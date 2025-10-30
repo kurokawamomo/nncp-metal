@@ -1,0 +1,82 @@
+# Build directories
+build/
+**/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+*.cmake
+
+# Compiled binaries
+nncp
+nncp_metal
+nncp_tests
+nncp-diagnostics
+nncp-diagnostics
+nncp-metal
+test-algorithm-selection
+test-compression-integration
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.lib
+*.so
+*.dylib
+
+# Metal compiled shaders
+*.metallib
+*.air
+
+# Test files and outputs
+*.test
+output_*
+simple_vocab.txt
+enwik8
+enwik8_*
+enwik9
+enwik9_*
+test_install.txt
+test_install.nncp
+test_install_restored.txt
+cuda-compatibility-tests
+tests/test_bpe_tokenizer
+tests/test_coreml_loader
+tests/test_mps_attention
+tests/test_mps_lstm
+tests/test_mps_transformer
+tests/test_sequence_manager
+tests/test_compression_selector
+
+# Temporary files
+*.tmp
+*.temp
+
+# macOS specific
+.DS_Store
+*.dSYM/
+
+# Version header (generated)
+src/version.h
+
+# IDE files
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# Log files
+*.log
+
+# Backup files
+*~
+*.bak
+*.swp
+*.swo
+
