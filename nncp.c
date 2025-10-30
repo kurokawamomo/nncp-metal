@@ -37,6 +37,7 @@
 #include "libnc.h"
 #include "cp_utils.h"
 #include "preprocess.h"
+#include "version.h"
 #include "cmdopt.h"
 
 /************************************************/
@@ -3710,8 +3711,8 @@ static void help(void)
     int i;
     const NNCPModelClass *mc;
     
-    printf("NNCP version " CONFIG_VERSION", Copyright (c) 2018-2021 Fabrice Bellard\n"
-           "Lossless data compression with Neural Networks\n"
+    printf("NNCP version %s, Copyright (c) 2018-2021 Fabrice Bellard\n", CONFIG_VERSION);
+    printf("Lossless data compression with Neural Networks\n"
            "usage: nncp [options] cmd args...\n"
            "\n"
            "Commands:\n"
