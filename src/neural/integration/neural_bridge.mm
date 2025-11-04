@@ -1716,6 +1716,115 @@ static bool metal_transformer_prediction(MetalTransformerModel* model,
     return true;
 }
 
+// Complete Transformer inference for lossless compression
+bool neural_bridge_transformer_predict(const uint8_t* context,
+                                      size_t context_len,
+                                      float* probabilities,
+                                      int vocab_size) {
+    if (!context || !probabilities || context_len == 0 || vocab_size != 258) {
+        printf("ERROR: Invalid parameters for transformer prediction\n");
+        return false;
+    }
+
+    // Ensure model is initialized
+    if (!g_transformer_model || !g_transformer_initialized) {
+        printf("ERROR: Transformer model not initialized. Call neural_bridge_init() first.\n");
+        return false;
+    }
+
+    MetalTransformerModel* model = g_transformer_model;
+
+    // Validate context length
+    if (context_len > model->train_len) {
+        printf("ERROR: Context length %zu exceeds max sequence length %d\n",
+               context_len, model->train_len);
+        return false;
+    }
+
+    @autoreleasepool {
+        // Get Metal device
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            printf("ERROR: Failed to get Metal device\n");
+            return false;
+        }
+
+        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+
+        // Allocate buffers for inference
+        size_t token_buffer_size = context_len * sizeof(int);
+        size_t hidden_buffer_size = context_len * model->d_model * sizeof(float);
+        size_t logits_buffer_size = context_len * model->n_symbols * sizeof(float);
+
+        id<MTLBuffer> token_buffer = [device newBufferWithLength:token_buffer_size
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden_buffer = [device newBufferWithLength:hidden_buffer_size
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits_buffer = [device newBufferWithLength:logits_buffer_size
+                                                         options:MTLResourceStorageModeShared];
+
+        if (!token_buffer || !hidden_buffer || !logits_buffer) {
+            printf("ERROR: Failed to allocate Metal buffers for inference\n");
+            return false;
+        }
+
+        // Copy context to token buffer (convert uint8_t to int)
+        int* token_data = (int*)[token_buffer contents];
+        for (size_t i = 0; i < context_len; i++) {
+            token_data[i] = (int)context[i];
+        }
+
+        // Step 1: Embedding lookup
+        if (!metal_transformer_embedding(model, token_buffer, hidden_buffer,
+                                        context_len, commandBuffer)) {
+            printf("ERROR: Transformer embedding failed\n");
+            return false;
+        }
+
+        // Step 2: Forward pass through all Transformer layers
+        if (!metal_transformer_forward(model, hidden_buffer, context_len, commandBuffer)) {
+            printf("ERROR: Transformer forward pass failed\n");
+            return false;
+        }
+
+        // Step 3: Prediction layer (logits + softmax)
+        if (!metal_transformer_prediction(model, hidden_buffer, logits_buffer,
+                                         context_len, commandBuffer)) {
+            printf("ERROR: Transformer prediction layer failed\n");
+            return false;
+        }
+
+        // Commit and wait for completion
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        // Extract probabilities for the last position (next token prediction)
+        float* logits_data = (float*)[logits_buffer contents];
+        size_t last_pos = context_len - 1;
+        float* last_probs = &logits_data[last_pos * model->n_symbols];
+
+        // Copy to output
+        memcpy(probabilities, last_probs, vocab_size * sizeof(float));
+
+        // Verify probabilities sum to approximately 1.0
+        float total = 0.0f;
+        for (int i = 0; i < vocab_size; i++) {
+            total += probabilities[i];
+        }
+
+        if (fabs(total - 1.0f) > 0.01f) {
+            printf("WARN: Probability sum = %.6f (should be ~1.0)\n", total);
+            // Renormalize if needed
+            for (int i = 0; i < vocab_size; i++) {
+                probabilities[i] /= total;
+            }
+        }
+
+        return true;
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

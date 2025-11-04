@@ -283,6 +283,27 @@ size_t neural_bridge_lossless_decompress(
     size_t output_capacity
 );
 
+/**
+ * @brief Perform Transformer inference to get probability distribution
+ *
+ * This function performs complete Transformer inference:
+ * 1. Embedding lookup for context tokens
+ * 2. Forward pass through all Transformer layers
+ * 3. Prediction layer to convert to probability distribution
+ *
+ * @param context Array of previous tokens (context)
+ * @param context_len Length of context (must be <= seg_len)
+ * @param probabilities Output probability distribution (must be allocated with vocab_size elements)
+ * @param vocab_size Vocabulary size (typically 258 for NNCP)
+ * @return true if inference succeeded, false otherwise
+ */
+bool neural_bridge_transformer_predict(
+    const uint8_t* context,
+    size_t context_len,
+    float* probabilities,
+    int vocab_size
+);
+
 #ifdef __cplusplus
 }
 #endif

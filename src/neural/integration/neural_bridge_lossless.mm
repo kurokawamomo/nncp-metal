@@ -125,36 +125,53 @@ size_t neural_bridge_lossless_compress(const uint8_t* input_data, size_t input_s
     encoder.output_pos += 2;
     
     printf("NNCP header written (%zu bytes)\n", encoder.output_pos);
-    
+
+    // Initialize Transformer model for neural prediction
+    if (!neural_bridge_init(config)) {
+        printf("Failed to initialize Transformer model for neural prediction\n");
+        return 0;
+    }
+    printf("Transformer model initialized for complete neural prediction\n");
+
     // Allocate context and probability buffers
     uint8_t* context = (uint8_t*)malloc(transformer.seg_len);
     float* probabilities = (float*)malloc(transformer.vocab_size * sizeof(float));
     uint32_t* cumulative = (uint32_t*)malloc((transformer.vocab_size + 1) * sizeof(uint32_t));
-    
+
     if (!context || !probabilities || !cumulative) {
         free(context);
         free(probabilities);
         free(cumulative);
         return 0;
     }
-    
+
     // Initialize context with BOS tokens
     memset(context, 256, transformer.seg_len); // BOS = 256
     size_t context_len = 0;
     
-    printf("Starting lossless byte-by-byte compression...\n");
-    
+    printf("Starting lossless byte-by-byte compression with complete Transformer prediction...\n");
+
     // Compress each input byte using Transformer predictions
     for (size_t i = 0; i < input_size; i++) {
-        // Get Transformer prediction (simplified - would need full implementation)
-        // For now, use uniform distribution as baseline
-        for (int j = 0; j < transformer.vocab_size; j++) {
-            if (j < 256) {
-                // Slightly favor byte values for better compression
-                probabilities[j] = 1.1f / transformer.vocab_size;
-            } else {
-                // BOS/EOS tokens get lower probability during compression
-                probabilities[j] = 0.1f / transformer.vocab_size;
+        // Get Transformer prediction using complete neural inference
+        // Must have at least 1 token in context for prediction
+        if (context_len == 0) {
+            // First prediction: use BOS context
+            context[0] = 256; // BOS token
+            context_len = 1;
+        }
+
+        // Perform complete Transformer inference
+        if (!neural_bridge_transformer_predict(context, context_len,
+                                              probabilities, transformer.vocab_size)) {
+            printf("ERROR: Transformer prediction failed at byte %zu\n", i);
+            // Fallback to uniform distribution for this byte
+            for (int j = 0; j < transformer.vocab_size; j++) {
+                if (j < 256) {
+                    probabilities[j] = 1.0f / 256.0f;
+                } else {
+                    probabilities[j] = 0.0f;
+                }
             }
         }
         
@@ -323,35 +340,57 @@ size_t neural_bridge_lossless_decompress(const uint8_t* input_data, size_t input
     }
     
     printf("Decoder initialized: value=0x%08x, data_start=%zu\n", decoder.value, pos);
-    
+
+    // Initialize Transformer model for neural prediction (decompression must match compression)
+    NeuralCompressionConfig dummy_config = {};
+    if (!neural_bridge_init(&dummy_config)) {
+        printf("Failed to initialize Transformer model for neural prediction\n");
+        return 0;
+    }
+    printf("Transformer model initialized for complete neural prediction (decompression)\n");
+
     // Allocate working buffers
     float* probabilities = (float*)malloc(258 * sizeof(float));
     uint32_t* cumulative = (uint32_t*)malloc(259 * sizeof(uint32_t));
     uint8_t* context = (uint8_t*)malloc(seg_len);
-    
+
     if (!probabilities || !cumulative || !context) {
         free(probabilities);
         free(cumulative);
         free(context);
         return 0;
     }
-    
+
     // Initialize context
     memset(context, 256, seg_len); // BOS = 256
     size_t context_len = 0;
     size_t decoded_bytes = 0;
-    
-    printf("Starting lossless byte-by-byte decompression...\n");
+
+    printf("Starting lossless byte-by-byte decompression with complete Transformer prediction...\n");
     
     // Decompress each byte
     while (decoded_bytes < original_size && decoder.input_pos <= input_size) {
-        // Get Transformer prediction (using same parameters as encoder)
+        // Get Transformer prediction using complete neural inference (must match encoder)
         int vocab_size = 258; // Must match encoder's transformer.vocab_size
-        for (int j = 0; j < vocab_size; j++) {
-            if (j < 256) {
-                probabilities[j] = 1.1f / vocab_size;
-            } else {
-                probabilities[j] = 0.1f / vocab_size;
+
+        // Must have at least 1 token in context for prediction
+        if (context_len == 0) {
+            // First prediction: use BOS context
+            context[0] = 256; // BOS token
+            context_len = 1;
+        }
+
+        // Perform complete Transformer inference (identical to compression)
+        if (!neural_bridge_transformer_predict(context, context_len,
+                                              probabilities, vocab_size)) {
+            printf("ERROR: Transformer prediction failed at byte %zu\n", decoded_bytes);
+            // Fallback to uniform distribution for this byte
+            for (int j = 0; j < vocab_size; j++) {
+                if (j < 256) {
+                    probabilities[j] = 1.0f / 256.0f;
+                } else {
+                    probabilities[j] = 0.0f;
+                }
             }
         }
         
