@@ -45,13 +45,10 @@ static void show_usage(const char* program_name) {
     printf("Commands:\n");
     printf("  c, compress    Compress input file to output file\n");
     printf("  d, decompress  Decompress input file to output file\n");
-    printf("  test           Run Metal framework tests\n");
-    printf("  neural         Use Neural Engine for high-quality compression\n\n");
     printf("Options:\n");
     printf("  -v, --verbose       Enable verbose output\n");
     printf("  -l, --level <1-9>   Set compression level (default: 6)\n");
     printf("  --cpu               Force CPU-only mode (disable Metal)\n");
-    printf("  --neural            Force Neural Engine mode\n");
     printf("  -h, --help          Show this help message\n\n");
     printf("Examples:\n");
     printf("  nncp-metal compress document.txt document.nncp\n");

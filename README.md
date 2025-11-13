@@ -103,8 +103,6 @@ gcc -o advanced_test advanced_verification_test.c && ./advanced_test
 Commands:
   c, compress    Compress input file to output file
   d, decompress  Decompress input file to output file
-  test           Run Metal framework tests
-  neural         Use Neural Engine for high-quality compression
 
 Options:
   -v, --verbose       Enable verbose output
@@ -114,7 +112,6 @@ Options:
                       8-9: LSTM neural compression
                       auto: Automatic algorithm selection
   --cpu               Force CPU-only mode (disable Metal)
-  --neural            Force Neural Engine mode
   --engine <type>     Specify neural engine (transformer|lstm)
   --memory-limit <MB> Set memory usage limit
   --quality <1-10>    Set quality level for neural compression
