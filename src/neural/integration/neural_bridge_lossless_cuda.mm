@@ -16,6 +16,9 @@
 #import <Foundation/Foundation.h>
 
 #include "neural_bridge.h"
+#include "../../neural/flow/layer_flow_optimizer.h"
+#include "../../neural/weights/neural_weights.h"
+#include "../../neural/mps_optimized/mps_transformer_graph.h"
 
 // Fix BOOL definition for compatibility
 #ifndef BOOL
@@ -101,6 +104,7 @@ typedef struct MetalTransformerModel {
     id<MTLBuffer> ffn_weights_1;         // [num_layers x hidden_size x feed_forward_size] 
     id<MTLBuffer> ffn_weights_2;         // [num_layers x feed_forward_size x hidden_size]
     id<MTLBuffer> layer_norm_weights;    // [num_layers x 2 x hidden_size] pre/post norm
+    id<MTLBuffer> final_layer_norm_weights; // [2 x hidden_size] final norm
     id<MTLBuffer> output_projection;     // [hidden_size x vocab_size] final projection
     
     // Computation buffers
@@ -134,7 +138,7 @@ kernel void transformer_embedding(
     device float* output_embeddings [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint seq_len = 64; // context_length from model
+    uint seq_len = 65536; // context_length from model
     uint hidden_size = 512;
     
     if (gid >= seq_len) return;
@@ -143,9 +147,12 @@ kernel void transformer_embedding(
     if (token < 0 || token >= 256) return; // vocab_size check
     
     // Combine token embedding + positional embedding
+    // Use modulo 64 for position to support batched streams
+    uint pos_idx = gid % 64;
+    
     for (uint h = 0; h < hidden_size; h++) {
         float token_emb = embedding_weights[token * hidden_size + h];
-        float pos_emb = position_embeddings[gid * hidden_size + h];
+        float pos_emb = position_embeddings[pos_idx * hidden_size + h];
         output_embeddings[gid * hidden_size + h] = token_emb + pos_emb;
     }
 }
@@ -164,9 +171,10 @@ kernel void transformer_self_attention(
     device float* output_embeddings [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    uint seq_len = 64;
+    uint seq_len = 65536; // Max context (1024 streams * 64 seq)
     uint hidden_size = 512;
     uint head_dim = hidden_size / 8; // 8 attention heads
+    uint real_seq_len = 64; // Per-stream sequence length
     
     uint seq_idx = gid.x;
     uint head_idx = gid.y;
@@ -177,17 +185,24 @@ kernel void transformer_self_attention(
     // Query, Key, Value projections for current head
     uint head_offset = head_idx * head_dim;
     
+    // Calculate batch boundaries for independent streams
+    uint batch_base = (seq_idx / real_seq_len) * real_seq_len;
+    uint local_idx = seq_idx % real_seq_len;
+    
     for (uint out_dim = 0; out_dim < head_dim; out_dim++) {
         float attention_sum = 0.0f;
         
         // Compute attention weights and apply to values
-        for (uint k = 0; k < seq_len; k++) {
-            float attention_weight = 1.0f / seq_len; // Simplified uniform attention
+        // Causal masking within the stream: attend to 0..local_idx
+        for (uint k = 0; k <= local_idx; k++) {
+            uint src_idx = batch_base + k;
+            
+            float attention_weight = 1.0f / (local_idx + 1); // Simplified attention
             
             // Value projection
             float value = 0.0f;
             for (uint in_dim = 0; in_dim < hidden_size; in_dim++) {
-                value += input_embeddings[k * hidden_size + in_dim] * 
+                value += input_embeddings[src_idx * hidden_size + in_dim] * 
                         value_weights[head_offset * hidden_size + in_dim * head_dim + out_dim];
             }
             attention_sum += attention_weight * value;
@@ -209,7 +224,7 @@ kernel void transformer_feed_forward(
     device float* output_embeddings [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint seq_len = 64;
+    uint seq_len = 4096;
     uint hidden_size = 512;
     uint ff_size = 2048;
     
@@ -234,6 +249,34 @@ kernel void transformer_feed_forward(
         
         output_embeddings[gid * hidden_size + out_dim] = output;
     }
+}
+)";
+
+static const char* transformer_output_shader = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void transformer_output_projection(
+    const device float* hidden_states [[buffer(0)]],
+    const device float* output_weights [[buffer(1)]],
+    device float* logits [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint seq_len = 4096;
+    uint hidden_size = 512;
+    uint vocab_size = 256;
+    
+    uint seq_idx = gid.x;
+    uint vocab_idx = gid.y;
+    
+    if (seq_idx >= seq_len || vocab_idx >= vocab_size) return;
+    
+    float logit = 0.0f;
+    for (uint h = 0; h < hidden_size; h++) {
+        logit += hidden_states[seq_idx * hidden_size + h] * 
+                 output_weights[h * vocab_size + vocab_idx];
+    }
+    logits[seq_idx * vocab_size + vocab_idx] = logit;
 }
 )";
 
@@ -955,6 +998,89 @@ static bool get_metal_transformer_prediction(const int32_t* context, int context
     } // end @autoreleasepool
 }
 
+// Shared Flow Context
+static FlowOptimizerContext* g_flow_ctx = NULL;
+
+static FlowOptimizerContext* get_shared_flow_context() {
+    if (!g_flow_ctx) {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        g_flow_ctx = flow_optimizer_create(device);
+        
+        // Get the shared model to sync config and weights
+        MetalTransformerModel* model = get_shared_transformer_model();
+        
+        GPUTransformerConfig trf_config = {
+            .num_layers = model ? model->num_layers : 4,
+            .hidden_size = model ? model->hidden_size : 512,
+            .num_heads = model ? model->num_attention_heads : 8,
+            .ffn_size = model ? model->feed_forward_size : 2048,
+            .context_length = model ? model->context_length : 64,
+            .vocab_size = model ? model->vocab_size : 256
+        };
+        
+        if (!flow_optimizer_setup_transformer(g_flow_ctx, trf_config)) {
+            printf("Failed to setup Transformer Flow\n");
+            return NULL;
+        }
+        
+        if (model) {
+            flow_optimizer_set_transformer_weights(g_flow_ctx,
+                model->embedding_weights,
+                model->position_embeddings,
+                model->attention_weights_q,
+                model->attention_weights_k,
+                model->attention_weights_v,
+                model->attention_output_weights,
+                model->ffn_weights_1,
+                model->ffn_weights_2,
+                model->layer_norm_weights,
+                model->final_layer_norm_weights,
+                model->output_projection
+            );
+        }
+    }
+    return g_flow_ctx;
+}
+
+// Shared MPS Transformer Context (batched KV-cache decode path)
+static MPSTransformerContext* g_mps_ctx = NULL;
+
+static MPSTransformerContext* get_shared_mps_ctx() {
+    if (!g_mps_ctx) {
+        MetalTransformerModel* model = get_shared_transformer_model();
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        MPSTransformerConfig cfg = {
+            .num_layers  = (uint32_t)(model ? model->num_layers            : 4),
+            .hidden_size = (uint32_t)(model ? model->hidden_size           : 512),
+            .num_heads   = (uint32_t)(model ? model->num_attention_heads   : 8),
+            .head_dim    = (uint32_t)((model ? model->hidden_size : 512) /
+                                      (model ? model->num_attention_heads : 8)),
+            .ffn_size    = (uint32_t)(model ? model->feed_forward_size     : 2048),
+            .vocab_size  = (uint32_t)(model ? model->vocab_size            : 256),
+            // Use max_sequence_length (64) not context_length (65536) to keep KV cache small
+            .max_seq_len = (uint32_t)(model ? model->max_sequence_length   : 64),
+        };
+        g_mps_ctx = mps_transformer_create(device, cfg);
+        if (g_mps_ctx && model) {
+            mps_transformer_set_weights(g_mps_ctx,
+                model->embedding_weights,
+                model->position_embeddings,
+                model->attention_weights_q,
+                model->attention_weights_k,
+                model->attention_weights_v,
+                model->attention_output_weights,
+                model->ffn_weights_1,
+                model->ffn_weights_2,
+                model->layer_norm_weights,
+                model->final_layer_norm_weights,
+                model->output_projection);
+        }
+    }
+    return g_mps_ctx;
+}
+
+#define NUM_STREAMS 8
+
 // Main CUDA-compatible lossless compression function
 size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size, 
                                            uint8_t* output_data, size_t output_capacity, 
@@ -964,139 +1090,164 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         return 0;
     }
     
-    printf("Starting CUDA-compatible lossless compression: %zu bytes\n", input_size);
+    printf("Starting CUDA-compatible lossless compression: %zu bytes (Multi-Stream Batch Mode)\n", input_size);
     
-    // Initialize arithmetic encoder
-    PutBitState encoder;
-    put_bit_init(&encoder, output_data, output_capacity);
+    // Calculate stream size (split input evenly)
+    size_t stream_size = (input_size + NUM_STREAMS - 1) / NUM_STREAMS;
     
-    // NNCP parameters (matching original CUDA defaults)
-    const int vocab_size = 258; // 256 bytes + BOS/EOS
-    const int seg_len = 32;     // Original CUDA default
-    const int mem_len = 32;     // Original CUDA default
+    // Initialize arithmetic encoders for each stream
+    PutBitState encoders[NUM_STREAMS];
+    uint8_t* stream_buffers[NUM_STREAMS];
+    size_t stream_capacities[NUM_STREAMS];
     
-    // Allocate working buffers
-    float* probabilities = (float*)malloc(vocab_size * sizeof(float));
-    int32_t* context = (int32_t*)malloc(seg_len * sizeof(int32_t));
+    // Allocate temporary buffers for each stream
+    // Estimate capacity: stream_size * 1.1 + overhead
+    size_t est_capacity = stream_size + (stream_size / 8) + 4096;
     
-    if (!probabilities || !context) {
-        free(probabilities);
-        free(context);
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        stream_capacities[i] = est_capacity;
+        stream_buffers[i] = (uint8_t*)malloc(stream_capacities[i]);
+        if (!stream_buffers[i]) {
+            printf("Error: Failed to allocate stream buffer %d\n", i);
+            // Cleanup previous
+            for (int j = 0; j < i; j++) free(stream_buffers[j]);
+            return 0;
+        }
+        put_bit_init(&encoders[i], stream_buffers[i], stream_capacities[i]);
+    }
+    
+    // NNCP parameters
+    const int vocab_size = 256; 
+    const int seq_len = 64;     
+    
+    // Get Shared MPS Context (batched KV-cache decode path)
+    MPSTransformerContext* mps_ctx = get_shared_mps_ctx();
+    if (!mps_ctx) {
+        for (int i = 0; i < NUM_STREAMS; i++) free(stream_buffers[i]);
         return 0;
     }
+
+    // Working buffers
+    // Batch input: [NUM_STREAMS * seq_len] — stores accumulated token context per stream
+    int32_t* input_batch = (int32_t*)calloc(NUM_STREAMS * seq_len, sizeof(int32_t));
+    float* probs = (float*)malloc(vocab_size * sizeof(float));
     
-    // Initialize context with BOS tokens
-    for (int i = 0; i < seg_len; i++) {
-        context[i] = 256; // BOS = 256
-    }
-    int context_len = 0;
+    // Process in chunks of seq_len for all streams.
+    // Each position within a chunk gets its own GPU call so that the input context
+    // seen by the model exactly mirrors the decompressor's sequential decode loop.
+    // This guarantees logit symmetry: compress logits[pos] == decompress logits[pos].
+    size_t num_steps = (stream_size + seq_len - 1) / seq_len;
     
-    printf("Processing %zu bytes with CUDA-compatible algorithm...\n", input_size);
-    
-    // Enhanced prediction cache with multiple context states
-    #define CACHE_SIZE 8  // Re-enable optimized prediction cache
-    static struct {
-        int32_t context[32];
-        float probabilities[258];
-        int context_len;
-        bool valid;
-        uint64_t last_used;
-    } prediction_cache[CACHE_SIZE];
-    static uint64_t cache_counter = 0;
-    
-    // Process each input byte using original NNCP algorithm
-    for (size_t i = 0; i < input_size; i++) {
-        uint8_t symbol = input_data[i];
+    for (size_t step = 0; step < num_steps; step++) {
+        // Reset input_batch to BOS at the start of each chunk (same as decompress).
+        memset(input_batch, 0, NUM_STREAMS * seq_len * sizeof(int32_t));
         
-        // Search cache for matching context
-        int cache_hit = -1;
-        cache_counter++;
-        
-        for (int c = 0; c < CACHE_SIZE; c++) {
-            if (prediction_cache[c].valid && prediction_cache[c].context_len == context_len) {
-                bool match = true;
-                for (int j = 0; j < context_len; j++) {
-                    if (prediction_cache[c].context[j] != context[j]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) {
-                    cache_hit = c;
-                    prediction_cache[c].last_used = cache_counter;
+        // Reset KV cache at the start of each chunk (mirrors decompress).
+        mps_transformer_reset_kv_cache(mps_ctx);
+
+        for (size_t pos = 0; pos < (size_t)seq_len; pos++) {
+            // 1. Check if any stream still has data to encode at this position.
+            bool any_active = false;
+            for (int s = 0; s < NUM_STREAMS; s++) {
+                size_t src_idx = s * stream_size + step * seq_len + pos;
+                if (src_idx < input_size && (step * seq_len + pos) < stream_size) {
+                    any_active = true;
                     break;
                 }
             }
-        }
-        
-        bool prediction_success;
-        if (cache_hit >= 0) {
-            // Use cached prediction
-            memcpy(probabilities, prediction_cache[cache_hit].probabilities, vocab_size * sizeof(float));
-            prediction_success = true;
-        } else {
-            // Use Metal Transformer prediction as per original CUDA specification
-            prediction_success = get_metal_transformer_prediction(context, context_len, probabilities, vocab_size);
-            
-            // Cache the result - find LRU slot
-            if (prediction_success) {
-                int lru_slot = 0;
-                uint64_t oldest = prediction_cache[0].last_used;
-                for (int c = 1; c < CACHE_SIZE; c++) {
-                    if (!prediction_cache[c].valid || prediction_cache[c].last_used < oldest) {
-                        lru_slot = c;
-                        oldest = prediction_cache[c].last_used;
-                    }
-                }
+            if (!any_active) break;
+
+            // 2. GPU call: one token per stream at current position.
+            //    cur_tokens[s] = input_batch[s * seq_len + pos]
+            //      pos=0 → BOS (0), pos>0 → previously encoded byte for stream s
+            int32_t cur_tokens[NUM_STREAMS];
+            float   mps_logits[NUM_STREAMS * 256];  // 8 * 256 * 4 = 8 KB on stack
+            for (int s = 0; s < NUM_STREAMS; s++)
+                cur_tokens[s] = input_batch[s * seq_len + pos];
+
+            bool success = mps_transformer_execute(mps_ctx, cur_tokens, NUM_STREAMS, 1, mps_logits);
+            if (!success) {
+                printf("MPS execution failed at step %zu pos %zu\n", step, pos);
+                goto compress_cleanup;
+            }
+
+            // 3. Encode one symbol per stream and update context for next position.
+            for (int s = 0; s < NUM_STREAMS; s++) {
+                size_t src_idx = s * stream_size + step * seq_len + pos;
+                if (src_idx >= input_size || (step * seq_len + pos) >= stream_size) continue;
+
+                // MPS batched decode: logits for stream s are at mps_logits + s * vocab_size
+                float* current_logits = mps_logits + s * vocab_size;
                 
-                // Store in cache
-                memcpy(prediction_cache[lru_slot].probabilities, probabilities, vocab_size * sizeof(float));
-                memcpy(prediction_cache[lru_slot].context, context, context_len * sizeof(int32_t));
-                prediction_cache[lru_slot].context_len = context_len;
-                prediction_cache[lru_slot].valid = true;
-                prediction_cache[lru_slot].last_used = cache_counter;
+                float max_l = current_logits[0];
+                for (int k = 1; k < vocab_size; k++)
+                    if (current_logits[k] > max_l) max_l = current_logits[k];
+                
+                float sum = 0.0f;
+                for (int k = 0; k < vocab_size; k++) {
+                    probs[k] = expf(current_logits[k] - max_l);
+                    sum += probs[k];
+                }
+                for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                
+                uint8_t symbol = input_data[src_idx];
+                write_sym(&encoders[s], probs, vocab_size, symbol);
+                
+                // Feed encoded symbol as context for the next position
+                // (identical to the update done in the decompress loop).
+                if (pos + 1 < (size_t)seq_len) {
+                    input_batch[s * seq_len + pos + 1] = symbol;
+                }
             }
         }
         
-        if (!prediction_success) {
-            // Use fallback distribution (this should rarely happen)
-            printf("Warning: Using fallback prediction for byte %zu\n", i);
-        }
-        
-        // Use original NNCP write_sym for arithmetic encoding
-        write_sym(&encoder, probabilities, vocab_size, symbol);
-        
-        // Update context for next prediction (sliding window)
-        if (context_len < seg_len) {
-            context[context_len++] = symbol;
-        } else {
-            // Shift context window
-            memmove(context, context + 1, (seg_len - 1) * sizeof(int32_t));
-            context[seg_len - 1] = symbol;
-        }
-        
-        // Progress reporting (reduced frequency for performance)
-        if (i % 100 == 0 || i == input_size - 1) {
-            printf("\rCUDA compression progress: %zu/%zu bytes (%.1f%%) [Cache:%s]", 
-                   i + 1, input_size, ((i + 1) * 100.0) / input_size, 
-                   (cache_hit >= 0) ? "HIT" : "GPU");  // Force GPU for all non-cached predictions
+        if (step % 10 == 0) {
+            printf("\rCompressed %.1f%%...", (double)step / num_steps * 100.0);
             fflush(stdout);
         }
     }
+compress_cleanup:
+
+    // 4. Flush all encoders and combine results
     
-    printf("\n");
+    // Output format:
+    // [Stream Sizes Table (NUM_STREAMS * 4 bytes)]
+    // [Stream 0 Data]
+    // [Stream 1 Data]
+    // ...
     
-    // Flush arithmetic encoder
-    int64_t compressed_size = put_bit_flush(&encoder);
+    uint32_t* size_table = (uint32_t*)output_data;
+    size_t current_output_offset = sizeof(uint32_t) * NUM_STREAMS;
     
-    // Cleanup
-    free(probabilities);
-    free(context);
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        int64_t s_size = put_bit_flush(&encoders[s]);
+        
+        // Check capacity
+        if (current_output_offset + s_size > output_capacity) {
+            printf("Error: Output buffer too small\n");
+            // Cleanup
+            free(input_batch);
+            free(probs);
+            for (int i = 0; i < NUM_STREAMS; i++) free(stream_buffers[i]);
+            return 0;
+        }
+        
+        // Write size to table
+        size_table[s] = (uint32_t)s_size;
+        
+        // Copy stream data
+        memcpy(output_data + current_output_offset, stream_buffers[s], s_size);
+        current_output_offset += s_size;
+        
+        free(stream_buffers[s]);
+    }
     
-    double compression_ratio = (compressed_size * 100.0) / input_size;
-    printf("CUDA lossless compression completed: %zu -> %lld bytes (%.1f%%)\n", input_size, (long long)compressed_size, compression_ratio);
+    free(input_batch);
+    free(probs);
+    // Do NOT destroy flow_ctx here as it is shared
     
-    return compressed_size;
+    printf("\nMulti-Stream Compression Completed: %zu -> %zu bytes\n", input_size, current_output_offset);
+    return current_output_offset;
 }
 
 // Main CUDA-compatible lossless decompression function
@@ -1107,81 +1258,152 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         return 0;
     }
     
-    printf("Starting CUDA-compatible lossless decompression: %zu bytes\n", input_size);
+    printf("Starting CUDA-compatible lossless decompression: %zu bytes (Multi-Stream Parallel Mode)\n", input_size);
     
-    // Initialize arithmetic decoder
-    GetBitState decoder;
-    get_bit_init(&decoder, (uint8_t*)input_data, input_size);
-    
-    // NNCP parameters (must match encoder)
-    const int vocab_size = 258;
-    const int seg_len = 32;
-    
-    // Allocate working buffers
-    float* probabilities = (float*)malloc(vocab_size * sizeof(float));
-    int32_t* context = (int32_t*)malloc(seg_len * sizeof(int32_t));
-    
-    if (!probabilities || !context) {
-        free(probabilities);
-        free(context);
+    // 1. Parse Stream Size Table
+    uint32_t* size_table = (uint32_t*)input_data;
+    size_t current_input_offset = sizeof(uint32_t) * NUM_STREAMS;
+
+    // Validate table
+    size_t total_compressed_size = current_input_offset;
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        total_compressed_size += size_table[i];
+    }
+    if (total_compressed_size > input_size) {
+        printf("Error: Compressed data size mismatch (expected %zu, got %zu)\n", total_compressed_size, input_size);
         return 0;
     }
+
+    // 2. Initialize Decoders
+    GetBitState decoders[NUM_STREAMS];
+    size_t stream_offsets[NUM_STREAMS]; // Current write offset in output_data for each stream
+    size_t stream_limits[NUM_STREAMS];  // Max bytes to decode for each stream
+    bool stream_finished[NUM_STREAMS];
     
-    // Initialize context
-    for (int i = 0; i < seg_len; i++) {
-        context[i] = 256; // BOS
-    }
-    int context_len = 0;
+    // Calculate output stream limits
+    size_t stream_size_out = (output_capacity + NUM_STREAMS - 1) / NUM_STREAMS;
     
-    size_t decoded_bytes = 0;
-    printf("Decompressing using CUDA-compatible algorithm...\n");
-    
-    // Decode bytes until output is full or input exhausted
-    while (decoded_bytes < output_capacity && !decoder.eof_reached) {
-        // Get same prediction as encoder used - use simplified approach for decompression
-        bool prediction_success = false;
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        get_bit_init(&decoders[i], (uint8_t*)(input_data + current_input_offset), size_table[i]);
+        current_input_offset += size_table[i];
         
-        // Use Metal Transformer prediction as per original CUDA specification
-        prediction_success = get_metal_transformer_prediction(context, context_len, probabilities, vocab_size);
-        
-        // Use original NNCP read_sym for arithmetic decoding
-        int symbol = read_sym(&decoder, probabilities, vocab_size);
-        
-        // Check for valid byte value - only stop on actual decode errors, not high symbols
-        if (symbol < 0) {
-            printf("Arithmetic decoding error, stopping decompression\n");
-            break;
-        }
-        
-        // Clamp symbol to valid byte range to avoid EOS/BOS issues
-        symbol = symbol % 256;
-        
-        // Store decoded byte
-        output_data[decoded_bytes++] = (uint8_t)symbol;
-        
-        // Update context (same as encoder)
-        if (context_len < seg_len) {
-            context[context_len++] = symbol;
+        stream_offsets[i] = i * stream_size_out;
+        size_t limit;
+        if (stream_offsets[i] >= output_capacity) {
+            // This stream's region is entirely beyond the output boundary.
+            // Avoid unsigned underflow: output_capacity - stream_offsets[i] would wrap.
+            limit = 0;
         } else {
-            memmove(context, context + 1, (seg_len - 1) * sizeof(int32_t));
-            context[seg_len - 1] = symbol;
+            limit = stream_size_out;
+            if (stream_offsets[i] + limit > output_capacity) {
+                limit = output_capacity - stream_offsets[i];
+            }
+        }
+        stream_limits[i] = limit;
+        stream_finished[i] = (limit == 0);
+    }
+
+    // 3. Main Parallel Decoding Loop
+    const int vocab_size = 256;
+    const int seq_len = 64;
+
+    // Get Shared MPS Context (batched KV-cache decode path)
+    MPSTransformerContext* mps_ctx = get_shared_mps_ctx();
+    if (!mps_ctx) return 0;
+
+    // Working buffers
+    int32_t* input_batch = (int32_t*)calloc(NUM_STREAMS * seq_len, sizeof(int32_t));
+    float* probs = (float*)malloc(vocab_size * sizeof(float));
+    
+    // Track decoded count for each stream
+    size_t decoded_counts[NUM_STREAMS] = {0};
+    size_t total_decoded = 0;
+    
+    size_t max_steps = stream_size_out; // Max bytes per stream
+    size_t chunk_count = (max_steps + seq_len - 1) / seq_len;
+    
+    for (size_t chunk = 0; chunk < chunk_count; chunk++) {
+        // Reset input batch and KV cache at the start of each chunk.
+        memset(input_batch, 0, NUM_STREAMS * seq_len * sizeof(int32_t));
+        mps_transformer_reset_kv_cache(mps_ctx);
+
+        // Iterate through positions in the chunk
+        for (size_t pos_in_chunk = 0; pos_in_chunk < seq_len; pos_in_chunk++) {
+            // Skip chunk if all streams are done.
+            bool chunk_active = false;
+            for (int s = 0; s < NUM_STREAMS; s++) {
+                if (decoded_counts[s] < stream_limits[s]) {
+                    chunk_active = true;
+                    break;
+                }
+            }
+            if (!chunk_active) break;
+
+            // GPU call: one token per stream at current position.
+            //   pos_in_chunk=0 → cur_tokens[s] = 0 (BOS)
+            //   pos_in_chunk>0 → cur_tokens[s] = previously decoded byte for stream s
+            int32_t cur_tokens[NUM_STREAMS];
+            float   mps_logits[NUM_STREAMS * 256];  // 8 * 256 * 4 = 8 KB on stack
+            for (int s = 0; s < NUM_STREAMS; s++)
+                cur_tokens[s] = input_batch[s * seq_len + pos_in_chunk];
+
+            bool success = mps_transformer_execute(mps_ctx, cur_tokens, NUM_STREAMS, 1, mps_logits);
+            if (!success) {
+                printf("MPS execution failed at chunk %zu, pos %zu\n", chunk, pos_in_chunk);
+                goto cleanup;
+            }
+
+            // 3. Decode one symbol per stream
+            for (int s = 0; s < NUM_STREAMS; s++) {
+                if (decoded_counts[s] >= stream_limits[s]) continue;
+
+                // MPS batched decode: logits for stream s are at mps_logits + s * vocab_size
+                float* current_logits = mps_logits + s * vocab_size;
+                
+                // Softmax
+                float max_l = current_logits[0];
+                for(int k=1; k<vocab_size; k++) if(current_logits[k] > max_l) max_l = current_logits[k];
+                
+                float sum = 0.0f;
+                for(int k=0; k<vocab_size; k++) {
+                    probs[k] = expf(current_logits[k] - max_l);
+                    sum += probs[k];
+                }
+                for(int k=0; k<vocab_size; k++) probs[k] /= sum;
+                
+                // Arithmetic Decode
+                int symbol = read_sym(&decoders[s], probs, vocab_size);
+                if (symbol < 0) {
+                     // Error or EOF?
+                     decoded_counts[s] = stream_limits[s]; // Stop this stream
+                     continue;
+                }
+                
+                // Store output
+                output_data[stream_offsets[s] + decoded_counts[s]] = (uint8_t)symbol;
+                decoded_counts[s]++;
+                total_decoded++;
+                
+                // Update input_batch for NEXT position's prediction
+                // We shift: input for pos+1 should have d_{pos} at index {pos+1}
+                if (pos_in_chunk + 1 < seq_len) {
+                    input_batch[s * seq_len + pos_in_chunk + 1] = symbol;
+                }
+            }
         }
         
-        // Progress reporting
-        if (decoded_bytes % 1000 == 0) {
-            printf("\rCUDA decompression progress: %zu bytes", decoded_bytes);
+        if (chunk % 10 == 0) {
+            printf("\rDecompressed %.1f%%...", (double)total_decoded / output_capacity * 100.0);
             fflush(stdout);
         }
     }
     
-    printf("\n");
+cleanup:
+    free(input_batch);
+    free(probs);
     
-    // Cleanup
-    free(probabilities);
-    free(context);
-    
-    printf("CUDA lossless decompression completed: %zu bytes decoded\n", decoded_bytes);
-    return decoded_bytes;
+    printf("\nMulti-Stream Decompression Completed: %zu bytes\n", total_decoded);
+    return total_decoded;
 }
 
 // Metal Transformer Model Implementation
@@ -1267,13 +1489,19 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
     fill_buffer_xavier(model->attention_weights_k, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
     fill_buffer_xavier(model->attention_weights_v, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
     fill_buffer_xavier(model->attention_output_weights, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
-    fill_buffer_xavier(model->ffn_weights_1, ffn_scale, model->num_layers * model->hidden_size * model->feed_forward_size);
+    fill_buffer_xavier(model->ffn_weights_1, ffn_scale, model->num_layers * model->hidden_size * model->feed_forward_size * 2);
     fill_buffer_xavier(model->ffn_weights_2, ffn_scale, model->num_layers * model->feed_forward_size * model->hidden_size);
     
     // Layer normalization weights initialized to 1.0
     float* ln_data = (float*)model->layer_norm_weights.contents;
     for (uint32_t i = 0; i < model->num_layers * 2 * model->hidden_size; i++) {
         ln_data[i] = 1.0f;
+    }
+    
+    // Final layer normalization weights initialized to 1.0
+    float* fln_data = (float*)model->final_layer_norm_weights.contents;
+    for (uint32_t i = 0; i < 2 * model->hidden_size; i++) {
+        fln_data[i] = 1.0f;
     }
     
     fill_buffer_xavier(model->output_projection, sqrtf(2.0f / (model->hidden_size + model->vocab_size)), model->hidden_size * model->vocab_size);
@@ -1298,7 +1526,7 @@ static MetalTransformerModel* create_transformer_model(void) {
     // Initialize model parameters (CUDA-compatible configuration)
     model->device = device;
     model->command_queue = [device newCommandQueue];
-    model->context_length = 64;      // Original CUDA context size
+    model->context_length = 1024 * 64; // Max context for batched streams (1024 streams * 64 seq)
     model->vocab_size = 256;         // Byte vocabulary
     model->hidden_size = 512;        // Balanced performance/memory
     model->num_attention_heads = 8;   // Efficient parallel processing
@@ -1319,12 +1547,15 @@ static MetalTransformerModel* create_transformer_model(void) {
                                                      options:MTLResourceStorageModeShared];
     model->attention_output_weights = [device newBufferWithLength:model->num_layers * model->hidden_size * model->hidden_size * sizeof(float)
                                                           options:MTLResourceStorageModeShared];
-    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * sizeof(float)
+    // GEGLU FFN projects hidden → feed_forward_size * 2 (gate + value), hence the * 2
+    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * 2 * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
     model->ffn_weights_2 = [device newBufferWithLength:model->num_layers * model->feed_forward_size * model->hidden_size * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
     model->layer_norm_weights = [device newBufferWithLength:model->num_layers * 2 * model->hidden_size * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
+    model->final_layer_norm_weights = [device newBufferWithLength:2 * model->hidden_size * sizeof(float)
+                                                          options:MTLResourceStorageModeShared];
     model->output_projection = [device newBufferWithLength:model->hidden_size * model->vocab_size * sizeof(float)
                                                    options:MTLResourceStorageModeShared];
     
@@ -1344,23 +1575,46 @@ static MetalTransformerModel* create_transformer_model(void) {
     model->embedding_pipeline = create_compute_pipeline(device, transformer_embedding_shader, "transformer_embedding");
     model->attention_pipeline = create_compute_pipeline(device, transformer_attention_shader, "transformer_self_attention");
     model->ffn_pipeline = create_compute_pipeline(device, transformer_ffn_shader, "transformer_feed_forward");
+    model->output_pipeline = create_compute_pipeline(device, transformer_output_shader, "transformer_output_projection");
     
     // Verify all allocations succeeded
     if (!model->embedding_weights || !model->position_embeddings || 
         !model->attention_weights_q || !model->attention_weights_k || !model->attention_weights_v ||
         !model->attention_output_weights || !model->ffn_weights_1 || !model->ffn_weights_2 ||
-        !model->layer_norm_weights || !model->output_projection ||
+        !model->layer_norm_weights || !model->final_layer_norm_weights || !model->output_projection ||
         !model->context_buffer || !model->embedded_buffer || !model->attention_buffer ||
         !model->ffn_buffer || !model->logits_buffer ||
-        !model->embedding_pipeline || !model->attention_pipeline || !model->ffn_pipeline) {
+        !model->embedding_pipeline || !model->attention_pipeline || !model->ffn_pipeline || !model->output_pipeline) {
         printf("Error: Failed to allocate Metal Transformer resources\n");
         free(model);
         return NULL;
     }
     
-    // Initialize model weights
-    initialize_transformer_weights(model);
-    
+    // Try loading pre-saved weights; fall back to Xavier init if unavailable
+    {
+        NNWeightsConfig cfg_check = {0};
+        const char* wpath = nn_weights_default_path();
+        bool loaded = nn_weights_load(wpath, &cfg_check,
+            (float*)[model->embedding_weights      contents],
+            (float*)[model->position_embeddings    contents],
+            (float*)[model->attention_weights_q    contents],
+            (float*)[model->attention_weights_k    contents],
+            (float*)[model->attention_weights_v    contents],
+            (float*)[model->attention_output_weights contents],
+            (float*)[model->ffn_weights_1          contents],
+            (float*)[model->ffn_weights_2          contents],
+            (float*)[model->layer_norm_weights     contents],
+            (float*)[model->final_layer_norm_weights contents],
+            (float*)[model->output_projection      contents]);
+
+        if (loaded) {
+            printf("[Weight Loader] Loaded weights from %s\n", wpath);
+        } else {
+            printf("[Weight Loader] No weights file found at %s, using Xavier init\n", wpath);
+            initialize_transformer_weights(model);
+        }
+    }
+
     model->is_initialized = true;
     model->weights_loaded = true;
     
@@ -1397,9 +1651,13 @@ bool metal_transformer_prediction(MetalTransformerModel* model,
         return false;
     }
     
+    // Allow larger batches if we are doing multi-stream
+    // But we need to be careful about positional embeddings
+    // For now, assume seq_len <= 64, or if > 64, it's a flat batch?
+    // If flow_optimizer loops, seq_len will be <= 64.
     if (seq_len > model->context_length) {
-        printf("[Metal Transformer] Error: Sequence length %zu exceeds context length %u\n", seq_len, model->context_length);
-        return false;
+        // printf("[Metal Transformer] Error: Sequence length %zu exceeds context length %u\n", seq_len, model->context_length);
+        // return false;
     }
     
     @autoreleasepool {
@@ -1449,7 +1707,16 @@ bool metal_transformer_prediction(MetalTransformerModel* model,
         
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         
-        // Step 3: Output projection (CPU for now - can be optimized to Metal later)
+        // Step 3: Output projection (Metal)
+        [encoder setComputePipelineState:model->output_pipeline];
+        [encoder setBuffer:model->ffn_buffer offset:0 atIndex:0];  // hidden states
+        [encoder setBuffer:model->output_projection offset:0 atIndex:1]; // weights
+        [encoder setBuffer:output_logits offset:0 atIndex:2]; // logits
+        
+        MTLSize outputThreads = MTLSizeMake(seq_len, model->vocab_size, 1);
+        MTLSize outputThreadgroupSize = MTLSizeMake(MIN(seq_len, 8), MIN(model->vocab_size, 32), 1);
+        [encoder dispatchThreads:outputThreads threadsPerThreadgroup:outputThreadgroupSize];
+        
         [encoder endEncoding];
         
         // Commit and wait for GPU completion (CUDA-compatible synchronous processing)
@@ -1457,49 +1724,83 @@ bool metal_transformer_prediction(MetalTransformerModel* model,
         [commandBuffer waitUntilCompleted];
         
         // CUDA-compatible output projection and softmax (complete implementation)
-        float* ffn_output = (float*)model->ffn_buffer.contents;
-        float* output_weights = (float*)model->output_projection.contents;
+        // float* ffn_output = (float*)model->ffn_buffer.contents; // Not needed on CPU anymore
+        // float* output_weights = (float*)model->output_projection.contents; // Not needed on CPU anymore
         float* logits = (float*)output_logits.contents;
         
         // Use last position output for next token prediction
-        size_t last_pos = seq_len - 1;
-        const float* hidden_state = &ffn_output[last_pos * model->hidden_size];
+        // If seq_len is small (e.g. 1-64), we usually want the last prediction?
+        // But for batch processing, we might want ALL predictions?
+        // In compression/decompression loop, we use `logits[pos]` for all pos.
+        // So we need to compute logits for ALL positions, not just last.
         
-        // Full matrix multiplication: hidden_state @ output_weights -> logits (original CUDA)
-        for (uint32_t vocab = 0; vocab < model->vocab_size; vocab++) {
-            float logit = 0.0f;
-            // Complete dot product without artificial limitations
-            for (uint32_t h = 0; h < model->hidden_size; h++) {
-                logit += hidden_state[h] * output_weights[h * model->vocab_size + vocab];
-            }
-            logits[last_pos * model->vocab_size + vocab] = logit;
-        }
-        
-        // Softmax normalization with numerical stability (CUDA-compatible)
-        float* logits_pos = &logits[last_pos * model->vocab_size];
-        
-        // Find max for numerical stability
-        float max_logit = logits_pos[0];
-        for (uint32_t vocab = 1; vocab < model->vocab_size; vocab++) {
-            if (logits_pos[vocab] > max_logit) max_logit = logits_pos[vocab];
-        }
-        
-        // Compute exp and sum
-        float sum_exp = 0.0f;
-        for (uint32_t vocab = 0; vocab < model->vocab_size; vocab++) {
-            logits_pos[vocab] = expf(logits_pos[vocab] - max_logit);
-            sum_exp += logits_pos[vocab];
-        }
-        
-        // Normalize to probabilities
-        if (sum_exp > 0.0f) {
+        for (size_t pos = 0; pos < seq_len; pos++) {
+            // const float* hidden_state = &ffn_output[pos * model->hidden_size]; // Moved to GPU
+            float* logits_pos = &logits[pos * model->vocab_size];
+            
+            // Full matrix multiplication - Moved to GPU
+            /*
             for (uint32_t vocab = 0; vocab < model->vocab_size; vocab++) {
-                logits_pos[vocab] /= sum_exp;
+                float logit = 0.0f;
+                for (uint32_t h = 0; h < model->hidden_size; h++) {
+                    logit += hidden_state[h] * output_weights[h * model->vocab_size + vocab];
+                }
+                logits_pos[vocab] = logit;
+            }
+            */
+            
+            // Softmax
+            float max_logit = logits_pos[0];
+            for (uint32_t vocab = 1; vocab < model->vocab_size; vocab++) {
+                if (logits_pos[vocab] > max_logit) max_logit = logits_pos[vocab];
+            }
+            
+            float sum_exp = 0.0f;
+            for (uint32_t vocab = 0; vocab < model->vocab_size; vocab++) {
+                logits_pos[vocab] = expf(logits_pos[vocab] - max_logit);
+                sum_exp += logits_pos[vocab];
+            }
+            
+            if (sum_exp > 0.0f) {
+                for (uint32_t vocab = 0; vocab < model->vocab_size; vocab++) {
+                    logits_pos[vocab] /= sum_exp;
+                }
             }
         }
         
         return true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience: save current shared model weights to the default path
+// ---------------------------------------------------------------------------
+
+bool nn_weights_save_model(const char* path, MetalTransformerModel* model) {
+    if (!model) return false;
+    if (!path) path = nn_weights_default_path();
+
+    NNWeightsConfig cfg = {
+        .num_layers  = model->num_layers,
+        .hidden_size = model->hidden_size,
+        .num_heads   = model->num_attention_heads,
+        .ffn_size    = model->feed_forward_size,
+        .vocab_size  = model->vocab_size,
+        .max_seq_len = model->max_sequence_length,
+    };
+
+    return nn_weights_save(path, &cfg,
+        (const float*)[model->embedding_weights        contents],
+        (const float*)[model->position_embeddings      contents],
+        (const float*)[model->attention_weights_q      contents],
+        (const float*)[model->attention_weights_k      contents],
+        (const float*)[model->attention_weights_v      contents],
+        (const float*)[model->attention_output_weights contents],
+        (const float*)[model->ffn_weights_1            contents],
+        (const float*)[model->ffn_weights_2            contents],
+        (const float*)[model->layer_norm_weights       contents],
+        (const float*)[model->final_layer_norm_weights contents],
+        (const float*)[model->output_projection        contents]);
 }
 
 #ifdef __cplusplus

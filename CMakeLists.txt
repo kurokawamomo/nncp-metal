@@ -101,6 +101,16 @@ if(USE_METAL)
         src/metal/wrapper/neural_engine.mm
         src/metal/wrapper/memory_manager.mm
         src/metal/wrapper/compute_kernels.mm
+        src/neural/memory/unified_memory_manager.mm
+        src/neural/memory/memory_pool_optimizer.mm
+        src/neural/memory/sync_optimizer.mm
+        src/neural/engines/gpu_native_transformer.mm
+        src/neural/engines/gpu_native_lstm.mm
+        src/neural/flow/layer_flow_optimizer.mm
+        src/neural/mps_optimized/mps_transformer_graph.mm
+        src/neural/mps_optimized/mps_lstm_graph.mm
+        src/neural/mps_optimized/mps_matrix_optimizer.mm
+        src/neural/pipeline/async_execution_manager.mm
         # src/metal/wrapper/benchmark.mm
     )
     
@@ -119,6 +129,7 @@ if(USE_METAL)
     )
     
     list(APPEND NNCP_CORE_SOURCES ${METAL_WRAPPER_SOURCES} ${LIBNC_METAL_SOURCES} ${NEURAL_LSTM_SOURCES}
+        src/neural/weights/neural_weights.c
         src/neural/config/cuda_profiles.c
         src/neural/compatibility/cuda_math_compat.c
         src/neural/validation/cuda_parameter_validator.c
@@ -146,6 +157,7 @@ if(USE_METAL)
         src/metal/algorithm_router.c
         src/metal/compression_selector_stub.c
         src/metal/nncp_original_port.c
+        src/neural/weights/neural_weights.c
         src/neural/config/cuda_profiles.c
         src/neural/compatibility/cuda_math_compat.c
         src/neural/validation/cuda_parameter_validator.c
@@ -197,6 +209,7 @@ if(USE_METAL)
         src/neural/compatibility/cuda_math_compat.c
         src/neural/error/cuda_error_handler.c
         ${NEURAL_LSTM_SOURCES}
+        ${METAL_WRAPPER_SOURCES}
     )
     
     target_link_libraries(nncp-diagnostics

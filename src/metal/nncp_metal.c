@@ -179,6 +179,8 @@ typedef struct {
     uint16_t compression_level;
     uint16_t quantization_bits;  // Bits per quantized value
     uint32_t checksum;       // CRC32 of original data
+    uint32_t num_streams;    // Number of parallel streams
+    uint32_t reserved[3];    // Padding
 } NNCPHeader;
 
 #define NNCP_MAGIC 0x4E4E4350  // "NNCP"
@@ -335,7 +337,9 @@ static int compress_file_metal_integrated(const char* input_file, const char* ou
         .compressed_size = total_compressed_size,
         .compression_level = actual_compression_level,
         .quantization_bits = 8, // Integration layer uses 8-bit by default
-        .checksum = checksum
+        .checksum = checksum,
+        .num_streams = 8, // Reduced parallelism for stability
+        .reserved = {0, 0, 0}
     };
     
     fwrite(&header, sizeof(NNCPHeader), 1, out);
@@ -1075,13 +1079,15 @@ static int compress_file_cpu_nncp_original(const char* input_file, const char* o
     }
     
     // Write NNCP header
+    // quantization_bits = 0 marks this as CPU NNCP Original (no quantization used),
+    // distinguishing it from Metal LSTM (quantization_bits=8, level=6) during auto-detection.
     NNCPHeader header = {
         .magic = NNCP_MAGIC,
         .version = NNCP_VERSION,
         .original_size = (uint32_t)file_size,
         .compressed_size = (uint32_t)(compressed_size + sizeof(NNCPHeader)),
         .compression_level = (uint16_t)level,
-        .quantization_bits = 8,
+        .quantization_bits = 0,
         .checksum = checksum
     };
     
@@ -1275,11 +1281,12 @@ int main(int argc, char** argv) {
             if (fread(&header, sizeof(NNCPHeader), 1, detect_file) == 1) {
                 fclose(detect_file);
                 bool is_neural = (header.compression_level & 0x8000) != 0;
-                // Metal LSTM uses level 6, Transformer uses level 8, CPU NNCP Original uses levels 1-5, 7, 9
-                bool is_metal_lstm = !is_neural && (header.compression_level == 6) && (header.quantization_bits == 8);
-                bool is_metal_transformer = !is_neural && (header.compression_level == 8) && (header.quantization_bits == 8);
-                bool is_cpu_nncp = !is_neural && !is_metal_lstm && !is_metal_transformer && 
-                                   (header.compression_level <= 9) && (header.quantization_bits == 8);
+                // CPU NNCP Original is identified by quantization_bits == 0 (no quantization used).
+                // Metal LSTM uses level 6 with quantization_bits == 8.
+                // Metal Transformer uses level 8 with quantization_bits == 8.
+                bool is_cpu_nncp = !is_neural && (header.quantization_bits == 0) && (header.compression_level <= 9);
+                bool is_metal_lstm = !is_neural && !is_cpu_nncp && (header.compression_level == 6) && (header.quantization_bits == 8);
+                bool is_metal_transformer = !is_neural && !is_cpu_nncp && (header.compression_level == 8) && (header.quantization_bits == 8);
                 
                 if (args.verbose) {
                     printf("Auto-detected compression format: %s\n", 

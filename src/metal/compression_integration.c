@@ -490,12 +490,11 @@ size_t compression_integration_estimate_output_size(
     
     switch (algorithm) {
         case COMPRESSION_ALGORITHM_TRANSFORMER:
-            // Transformer typically achieves good compression
-            return (input_size * 3) / 4 + neural_overhead;
+            /* Untrained model can expand data significantly; 12× gives comfortable margin */
+            return input_size * 12 + neural_overhead + 8 * 64;
             
         case COMPRESSION_ALGORITHM_LSTM:
-            // LSTM compression estimate - Metal LSTM only
-            return input_size + neural_overhead + (input_size / 4);
+            return input_size * 12 + neural_overhead + 8 * 64;
             
         case COMPRESSION_ALGORITHM_AUTO:
         default:

@@ -555,7 +555,9 @@ static void get_bit_init(GetBitState *s, uint8_t *buf, size_t buf_size,
     int i;
     s->buf_size = buf_size;
     s->buf = buf;
-    s->read_func = read_func ? read_func : get_bit_read_func;
+    // NULL means prefilled-buffer mode: refill() will pad with zeros on overflow
+    // rather than calling get_bit_read_func (which returns 0 and sets eof_reached).
+    s->read_func = read_func;
     s->opaque = opaque;
     if (read_func) {
         s->buf_len = 0;
@@ -741,15 +743,6 @@ bool nncp_original_decompress(const uint8_t* compressed_data, size_t compressed_
                     
                     if (verbose && output_pos >= target_output_size - 5) {
                         printf("[DEBUG] Symbol %d at pos %zu, target %zu\n", symbol, output_pos, target_output_size);
-                    }
-                    
-                    // Check for end marker
-                    if (symbol == 0xFF) {
-                        // End of data reached
-                        if (verbose) printf("[DEBUG] End marker found at pos %zu\n", output_pos);
-                        *decompressed_size = output_pos;
-                        nncp_original_cleanup(&state);
-                        return true;
                     }
                     
                     output_data[output_pos++] = (uint8_t)symbol;

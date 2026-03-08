@@ -6,6 +6,9 @@
 
 #include "neural_engine.h"
 #include "metal_context.h"
+#include "../../neural/engines/gpu_native_transformer.h"
+#include "../../neural/engines/gpu_native_lstm.h"
+#include "../../neural/memory/unified_memory_manager.h"
 
 // Internal Neural Engine context structure
 @interface NEContextImpl : NSObject
@@ -14,6 +17,7 @@
 @property (nonatomic) NEBackendType currentBackend;
 @property (nonatomic) NEAdaptiveConfig adaptiveConfig;
 @property (nonatomic) NEPerformanceMetrics lastMetrics;
+@property (nonatomic) UnifiedMemoryManager* memoryManager;
 @end
 
 @implementation NEContextImpl
@@ -27,8 +31,12 @@ struct NEContext {
 struct NEModel {
     NEContextImpl* context;
     MLModel* coremlModel;
+    GPUTransformerContext* nativeTransformer;
+    GPULSTMContext* nativeLSTM;
     NSString* modelPath;
     NEPerformanceMetrics metrics;
+    bool isNative;
+    bool isLSTM;
 };
 
 // System information detection
@@ -84,8 +92,13 @@ int ne_context_create(NEContext** context, NEBackendType preferred_backend) {
     ctx->impl = [[NEContextImpl alloc] init];
     ctx->impl.currentBackend = preferred_backend;
     
-    // Initialize Metal device for fallback
+    // Initialize Metal device
     ctx->impl.metalDevice = MTLCreateSystemDefaultDevice();
+    
+    // Initialize Unified Memory Manager
+    if (ctx->impl.metalDevice) {
+        ctx->impl.memoryManager = unified_memory_manager_create(ctx->impl.metalDevice);
+    }
     
     // Set default adaptive configuration
     NEAdaptiveConfig defaultConfig = {
@@ -102,6 +115,9 @@ int ne_context_create(NEContext** context, NEBackendType preferred_backend) {
 
 void ne_context_destroy(NEContext* context) {
     if (context && context->impl) {
+        if (context->impl.memoryManager) {
+            unified_memory_manager_destroy(context->impl.memoryManager);
+        }
         context->impl = nil;  // ARC will handle cleanup
         free(context);
     }
@@ -132,8 +148,142 @@ int ne_model_load_from_file(NEContext* context, const char* model_path, NEModel*
     
     modelWrapper->context = context->impl;
     modelWrapper->coremlModel = coremlModel;
+    modelWrapper->nativeTransformer = NULL;
+    modelWrapper->nativeLSTM = NULL;
     modelWrapper->modelPath = path;
+    modelWrapper->isNative = false;
+    modelWrapper->isLSTM = false;
     memset(&modelWrapper->metrics, 0, sizeof(NEPerformanceMetrics));
+    
+    *model = modelWrapper;
+    return 0;
+}
+
+int ne_model_load_from_memory(NEContext* context, const void* model_data, size_t size, NEModel** model) {
+    // Not implemented for CoreML in-memory
+    return -1;
+}
+
+// Helper to upload weights
+static id<MTLBuffer> upload_weights(UnifiedMemoryManager* mgr, const float* data, size_t count) {
+    if (!data || count == 0) return nil;
+    size_t size = count * sizeof(float);
+    void* ptr = unified_memory_alloc(mgr, size, UNIFIED_POOL_WEIGHTS, "weights");
+    if (!ptr) return nil;
+    memcpy(ptr, data, size);
+    return unified_memory_get_buffer(mgr, ptr);
+}
+
+int ne_model_create_transformer(NEContext* context, const NETransformerConfig* config, const NETransformerWeights* weights, NEModel** model) {
+    if (!context || !config || !weights || !model) return -1;
+    
+    if (!context->impl.metalDevice || !context->impl.memoryManager) {
+        return -1; // Metal not available
+    }
+    
+    NEModel* modelWrapper = (NEModel*)malloc(sizeof(NEModel));
+    if (!modelWrapper) return -1;
+    
+    modelWrapper->context = context->impl;
+    modelWrapper->coremlModel = nil;
+    modelWrapper->modelPath = nil;
+    modelWrapper->isNative = true;
+    modelWrapper->isLSTM = false;
+    memset(&modelWrapper->metrics, 0, sizeof(NEPerformanceMetrics));
+    
+    // Create Native Transformer
+    GPUTransformerConfig gpuConfig;
+    gpuConfig.num_layers = config->num_layers;
+    gpuConfig.hidden_size = config->hidden_size;
+    gpuConfig.num_heads = config->num_heads;
+    gpuConfig.ffn_size = config->ffn_size;
+    gpuConfig.context_length = config->context_length;
+    gpuConfig.vocab_size = config->vocab_size;
+    
+    modelWrapper->nativeTransformer = gpu_transformer_create(context->impl.metalDevice, context->impl.memoryManager, gpuConfig);
+    if (!modelWrapper->nativeTransformer) {
+        free(modelWrapper);
+        return -1;
+    }
+    
+    // Upload weights
+    UnifiedMemoryManager* mm = context->impl.memoryManager;
+    
+    id<MTLBuffer> w_embed = upload_weights(mm, weights->embed, config->vocab_size * config->hidden_size);
+    id<MTLBuffer> w_pos = upload_weights(mm, weights->pos_embed, config->context_length * config->hidden_size);
+    
+    size_t attn_size = config->num_layers * config->hidden_size * config->hidden_size;
+    id<MTLBuffer> w_q = upload_weights(mm, weights->attn_q, attn_size);
+    id<MTLBuffer> w_k = upload_weights(mm, weights->attn_k, attn_size);
+    id<MTLBuffer> w_v = upload_weights(mm, weights->attn_v, attn_size);
+    id<MTLBuffer> w_out = upload_weights(mm, weights->attn_out, attn_size);
+    
+    size_t ffn_size = config->num_layers * config->hidden_size * config->ffn_size * 2; // *2 for GEGLU
+    id<MTLBuffer> w_ffn1 = upload_weights(mm, weights->ffn_1, ffn_size);
+    
+    size_t ffn2_size = config->num_layers * config->ffn_size * config->hidden_size;
+    id<MTLBuffer> w_ffn2 = upload_weights(mm, weights->ffn_2, ffn2_size);
+    
+    size_t ln_size = config->num_layers * 2 * config->hidden_size; // Gamma+Beta
+    id<MTLBuffer> w_ln = upload_weights(mm, weights->ln_weights, ln_size);
+    
+    size_t final_ln_size = 2 * config->hidden_size;
+    id<MTLBuffer> w_final_ln = upload_weights(mm, weights->final_ln_weights, final_ln_size);
+    
+    id<MTLBuffer> w_proj = upload_weights(mm, weights->out_proj, config->hidden_size * config->vocab_size);
+    
+    gpu_transformer_set_weights(modelWrapper->nativeTransformer,
+                               w_embed, w_pos, w_q, w_k, w_v, w_out,
+                               w_ffn1, w_ffn2, w_ln, w_final_ln, w_proj);
+    
+    *model = modelWrapper;
+    return 0;
+}
+
+int ne_model_create_lstm(NEContext* context, const NELSTMConfig* config, const NELSTMWeights* weights, NEModel** model) {
+    if (!context || !config || !weights || !model) return -1;
+    
+    if (!context->impl.metalDevice || !context->impl.memoryManager) {
+        return -1; // Metal not available
+    }
+    
+    NEModel* modelWrapper = (NEModel*)malloc(sizeof(NEModel));
+    if (!modelWrapper) return -1;
+    
+    modelWrapper->context = context->impl;
+    modelWrapper->coremlModel = nil;
+    modelWrapper->modelPath = nil;
+    modelWrapper->isNative = true;
+    modelWrapper->isLSTM = true;
+    memset(&modelWrapper->metrics, 0, sizeof(NEPerformanceMetrics));
+    
+    // Create Native LSTM
+    GPULSTMConfig gpuConfig;
+    gpuConfig.input_size = config->input_size;
+    gpuConfig.hidden_size = config->hidden_size;
+    gpuConfig.num_layers = config->num_layers;
+    gpuConfig.seq_len = config->seq_len;
+    gpuConfig.batch_size = config->batch_size;
+    
+    modelWrapper->nativeLSTM = gpu_lstm_create(context->impl.metalDevice, context->impl.memoryManager, gpuConfig);
+    if (!modelWrapper->nativeLSTM) {
+        free(modelWrapper);
+        return -1;
+    }
+    
+    // Upload weights
+    UnifiedMemoryManager* mm = context->impl.memoryManager;
+    
+    // Weights sizes
+    size_t ih_size = config->num_layers * 4 * config->hidden_size * config->input_size;
+    size_t hh_size = config->num_layers * 4 * config->hidden_size * config->hidden_size;
+    size_t bias_size = config->num_layers * 4 * config->hidden_size;
+    
+    id<MTLBuffer> w_ih = upload_weights(mm, weights->w_ih, ih_size);
+    id<MTLBuffer> w_hh = upload_weights(mm, weights->w_hh, hh_size);
+    id<MTLBuffer> bias = upload_weights(mm, weights->bias, bias_size);
+    
+    gpu_lstm_set_weights(modelWrapper->nativeLSTM, w_ih, w_hh, bias);
     
     *model = modelWrapper;
     return 0;
@@ -141,6 +291,14 @@ int ne_model_load_from_file(NEContext* context, const char* model_path, NEModel*
 
 void ne_model_destroy(NEModel* model) {
     if (model) {
+        if (model->isNative) {
+            if (model->nativeTransformer) {
+                gpu_transformer_destroy(model->nativeTransformer);
+            }
+            if (model->nativeLSTM) {
+                gpu_lstm_destroy(model->nativeLSTM);
+            }
+        }
         model->coremlModel = nil;  // ARC cleanup
         free(model);
     }
@@ -150,6 +308,14 @@ void ne_model_destroy(NEModel* model) {
 int ne_model_predict(NEModel* model, 
                     const float* input, size_t input_size,
                     float* output, size_t output_size) {
+    // Single inference not supported for Native Transformer (batch optimized)
+    // Or we can treat as batch=1
+    if (model && model->isNative) {
+        // Native transformer expects int32 tokens, not float input
+        return -1; 
+    }
+    
+    // Fallback to CoreML
     if (!model || !input || !output) return -1;
     
     NSDate* startTime = [NSDate date];
@@ -214,22 +380,53 @@ int ne_model_predict(NEModel* model,
 
 // Batch inference
 int ne_model_predict_batch(NEModel* model,
-                          const float* inputs, size_t batch_size, size_t input_size,
+                          const int32_t* inputs, size_t batch_size, size_t seq_len,
                           float* outputs, size_t output_size) {
-    if (!model || !inputs || !outputs || batch_size == 0) return -1;
+    if (!model) return -1;
     
-    // Simple implementation: process each input sequentially
-    // In practice, CoreML might support batch processing better
-    for (size_t i = 0; i < batch_size; i++) {
-        const float* current_input = inputs + (i * input_size);
-        float* current_output = outputs + (i * output_size);
+    if (model->isNative && !model->isLSTM) {
+        NSDate* startTime = [NSDate date];
         
-        int result = ne_model_predict(model, current_input, input_size, 
-                                     current_output, output_size);
-        if (result != 0) return result;
+        bool success = gpu_transformer_predict_batch(model->nativeTransformer,
+                                                    inputs,
+                                                    batch_size,
+                                                    seq_len,
+                                                    outputs);
+                                                    
+        NSTimeInterval elapsedTime = [[NSDate date] timeIntervalSinceDate:startTime];
+        model->metrics.inference_time_ms = elapsedTime * 1000.0;
+        model->metrics.backend_used = NE_BACKEND_METAL_GPU;
+        
+        return success ? 0 : -1;
     }
     
-    return 0;
+    // CoreML fallback (not implemented for int32 input batch)
+    return -1;
+}
+
+// LSTM Sequence Prediction
+int ne_model_predict_lstm(NEModel* model,
+                         const float* input, size_t batch_size, size_t seq_len,
+                         float* output) {
+    if (!model) return -1;
+    
+    if (model->isNative && model->isLSTM) {
+        NSDate* startTime = [NSDate date];
+        
+        bool success = gpu_lstm_predict_sequence(model->nativeLSTM,
+                                                input,
+                                                batch_size,
+                                                seq_len,
+                                                output);
+                                                
+        NSTimeInterval elapsedTime = [[NSDate date] timeIntervalSinceDate:startTime];
+        model->metrics.inference_time_ms = elapsedTime * 1000.0;
+        model->metrics.backend_used = NE_BACKEND_METAL_GPU;
+        
+        return success ? 0 : -1;
+    }
+    
+    return -1;
 }
 
 // Performance metrics

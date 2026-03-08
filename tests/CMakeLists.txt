@@ -17,6 +17,16 @@ if(USE_METAL)
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/wrapper/neural_engine.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/wrapper/memory_manager.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/wrapper/compute_kernels.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/memory/unified_memory_manager.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/memory/memory_pool_optimizer.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/memory/sync_optimizer.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/engines/gpu_native_transformer.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/engines/gpu_native_lstm.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/flow/layer_flow_optimizer.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/mps_optimized/mps_transformer_graph.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/mps_optimized/mps_lstm_graph.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/mps_optimized/mps_matrix_optimizer.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/neural/pipeline/async_execution_manager.mm
         # ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/wrapper/benchmark.mm
     )
 endif()
@@ -32,6 +42,7 @@ if(USE_METAL)
         ${METAL_FRAMEWORK}
         ${METALKIT_FRAMEWORK}
         ${METALPERFORMANCESHADERS_FRAMEWORK}
+        ${METALPERFORMANCESHADERSGRAPH_FRAMEWORK}
         ${FOUNDATION_FRAMEWORK}
         ${COREML_FRAMEWORK}
     )
