@@ -786,6 +786,12 @@ void online_trainer_flush(OnlineTrainer* tr) {
 
     if (N == TRAIN_BATCH_SIZE && tr->batch_graph_built) {
         // ---- Fast path: one batched backward pass ----
+        // @autoreleasepool is critical: MPSGraph runWithFeeds creates many
+        // temporary Objective-C objects (feeds dict, result dict, TensorData,
+        // intermediate tensors) that accumulate without it, causing OOM on
+        // large files (e.g. 73KB * 1142 flushes = hundreds of GB).
+        @autoreleasepool {
+
         memcpy([tr->batch_buf_input  contents], tr->input_buf,  N * sizeof(int32_t));
         memcpy([tr->batch_buf_target contents], tr->target_buf, N * sizeof(int32_t));
 
@@ -874,6 +880,8 @@ void online_trainer_flush(OnlineTrainer* tr) {
             [cmd commit];
             [cmd waitUntilCompleted];
         }
+
+        } // @autoreleasepool — releases feeds dict, results dict, TensorData wrappers
     } else {
         // ---- Fallback: N separate single-sample steps (partial flush or graph unavailable) ----
         for (int i = 0; i < N; i++) {

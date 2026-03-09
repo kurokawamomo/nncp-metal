@@ -78,18 +78,29 @@ struct MPSTransformerContext {
     id<MTLBuffer> dec_zero_FFN2;        // [FFN*2] float zeros
     id<MTLBuffer> dec_zero_V;           // [V]   float zeros
 
-    // ---- KV Cache (decode fast path) ----
-    // Layout: [num_layers, max_seq_len, H]  (batch=1, unified memory)
-    id<MTLBuffer> kv_cache_k;           // [L * max_seq_len * H]  float
-    id<MTLBuffer> kv_cache_v;           // [L * max_seq_len * H]  float
-    id<MTLBuffer> dec_buf_scores_decode;// [NH * max_seq_len]     float  scratch for cached attention
-    NSUInteger    kv_cache_pos;         // write slot for the next token (0 .. max_sl-1, wraps)
+    // ---- KV Cache (decode fast path) — Transformer-XL memory layout ----
+    //
+    // The cache is split conceptually into two contiguous segments:
+    //   [0 .. kv_memory_len-1]              → "memory"  (previous chunk, frozen)
+    //   [kv_memory_len .. kv_total_len-1]   → "current" (tokens being processed)
+    //
+    // Buffer layout: [num_layers, batch, kv_total_len, H]
+    // When kv_cache_pos reaches kv_total_len the kv_memory_shift kernel copies
+    // the current segment into the memory segment and resets kv_cache_pos to
+    // kv_memory_len, so the oldest tokens are naturally discarded.
+    id<MTLBuffer> kv_cache_k;           // [L * batch * kv_total_len * H] float
+    id<MTLBuffer> kv_cache_v;           // [L * batch * kv_total_len * H] float
+    id<MTLBuffer> dec_buf_scores_decode;// [batch * NH * kv_total_len]    float  scratch
+    NSUInteger    kv_cache_pos;         // next write slot (0 .. kv_total_len-1)
     bool          kv_cache_valid;       // true after successful alloc
-    bool          kv_cache_wrapped;     // true once kv_cache_pos has wrapped around at least once
 
-    // New pipeline states for KV cache operations
+    uint32_t kv_memory_len;  // = max_seq_len (64): tokens kept as "memory" after a shift
+    uint32_t kv_total_len;   // = kv_memory_len * 2 (128): total slots in cache
+
+    // Pipeline states for KV cache operations
     id<MTLComputePipelineState> ps_kv_cache_write;
     id<MTLComputePipelineState> ps_attn_decode_cached;
+    id<MTLComputePipelineState> ps_kv_memory_shift;
 
     bool decode_pipeline_ready;
     uint32_t kv_cache_batch_size;  // batch size used when decode pipeline was allocated
@@ -202,21 +213,20 @@ void mps_transformer_reset_kv_cache(MPSTransformerContext* ctx) {
     if (!ctx || !ctx->kv_cache_valid) return;
 
     const uint32_t L  = ctx->config.num_layers;
-    const uint32_t S  = ctx->config.max_seq_len;
+    const uint32_t TL = ctx->kv_total_len;
     const uint32_t H  = ctx->config.hidden_size;
     const uint32_t NH = ctx->config.num_heads;
     const uint32_t B  = ctx->kv_cache_batch_size > 0 ? ctx->kv_cache_batch_size : 1;
 
-    // KV layout: [L, B, S, H]
-    size_t kv_size     = (size_t)L * B * S * H * sizeof(float);
-    // scores layout: [B, NH, S]
-    size_t scores_size = (size_t)B * NH * S * sizeof(float);
+    // KV layout: [L, B, TL, H]
+    size_t kv_size     = (size_t)L * B * TL * H * sizeof(float);
+    // scores layout: [B, NH, TL]
+    size_t scores_size = (size_t)B * NH * TL * sizeof(float);
 
     if (ctx->kv_cache_k) memset([ctx->kv_cache_k contents], 0, kv_size);
     if (ctx->kv_cache_v) memset([ctx->kv_cache_v contents], 0, kv_size);
     if (ctx->dec_buf_scores_decode) memset([ctx->dec_buf_scores_decode contents], 0, scores_size);
-    ctx->kv_cache_pos     = 0;
-    ctx->kv_cache_wrapped = false;
+    ctx->kv_cache_pos = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,18 +272,18 @@ static MPSGraphTensor* gelu(MPSGraph* graph, MPSGraphTensor* x) {
 // KV Cache: allocate / reset
 // ---------------------------------------------------------------------------
 
-// KV cache layout: [L, batch_size, max_seq_len, H]
-// scores_decode:   [batch_size, NH, max_seq_len]
+// KV cache layout: [L, batch_size, kv_total_len, H]    (Transformer-XL: total = memory + current)
+// scores_decode:   [batch_size, NH, kv_total_len]
 static bool alloc_kv_cache(MPSTransformerContext* ctx, uint32_t batch_size) {
     if (!ctx || !ctx->device) return false;
 
     const uint32_t L  = ctx->config.num_layers;
-    const uint32_t S  = ctx->config.max_seq_len;
-    const uint32_t H  = ctx->config.hidden_size;   // = NH * HD
+    const uint32_t TL = ctx->kv_total_len;   // memory_len + current_len = 128
+    const uint32_t H  = ctx->config.hidden_size;
     const uint32_t NH = ctx->config.num_heads;
 
-    size_t kv_size     = (size_t)L * batch_size * S * H * sizeof(float);
-    size_t scores_size = (size_t)batch_size * NH * S * sizeof(float);
+    size_t kv_size     = (size_t)L * batch_size * TL * H * sizeof(float);
+    size_t scores_size = (size_t)batch_size * NH * TL * sizeof(float);
 
     ctx->kv_cache_k = [ctx->device newBufferWithLength:kv_size
                                                options:MTLResourceStorageModeShared];
@@ -290,7 +300,6 @@ static bool alloc_kv_cache(MPSTransformerContext* ctx, uint32_t batch_size) {
     memset([ctx->dec_buf_scores_decode contents], 0, scores_size);
 
     ctx->kv_cache_pos        = 0;
-    ctx->kv_cache_wrapped    = false;
     ctx->kv_cache_valid      = true;
     ctx->kv_cache_batch_size = batch_size;
     return true;
@@ -347,14 +356,20 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_element_add         = makePSO(@"element_add");
     ctx->ps_kv_cache_write      = makePSO(@"kv_cache_write");
     ctx->ps_attn_decode_cached  = makePSO(@"transformer_attention_decode_cached");
+    ctx->ps_kv_memory_shift     = makePSO(@"kv_memory_shift");
 
     if (!ctx->ps_embedding   || !ctx->ps_layer_norm || !ctx->ps_linear              ||
         !ctx->ps_attn_score  || !ctx->ps_attn_value || !ctx->ps_geglu               ||
-        !ctx->ps_element_add || !ctx->ps_kv_cache_write || !ctx->ps_attn_decode_cached) {
+        !ctx->ps_element_add || !ctx->ps_kv_cache_write || !ctx->ps_attn_decode_cached ||
+        !ctx->ps_kv_memory_shift) {
         return false;
     }
 
-    // Allocate KV cache buffers (batch-aware layout: [L, batch, S, H])
+    // Transformer-XL: memory_len = max_seq_len, total = memory + current = 2 * max_seq_len
+    ctx->kv_memory_len = ctx->config.max_seq_len;
+    ctx->kv_total_len  = ctx->kv_memory_len * 2;
+
+    // Allocate KV cache buffers (Transformer-XL layout: [L, batch, kv_total_len, H])
     if (!alloc_kv_cache(ctx, batch_size)) {
         NSLog(@"[MPS Decode] Failed to allocate KV cache buffers");
         return false;
@@ -440,7 +455,8 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     const uint32_t NH  = ctx->config.num_heads;
     const uint32_t HD  = ctx->config.head_dim;
     const uint32_t FFN = ctx->config.ffn_size;
-    const uint32_t max_sl = ctx->config.max_seq_len;
+    // Transformer-XL: attention spans the full [memory | current] buffer
+    const uint32_t max_sl = ctx->kv_total_len;
     const float    eps = 1e-5f;
 
     // Copy batch_size token IDs into shared GPU buffer
@@ -560,10 +576,8 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
         // ---- Cached Attention: grid = [NH, batch_size, 1] ----
         // Pass layer-base pointer: kv_cache_k + layer * batch_size * max_sl * H
-        // After a full wrap, every slot is filled, so kv_len == max_sl.
-        uint32_t kv_len = ctx->kv_cache_wrapped
-                          ? max_sl
-                          : (uint32_t)(kv_pos + 1);
+        // kv_pos is always < kv_total_len (no wrap — shift is used instead).
+        uint32_t kv_len = (uint32_t)(kv_pos + 1);
         const float attn_scale = 1.0f / sqrtf((float)HD);
         const NSUInteger kv_layer_off =
             (NSUInteger)layer * batch_size * max_sl * H * sizeof(float);
@@ -707,13 +721,36 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     // Copy [batch_size, V] logits to caller — no readBytes stall (shared memory)
     memcpy(output_data, [ctx->dec_buf_logits contents], (size_t)batch_size * V * sizeof(float));
 
+    // Advance KV position — Transformer-XL shift when current segment is full.
     if (ctx->kv_cache_valid) {
         NSUInteger next_pos = ctx->kv_cache_pos + 1;
-        if (next_pos >= max_sl) {
-            ctx->kv_cache_wrapped = true;
-            next_pos = 0;
+        if (next_pos >= (NSUInteger)ctx->kv_total_len) {
+            // Dispatch kv_memory_shift: copy current→memory, reset to memory_len
+            uint32_t num_lb    = ctx->config.num_layers * ctx->kv_cache_batch_size;
+            uint32_t total_len = ctx->kv_total_len;
+            uint32_t mem_len   = ctx->kv_memory_len;
+            uint32_t H_val     = ctx->config.hidden_size;
+            uint32_t n_shift   = num_lb * mem_len * H_val;
+
+            id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
+            [se setComputePipelineState:ctx->ps_kv_memory_shift];
+            [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
+            [se setBuffer:ctx->kv_cache_v offset:0 atIndex:1];
+            [se setBytes:&num_lb    length:sizeof(uint32_t) atIndex:2];
+            [se setBytes:&total_len length:sizeof(uint32_t) atIndex:3];
+            [se setBytes:&mem_len   length:sizeof(uint32_t) atIndex:4];
+            [se setBytes:&H_val     length:sizeof(uint32_t) atIndex:5];
+            [se dispatchThreads:MTLSizeMake(n_shift, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(n_shift, 64u), 1, 1)];
+            [se endEncoding];
+            [sc commit];
+            [sc waitUntilCompleted];
+
+            ctx->kv_cache_pos = ctx->kv_memory_len;
+        } else {
+            ctx->kv_cache_pos = next_pos;
         }
-        ctx->kv_cache_pos = next_pos;
     }
 
     return true;

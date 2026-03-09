@@ -322,6 +322,41 @@ kernel void transformer_attention_decode_cached(
     }
 }
 
+// Transformer-XL memory shift
+//
+// Copies the "current" segment [memory_len .. total_len-1] into the "memory"
+// segment [0 .. memory_len-1] for both K and V caches across all (layer, batch)
+// pairs.  Called once every time the current segment fills up (i.e. after
+// processing total_len tokens since the last shift / session start).
+//
+// Buffer layout: [L * batch_size, total_len, H]  (flat float32 array)
+//   L * batch_size =: num_lb
+//
+// Grid: [num_lb * memory_len * H, 1, 1]
+kernel void kv_memory_shift(
+    device float*       kv_k       [[buffer(0)]],
+    device float*       kv_v       [[buffer(1)]],
+    constant uint&      num_lb     [[buffer(2)]],  // num_layers * batch_size
+    constant uint&      total_len  [[buffer(3)]],  // memory_len + current_len
+    constant uint&      memory_len [[buffer(4)]],  // tokens kept as memory
+    constant uint&      H          [[buffer(5)]],  // hidden_size
+    uint gid [[thread_position_in_grid]]
+) {
+    uint n_copy = num_lb * memory_len * H;
+    if (gid >= n_copy) return;
+
+    uint h   = gid % H;
+    uint rem = gid / H;
+    uint pos = rem % memory_len;  // destination memory slot
+    uint lb  = rem / memory_len;  // (layer, batch) index
+
+    uint dst = lb * total_len * H + pos             * H + h;
+    uint src = lb * total_len * H + (memory_len + pos) * H + h;
+
+    kv_k[dst] = kv_k[src];
+    kv_v[dst] = kv_v[src];
+}
+
 // SGD weight update: weight[i] -= lr * grad[i]
 // Dispatch with grid = [num_elements, 1, 1]
 kernel void sgd_update(

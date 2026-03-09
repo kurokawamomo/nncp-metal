@@ -507,56 +507,14 @@ CompressionAlgorithm compression_integration_select_algorithm(
     const uint8_t* input_data,
     size_t input_size
 ) {
-    if (!input_data || input_size == 0) {
-        return COMPRESSION_ALGORITHM_LSTM; // Default neural algorithm
-    }
-    
-    if (!g_integration_initialized) {
-        // Simple text detection for neural algorithm selection
-        bool looks_like_text = true;
-        for (size_t i = 0; i < input_size && i < 100; i++) {
-            uint8_t byte = input_data[i];
-            if (byte < 32 && byte != '\n' && byte != '\r' && byte != '\t') {
-                if (byte != 0) {
-                    looks_like_text = false;
-                    break;
-                }
-            }
-        }
-        
-        return looks_like_text ? COMPRESSION_ALGORITHM_TRANSFORMER : COMPRESSION_ALGORITHM_LSTM;
-    }
-    
-    // Use algorithm router if available
-    if (algorithm_router_is_ready()) {
-        AlgorithmRoutingDecision decision;
-        if (algorithm_router_analyze_and_select(input_data, input_size, &decision)) {
-            // Convert routing algorithm to neural compression algorithm
-            switch (decision.primary_algorithm) {
-                case ROUTING_ALGORITHM_TRANSFORMER:
-                    return COMPRESSION_ALGORITHM_TRANSFORMER;
-                case ROUTING_ALGORITHM_LSTM:
-                    return COMPRESSION_ALGORITHM_LSTM;
-                default:
-                    break; // Fall through to heuristics
-            }
-        }
-    }
-    
-    // Fallback to basic heuristics if router is not available
-    // Simple text detection
-    bool is_text_like = true;
-    for (size_t i = 0; i < input_size && i < 100; i++) {
-        uint8_t byte = input_data[i];
-        if (byte < 32 && byte != '\n' && byte != '\r' && byte != '\t') {
-            if (byte != 0) {
-                is_text_like = false;
-                break;
-            }
-        }
-    }
-    
-    return is_text_like ? COMPRESSION_ALGORITHM_TRANSFORMER : COMPRESSION_ALGORITHM_LSTM;
+    /* Original NNCP treats every file as a plain byte-stream regardless of
+     * content type.  Text/binary detection is therefore incorrect: it causes
+     * binary files (JPEG, binary data, …) to be routed to the legacy LSTM
+     * path instead of the Transformer + online-learning path.
+     * Always return TRANSFORMER. */
+    (void)input_data;
+    (void)input_size;
+    return COMPRESSION_ALGORITHM_TRANSFORMER;
 }
 
 const char* compression_integration_algorithm_name(CompressionAlgorithm algorithm) {

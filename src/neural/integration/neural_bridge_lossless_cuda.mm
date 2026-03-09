@@ -1341,14 +1341,16 @@ compress_cleanup:
 
     // 4. Flush all encoders and combine results
     
-    // Output format:
-    // [Stream Sizes Table (NUM_STREAMS * 4 bytes)]
-    // [Stream 0 Data]
-    // [Stream 1 Data]
+    // Output format (self-describing):
+    // [uint32: num_streams]          ← ストリーム数
+    // [uint32 × num_streams]         ← 各ストリームのバイト数
+    // [stream 0 data]
+    // [stream 1 data]
     // ...
     
-    uint32_t* size_table = (uint32_t*)output_data;
-    size_t current_output_offset = sizeof(uint32_t) * NUM_STREAMS;
+    *(uint32_t*)output_data = (uint32_t)NUM_STREAMS;          // header: num_streams
+    uint32_t* size_table = (uint32_t*)(output_data + sizeof(uint32_t));
+    size_t current_output_offset = sizeof(uint32_t) + sizeof(uint32_t) * NUM_STREAMS;
     
     for (int s = 0; s < NUM_STREAMS; s++) {
         int64_t s_size = put_bit_flush(&encoders[s]);
@@ -1393,47 +1395,62 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     reset_model_to_session_weights(get_shared_transformer_model());
 
     printf("Starting CUDA-compatible lossless decompression: %zu bytes (Multi-Stream Parallel Mode)\n", input_size);
-    
-    // 1. Parse Stream Size Table
-    uint32_t* size_table = (uint32_t*)input_data;
-    size_t current_input_offset = sizeof(uint32_t) * NUM_STREAMS;
 
-    // Validate table
-    size_t total_compressed_size = current_input_offset;
-    for (int i = 0; i < NUM_STREAMS; i++) {
-        total_compressed_size += size_table[i];
+    // 1. Parse self-describing header
+    //    [uint32: num_streams][uint32 × num_streams: per-stream sizes][stream data ...]
+    if (input_size < sizeof(uint32_t)) {
+        printf("Error: Compressed data too small to hold header\n");
+        return 0;
     }
+    uint32_t file_num_streams = *(const uint32_t*)input_data;
+    if (file_num_streams == 0 || file_num_streams > 1024) {
+        printf("Error: Invalid num_streams in header: %u\n", file_num_streams);
+        return 0;
+    }
+    size_t header_bytes = sizeof(uint32_t) + sizeof(uint32_t) * file_num_streams;
+    if (input_size < header_bytes) {
+        printf("Error: Compressed data too small for stream-sizes table\n");
+        return 0;
+    }
+    const uint32_t* size_table = (const uint32_t*)(input_data + sizeof(uint32_t));
+    size_t current_input_offset = header_bytes;
+
+    // Validate total
+    size_t total_compressed_size = current_input_offset;
+    for (uint32_t i = 0; i < file_num_streams; i++) total_compressed_size += size_table[i];
     if (total_compressed_size > input_size) {
-        printf("Error: Compressed data size mismatch (expected %zu, got %zu)\n", total_compressed_size, input_size);
+        printf("Error: Compressed data size mismatch (expected %zu, got %zu)\n",
+               total_compressed_size, input_size);
         return 0;
     }
 
-    // 2. Initialize Decoders
-    GetBitState decoders[NUM_STREAMS];
-    size_t stream_offsets[NUM_STREAMS]; // Current write offset in output_data for each stream
-    size_t stream_limits[NUM_STREAMS];  // Max bytes to decode for each stream
-    bool stream_finished[NUM_STREAMS];
-    
-    // Calculate output stream limits
-    size_t stream_size_out = (output_capacity + NUM_STREAMS - 1) / NUM_STREAMS;
-    
-    for (int i = 0; i < NUM_STREAMS; i++) {
+    // 2. Initialize Decoders (dynamic allocation — file_num_streams from header)
+    GetBitState* decoders       = (GetBitState*)malloc(file_num_streams * sizeof(GetBitState));
+    size_t*      stream_offsets = (size_t*)     malloc(file_num_streams * sizeof(size_t));
+    size_t*      stream_limits  = (size_t*)     malloc(file_num_streams * sizeof(size_t));
+    bool*        stream_finished= (bool*)       malloc(file_num_streams * sizeof(bool));
+    if (!decoders || !stream_offsets || !stream_limits || !stream_finished) {
+        free(decoders); free(stream_offsets); free(stream_limits); free(stream_finished);
+        printf("Error: OOM allocating decoder arrays\n");
+        return 0;
+    }
+
+    size_t stream_size_out = (output_capacity + file_num_streams - 1) / file_num_streams;
+
+    for (uint32_t i = 0; i < file_num_streams; i++) {
         get_bit_init(&decoders[i], (uint8_t*)(input_data + current_input_offset), size_table[i]);
         current_input_offset += size_table[i];
-        
+
         stream_offsets[i] = i * stream_size_out;
         size_t limit;
         if (stream_offsets[i] >= output_capacity) {
-            // This stream's region is entirely beyond the output boundary.
-            // Avoid unsigned underflow: output_capacity - stream_offsets[i] would wrap.
             limit = 0;
         } else {
             limit = stream_size_out;
-            if (stream_offsets[i] + limit > output_capacity) {
+            if (stream_offsets[i] + limit > output_capacity)
                 limit = output_capacity - stream_offsets[i];
-            }
         }
-        stream_limits[i] = limit;
+        stream_limits[i]   = limit;
         stream_finished[i] = (limit == 0);
     }
 
@@ -1454,59 +1471,54 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         online_trainer_reset_session(g_online_trainer, false);
     }
 
-    // Working buffers
-    int32_t* input_batch = (int32_t*)calloc(NUM_STREAMS * seq_len, sizeof(int32_t));
-    float* probs = (float*)malloc(vocab_size * sizeof(float));
-    
-    // Track decoded count for each stream
-    size_t decoded_counts[NUM_STREAMS] = {0};
+    // Working buffers (sized from file_num_streams, not compile-time NUM_STREAMS)
+    int32_t* input_batch           = (int32_t*)calloc(file_num_streams * seq_len, sizeof(int32_t));
+    float*   probs                 = (float*)  malloc(vocab_size * sizeof(float));
+    size_t*  decoded_counts        = (size_t*) calloc(file_num_streams, sizeof(size_t));
+    int32_t* last_token_per_stream = (int32_t*)calloc(file_num_streams, sizeof(int32_t));
+    int32_t* cur_tokens            = (int32_t*)malloc(file_num_streams * sizeof(int32_t));
+    float*   mps_logits            = (float*)  malloc(file_num_streams * 256 * sizeof(float));
+    if (!input_batch || !probs || !decoded_counts || !last_token_per_stream
+        || !cur_tokens || !mps_logits) {
+        free(decoders); free(stream_offsets); free(stream_limits); free(stream_finished);
+        free(input_batch); free(probs); free(decoded_counts);
+        free(last_token_per_stream); free(cur_tokens); free(mps_logits);
+        printf("Error: OOM allocating decode working buffers\n");
+        return 0;
+    }
+
     size_t total_decoded = 0;
-    
-    size_t max_steps = stream_size_out; // Max bytes per stream
+    size_t max_steps  = stream_size_out;
     size_t chunk_count = (max_steps + seq_len - 1) / seq_len;
 
-    // Transformer-XL: reset KV cache ONCE at session start so context persists
-    // across chunk boundaries (symmetric with compress side).
+    // Transformer-XL: reset KV cache ONCE at session start.
     mps_transformer_reset_kv_cache(mps_ctx);
-    int32_t last_token_per_stream[NUM_STREAMS] = {0};  // BOS for first chunk
 
     for (size_t chunk = 0; chunk < chunk_count; chunk++) {
-        // Initialise pos=0 from the last token of the previous chunk (or BOS).
-        // Positions 1..seq_len-1 will be filled in during the inner loop.
-        for (int s = 0; s < NUM_STREAMS; s++) {
+        for (uint32_t s = 0; s < file_num_streams; s++) {
             input_batch[s * seq_len + 0] = last_token_per_stream[s];
             for (int p = 1; p < seq_len; p++)
                 input_batch[s * seq_len + p] = 0;
         }
 
-        // Iterate through positions in the chunk
         for (size_t pos_in_chunk = 0; pos_in_chunk < seq_len; pos_in_chunk++) {
-            // Skip chunk if all streams are done.
             bool chunk_active = false;
-            for (int s = 0; s < NUM_STREAMS; s++) {
-                if (decoded_counts[s] < stream_limits[s]) {
-                    chunk_active = true;
-                    break;
-                }
+            for (uint32_t s = 0; s < file_num_streams; s++) {
+                if (decoded_counts[s] < stream_limits[s]) { chunk_active = true; break; }
             }
             if (!chunk_active) break;
 
-            // GPU call: one token per stream at current position.
-            //   pos_in_chunk=0 → cur_tokens[s] = 0 (BOS)
-            //   pos_in_chunk>0 → cur_tokens[s] = previously decoded byte for stream s
-            int32_t cur_tokens[NUM_STREAMS];
-            float   mps_logits[NUM_STREAMS * 256];  // 8 * 256 * 4 = 8 KB on stack
-            for (int s = 0; s < NUM_STREAMS; s++)
+            for (uint32_t s = 0; s < file_num_streams; s++)
                 cur_tokens[s] = input_batch[s * seq_len + pos_in_chunk];
 
-            bool success = mps_transformer_execute(mps_ctx, cur_tokens, NUM_STREAMS, 1, mps_logits);
+            bool success = mps_transformer_execute(mps_ctx, cur_tokens,
+                                                   (int)file_num_streams, 1, mps_logits);
             if (!success) {
                 printf("MPS execution failed at chunk %zu, pos %zu\n", chunk, pos_in_chunk);
                 goto cleanup;
             }
 
-            // 3. Decode one symbol per stream
-            for (int s = 0; s < NUM_STREAMS; s++) {
+            for (uint32_t s = 0; s < file_num_streams; s++) {
                 if (decoded_counts[s] >= stream_limits[s]) continue;
 
                 // MPS batched decode: logits for stream s are at mps_logits + s * vocab_size
@@ -1563,9 +1575,17 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     if (g_online_trainer) online_trainer_flush(g_online_trainer);
 
 cleanup:
+    free(decoders);
+    free(stream_offsets);
+    free(stream_limits);
+    free(stream_finished);
     free(input_batch);
     free(probs);
-    
+    free(decoded_counts);
+    free(last_token_per_stream);
+    free(cur_tokens);
+    free(mps_logits);
+
     printf("\nMulti-Stream Decompression Completed: %zu bytes\n", total_decoded);
     return total_decoded;
 }
