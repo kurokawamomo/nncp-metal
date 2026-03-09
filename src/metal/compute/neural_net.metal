@@ -322,6 +322,17 @@ kernel void transformer_attention_decode_cached(
     }
 }
 
+// SGD weight update: weight[i] -= lr * grad[i]
+// Dispatch with grid = [num_elements, 1, 1]
+kernel void sgd_update(
+    device float*       weight [[buffer(0)]],
+    device const float* grad   [[buffer(1)]],
+    constant float&     lr     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    weight[gid] -= lr * grad[gid];
+}
+
 // 6. Element-wise Add (Residual Connection)
 kernel void element_add(
     device const float* a [[buffer(0)]],

@@ -63,6 +63,33 @@ void mps_transformer_destroy(MPSTransformerContext* ctx);
 void mps_transformer_reset_kv_cache(MPSTransformerContext* ctx);
 
 /**
+ * Weight buffer accessor — returns Metal buffers and config so that other
+ * modules (e.g. OnlineTrainer) can read/write the weights without knowing
+ * the internals of MPSTransformerContext.
+ */
+typedef struct {
+    id<MTLBuffer> embed;      /* [V, H] */
+    id<MTLBuffer> pos_embed;  /* [S, H] */
+    id<MTLBuffer> attn_q;     /* [L, H, H] */
+    id<MTLBuffer> attn_k;     /* [L, H, H] */
+    id<MTLBuffer> attn_v;     /* [L, H, H] */
+    id<MTLBuffer> attn_out;   /* [L, H, H] */
+    id<MTLBuffer> ffn1;       /* [L, H, F*2] */
+    id<MTLBuffer> ffn2;       /* [L, F, H] */
+    id<MTLBuffer> ln;         /* [L, 2, H] */
+    id<MTLBuffer> final_ln;   /* [2, H] */
+    id<MTLBuffer> out_proj;   /* [H, V] */
+} MPSTransformerWeightBuffers;
+
+bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,
+                                        MPSTransformerWeightBuffers* out);
+
+/**
+ * Returns the configuration stored inside the context (zeroed on error).
+ */
+MPSTransformerConfig mps_transformer_get_config(MPSTransformerContext* ctx);
+
+/**
  * Execute Batch Inference using MPSGraph (synchronous)
  *
  * Blocks the CPU until GPU computation and readBytes are complete.

@@ -83,8 +83,9 @@ struct MPSTransformerContext {
     id<MTLBuffer> kv_cache_k;           // [L * max_seq_len * H]  float
     id<MTLBuffer> kv_cache_v;           // [L * max_seq_len * H]  float
     id<MTLBuffer> dec_buf_scores_decode;// [NH * max_seq_len]     float  scratch for cached attention
-    NSUInteger    kv_cache_pos;         // how many tokens are currently stored
+    NSUInteger    kv_cache_pos;         // write slot for the next token (0 .. max_sl-1, wraps)
     bool          kv_cache_valid;       // true after successful alloc
+    bool          kv_cache_wrapped;     // true once kv_cache_pos has wrapped around at least once
 
     // New pipeline states for KV cache operations
     id<MTLComputePipelineState> ps_kv_cache_write;
@@ -175,6 +176,28 @@ void mps_transformer_destroy(MPSTransformerContext* ctx) {
     }
 }
 
+MPSTransformerConfig mps_transformer_get_config(MPSTransformerContext* ctx) {
+    if (!ctx) { MPSTransformerConfig z = {}; return z; }
+    return ctx->config;
+}
+
+bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,
+                                        MPSTransformerWeightBuffers* out) {
+    if (!ctx || !out) return false;
+    out->embed     = ctx->w_embed;
+    out->pos_embed = ctx->w_pos;
+    out->attn_q    = ctx->w_attn_q;
+    out->attn_k    = ctx->w_attn_k;
+    out->attn_v    = ctx->w_attn_v;
+    out->attn_out  = ctx->w_attn_out;
+    out->ffn1      = ctx->w_ffn_1;
+    out->ffn2      = ctx->w_ffn_2;
+    out->ln        = ctx->w_ln;
+    out->final_ln  = ctx->w_final_ln;
+    out->out_proj  = ctx->w_out_proj;
+    return true;
+}
+
 void mps_transformer_reset_kv_cache(MPSTransformerContext* ctx) {
     if (!ctx || !ctx->kv_cache_valid) return;
 
@@ -192,7 +215,8 @@ void mps_transformer_reset_kv_cache(MPSTransformerContext* ctx) {
     if (ctx->kv_cache_k) memset([ctx->kv_cache_k contents], 0, kv_size);
     if (ctx->kv_cache_v) memset([ctx->kv_cache_v contents], 0, kv_size);
     if (ctx->dec_buf_scores_decode) memset([ctx->dec_buf_scores_decode contents], 0, scores_size);
-    ctx->kv_cache_pos = 0;
+    ctx->kv_cache_pos     = 0;
+    ctx->kv_cache_wrapped = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +290,7 @@ static bool alloc_kv_cache(MPSTransformerContext* ctx, uint32_t batch_size) {
     memset([ctx->dec_buf_scores_decode contents], 0, scores_size);
 
     ctx->kv_cache_pos        = 0;
+    ctx->kv_cache_wrapped    = false;
     ctx->kv_cache_valid      = true;
     ctx->kv_cache_batch_size = batch_size;
     return true;
@@ -535,7 +560,10 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
         // ---- Cached Attention: grid = [NH, batch_size, 1] ----
         // Pass layer-base pointer: kv_cache_k + layer * batch_size * max_sl * H
-        uint32_t kv_len = (uint32_t)(kv_pos + 1);
+        // After a full wrap, every slot is filled, so kv_len == max_sl.
+        uint32_t kv_len = ctx->kv_cache_wrapped
+                          ? max_sl
+                          : (uint32_t)(kv_pos + 1);
         const float attn_scale = 1.0f / sqrtf((float)HD);
         const NSUInteger kv_layer_off =
             (NSUInteger)layer * batch_size * max_sl * H * sizeof(float);
@@ -680,7 +708,12 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     memcpy(output_data, [ctx->dec_buf_logits contents], (size_t)batch_size * V * sizeof(float));
 
     if (ctx->kv_cache_valid) {
-        ctx->kv_cache_pos = (ctx->kv_cache_pos + 1) % max_sl;
+        NSUInteger next_pos = ctx->kv_cache_pos + 1;
+        if (next_pos >= max_sl) {
+            ctx->kv_cache_wrapped = true;
+            next_pos = 0;
+        }
+        ctx->kv_cache_pos = next_pos;
     }
 
     return true;

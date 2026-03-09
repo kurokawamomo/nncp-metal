@@ -111,6 +111,7 @@ if(USE_METAL)
         src/neural/mps_optimized/mps_lstm_graph.mm
         src/neural/mps_optimized/mps_matrix_optimizer.mm
         src/neural/pipeline/async_execution_manager.mm
+        src/neural/training/online_trainer.mm
         # src/metal/wrapper/benchmark.mm
     )
     
@@ -137,6 +138,7 @@ if(USE_METAL)
         src/neural/integration/neural_bridge.mm
         src/neural/integration/neural_bridge_lossless_cuda.mm
         src/neural/integration/neural_bridge_enhanced.c
+        src/neural/training/online_trainer.mm
         src/neural/quality/quality_validator.c
         src/neural/prediction/prediction_scorer.c
         src/neural/prediction/entropy_analyzer.c
@@ -165,6 +167,7 @@ if(USE_METAL)
         src/neural/integration/neural_bridge.mm
         src/neural/integration/neural_bridge_lossless_cuda.mm
         src/neural/integration/neural_bridge_enhanced.c
+        src/neural/training/online_trainer.mm
         src/neural/quality/quality_validator.c
         src/neural/prediction/prediction_scorer.c
         src/neural/prediction/entropy_analyzer.c
@@ -190,6 +193,14 @@ if(USE_METAL)
     
     target_compile_definitions(nncp-metal PRIVATE USE_METAL=1)
     add_dependencies(nncp-metal metal_shaders)
+
+    # Keep the metallib next to the executable so it can be found at runtime.
+    add_custom_command(TARGET nncp-metal POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_BINARY_DIR}/default.metallib
+            ${CMAKE_SOURCE_DIR}/default.metallib
+        COMMENT "Copying default.metallib to project root"
+    )
     
     # NNCP Diagnostics tool (simplified to avoid type conflicts)
     add_executable(nncp-diagnostics

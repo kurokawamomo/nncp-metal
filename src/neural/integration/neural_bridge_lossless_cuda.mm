@@ -19,6 +19,7 @@
 #include "../../neural/flow/layer_flow_optimizer.h"
 #include "../../neural/weights/neural_weights.h"
 #include "../../neural/mps_optimized/mps_transformer_graph.h"
+#include "../../neural/training/online_trainer.h"
 
 // Fix BOOL definition for compatibility
 #ifndef BOOL
@@ -1043,6 +1044,102 @@ static FlowOptimizerContext* get_shared_flow_context() {
 }
 
 // Shared MPS Transformer Context (batched KV-cache decode path)
+/* -------------------------------------------------------------------------
+ * Session weight snapshots
+ *
+ * On the first call to ensure_session_weights() the current MTLBuffer
+ * contents are copied to CPU-side float* buffers.  Subsequent calls to
+ * reset_model_to_session_weights() restore those buffers, guaranteeing that
+ * every compress / decompress session starts from the same initial weights.
+ *
+ * Position embeddings are excluded from the snapshot: they are computed by
+ * the sinusoidal formula (deterministic, never mutated), so they are
+ * always identical without explicit snapshotting.
+ * ---------------------------------------------------------------------- */
+
+static float* g_session_init_embed     = NULL;  /* [V * H]          */
+static float* g_session_init_attn_q    = NULL;  /* [L * H * H]      */
+static float* g_session_init_attn_k    = NULL;  /* [L * H * H]      */
+static float* g_session_init_attn_v    = NULL;  /* [L * H * H]      */
+static float* g_session_init_attn_out  = NULL;  /* [L * H * H]      */
+static float* g_session_init_ffn1      = NULL;  /* [L * H * FFS * 2]*/
+static float* g_session_init_ffn2      = NULL;  /* [L * FFS * H]    */
+static float* g_session_init_ln        = NULL;  /* [L * 2 * H]      */
+static float* g_session_init_final_ln  = NULL;  /* [2 * H]          */
+static float* g_session_init_out_proj  = NULL;  /* [H * V]          */
+static bool   g_session_weights_ready  = false;
+
+/* Snapshot the model's current weights into CPU buffers (called once). */
+static void ensure_session_weights(MetalTransformerModel* model) {
+    if (g_session_weights_ready || !model) return;
+
+    const size_t L   = model->num_layers;
+    const size_t H   = model->hidden_size;
+    const size_t V   = model->vocab_size;
+    const size_t FFS = model->feed_forward_size;
+
+#define SNAPSHOT(dst, buf, n) do { \
+    size_t _sz = (n) * sizeof(float); \
+    (dst) = (float*)malloc(_sz); \
+    if (!(dst)) { fprintf(stderr, "[session_weights] malloc failed\n"); return; } \
+    memcpy((dst), [(buf) contents], _sz); \
+} while (0)
+
+    SNAPSHOT(g_session_init_embed,    model->embedding_weights,       V * H);
+    SNAPSHOT(g_session_init_attn_q,   model->attention_weights_q,     L * H * H);
+    SNAPSHOT(g_session_init_attn_k,   model->attention_weights_k,     L * H * H);
+    SNAPSHOT(g_session_init_attn_v,   model->attention_weights_v,     L * H * H);
+    SNAPSHOT(g_session_init_attn_out, model->attention_output_weights, L * H * H);
+    SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS * 2);
+    SNAPSHOT(g_session_init_ffn2,     model->ffn_weights_2,           L * FFS * H);
+    SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 2 * H);
+    SNAPSHOT(g_session_init_final_ln, model->final_layer_norm_weights, 2 * H);
+    SNAPSHOT(g_session_init_out_proj, model->output_projection,       H * V);
+
+#undef SNAPSHOT
+
+    g_session_weights_ready = true;
+    printf("[session_weights] Snapshot captured (%.1f MB)\n",
+           (double)((V*H + 4*L*H*H + L*H*FFS*2 + L*FFS*H + L*2*H + 2*H + H*V)
+                    * sizeof(float)) / (1024.0 * 1024.0));
+}
+
+/* Restore MTLBuffer contents from the snapshot (call at compress/decompress start). */
+static void reset_model_to_session_weights(MetalTransformerModel* model) {
+    ensure_session_weights(model);
+    if (!g_session_weights_ready || !model) return;
+
+    const size_t L   = model->num_layers;
+    const size_t H   = model->hidden_size;
+    const size_t V   = model->vocab_size;
+    const size_t FFS = model->feed_forward_size;
+
+#define RESTORE(src, buf, n) \
+    memcpy([(buf) contents], (src), (n) * sizeof(float))
+
+    RESTORE(g_session_init_embed,    model->embedding_weights,        V * H);
+    RESTORE(g_session_init_attn_q,   model->attention_weights_q,      L * H * H);
+    RESTORE(g_session_init_attn_k,   model->attention_weights_k,      L * H * H);
+    RESTORE(g_session_init_attn_v,   model->attention_weights_v,      L * H * H);
+    RESTORE(g_session_init_attn_out, model->attention_output_weights,  L * H * H);
+    RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS * 2);
+    RESTORE(g_session_init_ffn2,     model->ffn_weights_2,            L * FFS * H);
+    RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 2 * H);
+    RESTORE(g_session_init_final_ln, model->final_layer_norm_weights,  2 * H);
+    RESTORE(g_session_init_out_proj, model->output_projection,        H * V);
+
+#undef RESTORE
+
+#ifndef NDEBUG
+    /* Verification: print first 10 elements of w_embed */
+    float* e = (float*)[model->embedding_weights contents];
+    printf("[session_weights] reset: w_embed[0..9] =");
+    for (int _i = 0; _i < 10; _i++) printf(" %.6f", e[_i]);
+    printf("\n");
+#endif
+}
+
+static OnlineTrainer*         g_online_trainer = NULL;
 static MPSTransformerContext* g_mps_ctx = NULL;
 
 static MPSTransformerContext* get_shared_mps_ctx() {
@@ -1079,7 +1176,7 @@ static MPSTransformerContext* get_shared_mps_ctx() {
     return g_mps_ctx;
 }
 
-#define NUM_STREAMS 8
+#define NUM_STREAMS 8  /* Phase 2: batched back-prop (= TRAIN_BATCH_SIZE) */
 
 // Main CUDA-compatible lossless compression function
 size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size, 
@@ -1089,7 +1186,11 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         printf("CUDA Lossless compression: Invalid input parameters\n");
         return 0;
     }
-    
+
+    /* Reset model to deterministic session weights so that compress and
+     * decompress always start from the identical initial state. */
+    reset_model_to_session_weights(get_shared_transformer_model());
+
     printf("Starting CUDA-compatible lossless compression: %zu bytes (Multi-Stream Batch Mode)\n", input_size);
     
     // Calculate stream size (split input evenly)
@@ -1127,11 +1228,26 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         return 0;
     }
 
+    // Online trainer: create once, reset to deterministic state each session
+    if (!g_online_trainer) {
+        g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
+                                                  mps_ctx, /* lr= */ 1e-3f);
+    }
+    if (g_online_trainer) {
+        online_trainer_reset_session(g_online_trainer, false);
+    }
+
     // Working buffers
     // Batch input: [NUM_STREAMS * seq_len] — stores accumulated token context per stream
     int32_t* input_batch = (int32_t*)calloc(NUM_STREAMS * seq_len, sizeof(int32_t));
     float* probs = (float*)malloc(vocab_size * sizeof(float));
-    
+
+    // Transformer-XL: reset KV cache ONCE at session start so context persists
+    // across chunk boundaries.  last_token_per_stream carries the final token of
+    // each chunk into the first position of the next chunk.
+    mps_transformer_reset_kv_cache(mps_ctx);
+    int32_t last_token_per_stream[NUM_STREAMS] = {0};  // BOS for first chunk
+
     // Process in chunks of seq_len for all streams.
     // Each position within a chunk gets its own GPU call so that the input context
     // seen by the model exactly mirrors the decompressor's sequential decode loop.
@@ -1139,11 +1255,13 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     size_t num_steps = (stream_size + seq_len - 1) / seq_len;
     
     for (size_t step = 0; step < num_steps; step++) {
-        // Reset input_batch to BOS at the start of each chunk (same as decompress).
-        memset(input_batch, 0, NUM_STREAMS * seq_len * sizeof(int32_t));
-        
-        // Reset KV cache at the start of each chunk (mirrors decompress).
-        mps_transformer_reset_kv_cache(mps_ctx);
+        // Initialise pos=0 from the last token of the previous chunk (or BOS).
+        // Positions 1..seq_len-1 will be filled in during the inner loop.
+        for (int s = 0; s < NUM_STREAMS; s++) {
+            input_batch[s * seq_len + 0] = last_token_per_stream[s];
+            for (int p = 1; p < seq_len; p++)
+                input_batch[s * seq_len + p] = 0;
+        }
 
         for (size_t pos = 0; pos < (size_t)seq_len; pos++) {
             // 1. Check if any stream still has data to encode at this position.
@@ -1192,12 +1310,21 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                 
                 uint8_t symbol = input_data[src_idx];
                 write_sym(&encoders[s], probs, vocab_size, symbol);
-                
+
+                // Online training: buffer this (input, true_byte) pair.
+                // The buffer auto-flushes when NUM_STREAMS bytes have been
+                // accumulated (one flush per pos-iteration, batch = 8).
+                if (g_online_trainer) {
+                    online_trainer_step_buffered(g_online_trainer, cur_tokens[s], (int)symbol);
+                }
+
                 // Feed encoded symbol as context for the next position
                 // (identical to the update done in the decompress loop).
                 if (pos + 1 < (size_t)seq_len) {
                     input_batch[s * seq_len + pos + 1] = symbol;
                 }
+                // Transformer-XL: carry last token across chunk boundaries
+                last_token_per_stream[s] = symbol;
             }
         }
         
@@ -1206,6 +1333,10 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
             fflush(stdout);
         }
     }
+
+    // Drain any remaining buffered training samples (e.g. final partial batch).
+    if (g_online_trainer) online_trainer_flush(g_online_trainer);
+
 compress_cleanup:
 
     // 4. Flush all encoders and combine results
@@ -1257,7 +1388,10 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         printf("CUDA Lossless decompression: Invalid input parameters\n");
         return 0;
     }
-    
+
+    /* Reset model to the same deterministic session weights used by compress. */
+    reset_model_to_session_weights(get_shared_transformer_model());
+
     printf("Starting CUDA-compatible lossless decompression: %zu bytes (Multi-Stream Parallel Mode)\n", input_size);
     
     // 1. Parse Stream Size Table
@@ -1311,6 +1445,15 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     MPSTransformerContext* mps_ctx = get_shared_mps_ctx();
     if (!mps_ctx) return 0;
 
+    // Online trainer: create once, reset to same deterministic state as compress
+    if (!g_online_trainer) {
+        g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
+                                                  mps_ctx, /* lr= */ 1e-3f);
+    }
+    if (g_online_trainer) {
+        online_trainer_reset_session(g_online_trainer, false);
+    }
+
     // Working buffers
     int32_t* input_batch = (int32_t*)calloc(NUM_STREAMS * seq_len, sizeof(int32_t));
     float* probs = (float*)malloc(vocab_size * sizeof(float));
@@ -1321,11 +1464,20 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     
     size_t max_steps = stream_size_out; // Max bytes per stream
     size_t chunk_count = (max_steps + seq_len - 1) / seq_len;
-    
+
+    // Transformer-XL: reset KV cache ONCE at session start so context persists
+    // across chunk boundaries (symmetric with compress side).
+    mps_transformer_reset_kv_cache(mps_ctx);
+    int32_t last_token_per_stream[NUM_STREAMS] = {0};  // BOS for first chunk
+
     for (size_t chunk = 0; chunk < chunk_count; chunk++) {
-        // Reset input batch and KV cache at the start of each chunk.
-        memset(input_batch, 0, NUM_STREAMS * seq_len * sizeof(int32_t));
-        mps_transformer_reset_kv_cache(mps_ctx);
+        // Initialise pos=0 from the last token of the previous chunk (or BOS).
+        // Positions 1..seq_len-1 will be filled in during the inner loop.
+        for (int s = 0; s < NUM_STREAMS; s++) {
+            input_batch[s * seq_len + 0] = last_token_per_stream[s];
+            for (int p = 1; p < seq_len; p++)
+                input_batch[s * seq_len + p] = 0;
+        }
 
         // Iterate through positions in the chunk
         for (size_t pos_in_chunk = 0; pos_in_chunk < seq_len; pos_in_chunk++) {
@@ -1383,12 +1535,21 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                 output_data[stream_offsets[s] + decoded_counts[s]] = (uint8_t)symbol;
                 decoded_counts[s]++;
                 total_decoded++;
-                
+
+                // Online training: symmetric buffered update (same order as compress).
+                if (g_online_trainer) {
+                    online_trainer_step_buffered(g_online_trainer,
+                                                  input_batch[s * seq_len + pos_in_chunk],
+                                                  symbol);
+                }
+
                 // Update input_batch for NEXT position's prediction
                 // We shift: input for pos+1 should have d_{pos} at index {pos+1}
                 if (pos_in_chunk + 1 < seq_len) {
                     input_batch[s * seq_len + pos_in_chunk + 1] = symbol;
                 }
+                // Transformer-XL: carry last token across chunk boundaries
+                last_token_per_stream[s] = symbol;
             }
         }
         
@@ -1397,7 +1558,10 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
             fflush(stdout);
         }
     }
-    
+
+    // Drain any remaining buffered training samples.
+    if (g_online_trainer) online_trainer_flush(g_online_trainer);
+
 cleanup:
     free(input_batch);
     free(probs);
@@ -1435,78 +1599,67 @@ static id<MTLComputePipelineState> create_compute_pipeline(id<MTLDevice> device,
     return pipeline;
 }
 
-// Initialize Metal Transformer model weights using Xavier/Glorot initialization
+// Initialize Metal Transformer model weights using deterministic Xavier initialization.
+// Deterministic seeds ensure compress and decompress sides produce identical initial weights
+// regardless of process startup order or platform rand() behavior.
 static void initialize_transformer_weights(MetalTransformerModel* model) {
     if (!model || !model->device) return;
-    
-    // Xavier initialization parameters
-    float embedding_scale = sqrtf(2.0f / (model->vocab_size + model->hidden_size));
-    float attention_scale = sqrtf(2.0f / model->hidden_size);
-    float ffn_scale = sqrtf(2.0f / (model->hidden_size + model->feed_forward_size));
-    
-    // Random seed for reproducible initialization
-    srand(42);
-    
-    // Helper lambda for filling buffer with Xavier initialization
-    auto fill_buffer_xavier = [](id<MTLBuffer> buffer, float scale, size_t element_count) {
-        float* data = (float*)buffer.contents;
-        for (size_t i = 0; i < element_count; i++) {
-            // Box-Muller transform for Gaussian distribution
-            static bool have_spare = false;
-            static float spare;
-            
-            if (have_spare) {
-                data[i] = spare * scale;
-                have_spare = false;
-            } else {
-                float u = (rand() + 1.0f) / (RAND_MAX + 2.0f); // Avoid 0
-                float v = (rand() + 1.0f) / (RAND_MAX + 2.0f);
-                float mag = scale * sqrtf(-2.0f * logf(u));
-                data[i] = mag * cosf(2.0f * M_PI * v);
-                spare = mag * sinf(2.0f * M_PI * v);
-                have_spare = true;
-            }
-        }
-    };
-    
-    // Initialize all weight buffers
-    fill_buffer_xavier(model->embedding_weights, embedding_scale, model->vocab_size * model->hidden_size);
-    
-    // Positional embeddings with sinusoidal pattern (CUDA-compatible)
+
+    const uint32_t L   = model->num_layers;
+    const uint32_t H   = model->hidden_size;
+    const uint32_t V   = model->vocab_size;
+    const uint32_t FFS = model->feed_forward_size;
+
+    // Embedding
+    nn_weights_init_deterministic(
+        (float*)model->embedding_weights.contents,
+        (size_t)V * H,
+        V + H,   /* fan_in = vocab + hidden (Xavier convention) */
+        42u);
+
+    // Positional embeddings: sinusoidal (deterministic by formula, no randomness)
     float* pos_data = (float*)model->position_embeddings.contents;
     for (uint32_t pos = 0; pos < model->context_length; pos++) {
-        for (uint32_t dim = 0; dim < model->hidden_size; dim++) {
-            float angle = pos / powf(10000.0f, 2.0f * (dim / 2) / model->hidden_size);
-            if (dim % 2 == 0) {
-                pos_data[pos * model->hidden_size + dim] = sinf(angle);
-            } else {
-                pos_data[pos * model->hidden_size + dim] = cosf(angle);
-            }
+        for (uint32_t dim = 0; dim < H; dim++) {
+            float angle = pos / powf(10000.0f, 2.0f * (dim / 2) / H);
+            pos_data[pos * H + dim] = (dim % 2 == 0) ? sinf(angle) : cosf(angle);
         }
     }
-    
-    fill_buffer_xavier(model->attention_weights_q, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
-    fill_buffer_xavier(model->attention_weights_k, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
-    fill_buffer_xavier(model->attention_weights_v, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
-    fill_buffer_xavier(model->attention_output_weights, attention_scale, model->num_layers * model->hidden_size * model->hidden_size);
-    fill_buffer_xavier(model->ffn_weights_1, ffn_scale, model->num_layers * model->hidden_size * model->feed_forward_size * 2);
-    fill_buffer_xavier(model->ffn_weights_2, ffn_scale, model->num_layers * model->feed_forward_size * model->hidden_size);
-    
-    // Layer normalization weights initialized to 1.0
-    float* ln_data = (float*)model->layer_norm_weights.contents;
-    for (uint32_t i = 0; i < model->num_layers * 2 * model->hidden_size; i++) {
-        ln_data[i] = 1.0f;
-    }
-    
-    // Final layer normalization weights initialized to 1.0
-    float* fln_data = (float*)model->final_layer_norm_weights.contents;
-    for (uint32_t i = 0; i < 2 * model->hidden_size; i++) {
-        fln_data[i] = 1.0f;
-    }
-    
-    fill_buffer_xavier(model->output_projection, sqrtf(2.0f / (model->hidden_size + model->vocab_size)), model->hidden_size * model->vocab_size);
-    
-    printf("[Metal Transformer] Weights initialized with Xavier/Glorot distribution\n");
+
+    // Attention Q / K / V / Out  (seeds 43-46)
+    nn_weights_init_deterministic(
+        (float*)model->attention_weights_q.contents,
+        (size_t)L * H * H, H, 43u);
+    nn_weights_init_deterministic(
+        (float*)model->attention_weights_k.contents,
+        (size_t)L * H * H, H, 44u);
+    nn_weights_init_deterministic(
+        (float*)model->attention_weights_v.contents,
+        (size_t)L * H * H, H, 45u);
+    nn_weights_init_deterministic(
+        (float*)model->attention_output_weights.contents,
+        (size_t)L * H * H, H, 46u);
+
+    // FFN weights (seeds 47-48)
+    nn_weights_init_deterministic(
+        (float*)model->ffn_weights_1.contents,
+        (size_t)L * H * FFS * 2, H + FFS, 47u);
+    nn_weights_init_deterministic(
+        (float*)model->ffn_weights_2.contents,
+        (size_t)L * FFS * H, FFS + H, 48u);
+
+    // LayerNorm: gamma=1, beta=0
+    nn_weights_init_layer_norm(
+        (float*)model->layer_norm_weights.contents, H, L);
+    nn_weights_init_layer_norm(
+        (float*)model->final_layer_norm_weights.contents, H, 1);
+
+    // Output projection (seed 49)
+    nn_weights_init_deterministic(
+        (float*)model->output_projection.contents,
+        (size_t)H * V, H + V, 49u);
+
+    printf("[Metal Transformer] Weights initialized with deterministic Xavier (seed base 42)\n");
 }
 
 // Create and initialize Metal Transformer model
