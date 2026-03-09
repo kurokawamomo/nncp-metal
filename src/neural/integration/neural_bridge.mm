@@ -503,8 +503,8 @@ static BOOL initialize_transformer_model(MetalTransformerModel *model, const CUD
     model->d_pos = 32;       // Position encoding dimension
     model->mem_len = 128;    // Memory length
     model->train_len = profile->params.train_len;  // From CUDA profile (32 for default)
-    model->n_symbols = 258;  // Vocabulary size (256 bytes + BOS/EOS)
-    model->vocab_size = 258;  // Alias for n_symbols
+    model->n_symbols = 256;  // Vocabulary size (original NNCP: 256 byte values, no BOS/EOS)
+    model->vocab_size = 256; // Alias for n_symbols
     
     // Configuration flags (from original CUDA default profile)
     model->use_bias = 1;
@@ -940,9 +940,8 @@ bool neural_bridge_lstm_compress(
         [tokens addObject:@(input_data[i])];
     }
     
-    // Add special tokens
-    [tokens insertObject:@(256) atIndex:0]; // BOS token
-    [tokens addObject:@(257)]; // EOS token
+    // Prepend token 0 as the initial context (original NNCP convention; no EOS)
+    [tokens insertObject:@(0) atIndex:0];
     
     size_t seq_len = [tokens count];
     printf("  Tokenized: %zu bytes -> %zu tokens\n", input_size, seq_len);
@@ -1027,21 +1026,21 @@ bool neural_bridge_lstm_compress(
     coder.high = 0xFFFFFFFF;
     coder.output_pos = 16; // Reserve space for header
     
-    // Compress each token using predicted probabilities
-    for (size_t i = 1; i < seq_len - 1; i++) { // Skip BOS/EOS tokens
+    // Compress each token using predicted probabilities (skip index 0 = BOS context)
+    for (size_t i = 1; i < seq_len; i++) {
         int token = token_data[i];
         float* token_probs = &prob_data[i * g_transformer_model->vocab_size];
         
         // Convert to cumulative probabilities
-        float cumulative[259]; // 256 bytes + BOS/EOS + padding
+        float cumulative[257]; // vocab_size + 1
         cumulative[0] = 0.0f;
-        for (int j = 0; j < 258; j++) {
-            cumulative[j + 1] = cumulative[j] + fmaxf(token_probs[j], 1e-8f); // Minimum probability
+        for (int j = 0; j < 256; j++) {
+            cumulative[j + 1] = cumulative[j] + fmaxf(token_probs[j], 1e-8f);
         }
         
         // Normalize
-        float total = cumulative[258];
-        for (int j = 0; j <= 258; j++) {
+        float total = cumulative[256];
+        for (int j = 0; j <= 256; j++) {
             cumulative[j] /= total;
         }
         
@@ -1242,8 +1241,8 @@ bool neural_bridge_lstm_decompress(
                                                            options:MTLResourceStorageModeShared];
         int* token_data = (int*)[input_tokens contents];
         
-        // Fill input sequence: BOS + recent decoded bytes
-        token_data[0] = 256; // BOS token
+        // Fill input sequence: context token 0 + recent decoded bytes
+        token_data[0] = 0;
         size_t start_offset = (decoded_bytes + 1 > current_seq_len) ? 
                               decoded_bytes + 1 - current_seq_len : 0;
         for (size_t i = 1; i < current_seq_len; i++) {
@@ -1301,20 +1300,20 @@ bool neural_bridge_lstm_decompress(
         free(logits_out);
         
         // Build cumulative probability distribution
-        float cumulative[259]; // 256 bytes + BOS/EOS + padding
+        float cumulative[257]; // vocab_size + 1
         cumulative[0] = 0.0f;
-        for (int j = 0; j < 258; j++) {
+        for (int j = 0; j < 256; j++) {
             cumulative[j + 1] = cumulative[j] + fmaxf(next_token_probs[j], 1e-8f);
         }
         
         // Normalize cumulative distribution
-        float total = cumulative[258];
+        float total = cumulative[256];
         if (total <= 0) {
             printf("  Invalid probability distribution at iteration %d\n", iteration);
-            free(next_token_probs); // Free buffer
+            free(next_token_probs);
             break;
         }
-        for (int j = 0; j <= 258; j++) {
+        for (int j = 0; j <= 256; j++) {
             cumulative[j] /= total;
         }
         
@@ -1433,10 +1432,7 @@ bool neural_bridge_lstm_decompress(
         
         free(next_token_probs); // Free buffer before next iteration
         
-        if (decoded_token == 257) { // EOS token
-            printf("  Found EOS token at %zu bytes\n", decoded_bytes);
-            break;
-        }
+        // No EOS token in original NNCP; stop condition is reaching original_size
         
         // Add decoded byte to output
         if (decoded_bytes < output_capacity) {

@@ -1176,7 +1176,7 @@ static MPSTransformerContext* get_shared_mps_ctx() {
     return g_mps_ctx;
 }
 
-#define NUM_STREAMS 8  /* Phase 2: batched back-prop (= TRAIN_BATCH_SIZE) */
+#define NUM_STREAMS 16  // Match original nncp default profile (batch_size=16)
 
 // Main CUDA-compatible lossless compression function
 size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size, 

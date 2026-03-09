@@ -76,6 +76,12 @@ struct OnlineTrainer {
     MPSTransformerContext* ctx;    // borrowed — not owned
     float                  lr;
 
+    // LR schedule state
+    uint64_t train_step;       // cumulative sample count (not reset per session)
+    float    lr_init;          // initial LR
+    float    lr_min;           // floor LR
+    uint64_t lr_warmup_steps;  // linear warmup length
+
     // Architecture dims (cached from ctx config)
     uint32_t L, H, NH, HD, F, V, S;
 
@@ -578,6 +584,22 @@ static void apply_sgd(id<MTLComputeCommandEncoder> enc,
 }
 
 // ---------------------------------------------------------------------------
+// LR schedule
+// ---------------------------------------------------------------------------
+
+static float compute_lr(OnlineTrainer* tr) {
+    uint64_t t = tr->train_step;
+    if (t < tr->lr_warmup_steps) {
+        // Linear warmup: 0 → lr_init
+        return tr->lr_init * (float)t / (float)tr->lr_warmup_steps;
+    }
+    // Power decay: lr_min + (lr_init - lr_min) * sqrt(warmup / t)
+    float decay = sqrtf((float)tr->lr_warmup_steps / (float)t);
+    float lr = tr->lr_min + (tr->lr_init - tr->lr_min) * decay;
+    return lr < tr->lr_min ? tr->lr_min : lr;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -595,9 +617,13 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     OnlineTrainer* tr = new OnlineTrainer();
     memset(tr, 0, sizeof(*tr));
 
-    tr->device = device;
-    tr->ctx    = ctx;
-    tr->lr     = lr;
+    tr->device          = device;
+    tr->ctx             = ctx;
+    tr->lr_init         = lr;
+    tr->lr_min          = 1e-4f;
+    tr->lr_warmup_steps = 1000;
+    tr->train_step      = 0;
+    tr->lr              = 0.0f;  // will be set by compute_lr on first flush
     tr->L  = cfg.num_layers;
     tr->H  = cfg.hidden_size;
     tr->NH = cfg.num_heads;
@@ -750,7 +776,10 @@ bool online_trainer_step(OnlineTrainer* tr,
 
     if (!tr->ps_sgd) return true; // gradient computed but SGD disabled
 
-    // ---- Apply SGD via Metal kernel ----
+    // ---- Update LR schedule then apply SGD via Metal kernel ----
+    tr->lr = compute_lr(tr);
+    tr->train_step++;
+
     id<MTLCommandBuffer>       cmd = [tr->cmdQueue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
@@ -863,6 +892,10 @@ void online_trainer_flush(OnlineTrainer* tr) {
         copyGrad(tr->tb_grad_out,      tr->grad_out,      (size_t)H * V);
 
         if (tr->ps_sgd) {
+            // Update LR schedule: count N samples, then compute new LR
+            tr->train_step += (uint64_t)N;
+            tr->lr = compute_lr(tr);
+
             id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
