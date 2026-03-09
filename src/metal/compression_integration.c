@@ -1,6 +1,6 @@
 #include "compression_integration.h"
 #include "algorithm_router.h"
-#include "../neural/integration/neural_bridge.h"
+#include "../neural/neural_bridge.h"
 
 // CUDA-compatible lossless compression functions  
 extern size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size, 
@@ -250,11 +250,7 @@ bool compression_integration_init(const CompressionConfig* config) {
     }
     
     // Initialize algorithm router
-    if (!algorithm_router_init()) {
-        printf("Warning: Algorithm router initialization failed, using basic selection\n");
-    } else {
-        printf("Algorithm router initialized successfully\n");
-    }
+    algorithm_router_init();
     
     // Initialize neural bridge
     NeuralCompressionConfig neural_config = {
@@ -371,9 +367,6 @@ bool compression_integration_compress(
         .verbose_logging = true, // Force debug mode
         .compression_target = 0.20f // Target 20% compression ratio for transformer
     };
-    
-    // Enable detailed debugging
-    printf("Metal Transformer compression: %zu bytes\n", input_size);
     
     NeuralCompressionResult neural_result = {0};
     

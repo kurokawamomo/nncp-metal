@@ -6,7 +6,7 @@
  * until the full Phase 2C implementation is available.
  */
 
-#include "../neural/optimization/compression_selector.h"
+#include "../neural/compression_selector.h"
 #include <string.h>
 #include <math.h>
 #include <stdio.h>

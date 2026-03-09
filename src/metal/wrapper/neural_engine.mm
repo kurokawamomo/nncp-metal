@@ -6,9 +6,9 @@
 
 #include "neural_engine.h"
 #include "metal_context.h"
-#include "../../neural/engines/gpu_native_transformer.h"
-#include "../../neural/engines/gpu_native_lstm.h"
-#include "../../neural/memory/unified_memory_manager.h"
+#include "../../neural/gpu_native_transformer.h"
+#include "../../neural/gpu_native_lstm.h"
+#include "../../neural/unified_memory_manager.h"
 
 // Internal Neural Engine context structure
 @interface NEContextImpl : NSObject

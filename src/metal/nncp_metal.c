@@ -24,7 +24,7 @@
 #include "compute_kernels.h"
 #include "version.h"
 #include "compression_integration.h"
-#include "../neural/integration/neural_bridge.h"
+#include "../neural/neural_bridge.h"
 #include "nncp_original_port.h"
 #endif
 
@@ -41,7 +41,7 @@ typedef struct {
 static void show_usage(const char* program_name) {
     printf("NNCP Metal v1.0 - Neural Network Compression for Apple Silicon\n");
     printf("Copyright (c) 2025 NNCP Metal Project\n\n");
-    printf("Usage: nncp-metal <command> [options] <input> <output>\n\n");
+    printf("Usage: nncp <command> [options] <input> <output>\n\n");
     printf("Commands:\n");
     printf("  c, compress    Compress input file to output file\n");
     printf("  d, decompress  Decompress input file to output file\n");
@@ -51,9 +51,9 @@ static void show_usage(const char* program_name) {
     printf("  --cpu               Force CPU-only mode (disable Metal)\n");
     printf("  -h, --help          Show this help message\n\n");
     printf("Examples:\n");
-    printf("  nncp-metal compress document.txt document.nncp\n");
-    printf("  nncp-metal decompress document.nncp document_restored.txt\n");
-    printf("  nncp-metal test\n");
+    printf("  nncp compress document.txt document.nncp\n");
+    printf("  nncp decompress document.nncp document_restored.txt\n");
+    printf("  nncp test\n");
 }
 
 static int parse_args(int argc, char** argv, NNCPMetalArgs* args) {
@@ -285,15 +285,10 @@ static int compress_file_metal_integrated(const char* input_file, const char* ou
     
     if (verbose) {
         printf("Compression completed: %zu -> %zu bytes (%.1f%%) using %s\n",
-               (size_t)file_size, result.compressed_size, 
+               (size_t)file_size, result.compressed_size,
                result.compression_ratio * 100.0f,
                compression_integration_algorithm_name(result.algorithm_used));
         printf("Processing time: %.2f ms\n", result.processing_time_ns / 1000000.0);
-    } else {
-        // Show algorithm and compression ratio for user awareness
-        const char* algo_name = compression_integration_algorithm_name(result.algorithm_used);
-        printf("Compressed using %s: %.1f%% of original size\n", 
-               algo_name, result.compression_ratio * 100.0f);
     }
     
     // Write compressed file with header
@@ -827,20 +822,9 @@ static int decompress_file_metal_integrated(const char* input_file, const char* 
         algorithm_used = COMPRESSION_ALGORITHM_LSTM; // Default to LSTM for all other levels
     }
     
-    if (verbose) {
-        printf("MODIFIED: Algorithm determined from compression level %d: %s\n", 
-               header.compression_level, compression_integration_algorithm_name(algorithm_used));
-        printf("DEBUG: After algorithm determination, algorithm_used=%d\n", algorithm_used);
-    }
-    
-    // Perform decompression using specific algorithm, not integration layer detection
-    printf("DEBUG: About to perform decompression, algorithm_used=%d\n", algorithm_used);
     DecompressionResult result = {0};
     result.algorithm_detected = algorithm_used;
     bool success = false;
-    
-    printf("DEBUG: Algorithm check - algorithm_used=%d, TRANSFORMER=%d, LSTM=%d\n", 
-           algorithm_used, COMPRESSION_ALGORITHM_TRANSFORMER, COMPRESSION_ALGORITHM_LSTM);
     if (algorithm_used == COMPRESSION_ALGORITHM_TRANSFORMER || algorithm_used == COMPRESSION_ALGORITHM_LSTM) {
         // Check if this is NNCP Original format data first
         if (verbose) {
@@ -878,15 +862,9 @@ static int decompress_file_metal_integrated(const char* input_file, const char* 
                 compressed_data, neural_data_size, 
                 output_data, header.original_size, &neural_result);
         } else {
-            printf("[DEBUG] About to call neural_bridge_lstm_decompress\n");
             neural_success = neural_bridge_lstm_decompress(
                 compressed_data, neural_data_size,
                 output_data, header.original_size, &neural_result);
-            printf("[DEBUG] neural_bridge_lstm_decompress returned: %s\n", 
-                   neural_success ? "SUCCESS" : "FAILURE");
-            if (!neural_success) {
-                printf("[DEBUG] LSTM decompress error: %s\n", neural_result.error_message);
-            }
         }
         
         if (neural_success) {
@@ -922,14 +900,6 @@ static int decompress_file_metal_integrated(const char* input_file, const char* 
                header.compressed_size, result.decompressed_size,
                compression_integration_algorithm_name(result.algorithm_detected));
         printf("Processing time: %.2f ms\n", result.processing_time_ns / 1000000.0);
-    } else {
-            // Show algorithm used for user awareness
-        const char* algo_name = compression_integration_algorithm_name(result.algorithm_detected);
-        printf("[DEBUG] Result: success=%s, size=%zu, algorithm=%s\n", 
-               result.success ? "YES" : "NO", result.decompressed_size, algo_name);
-        if (strcmp(algo_name, "Transformer") == 0 || strcmp(algo_name, "LSTM") == 0) {
-            printf("Decompressed using %s neural algorithm\n", algo_name);
-        }
     }
     
     // Verify checksum
@@ -955,14 +925,6 @@ static int decompress_file_metal_integrated(const char* input_file, const char* 
     } else if (verbose) {
         printf("Checksum verification passed (perfect reconstruction)\n");
     }
-    
-    // Write output file
-    printf("[DEBUG] About to write %zu bytes to output file\n", result.decompressed_size);
-    printf("[DEBUG] First 16 bytes: ");
-    for (int i = 0; i < 16 && i < result.decompressed_size; i++) {
-        printf("%02X ", output_data[i]);
-    }
-    printf("\n");
     
     FILE* out = fopen(output_file, "wb");
     if (!out) {

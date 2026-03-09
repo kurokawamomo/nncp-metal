@@ -211,32 +211,22 @@ kernel void transformer_attention_value(
     }
 }
 
-// 5. GEGLU Feed Forward
-// Input: [batch_seq, hidden]
-// W1: [hidden, intermediate] (gate)
-// W2: [hidden, intermediate] (value)
-// W3: [intermediate, hidden] (output proj)
-// This is typically implemented as:
-// Temp = Linear(Input, W_gate_val) -> Split -> Gelu(gate) * val -> Linear(W_out)
-//
-// Optimized kernel: assumes input has been projected to [intermediate * 2] size already
-// so input contains [gate | value] concatenated.
+// 5. GELU Feed Forward activation
+// Input: [batch_seq, inter_dim]  (result of W1 linear projection, hidden → ffn_size)
+// Output: [batch_seq, inter_dim]  element-wise GELU
 kernel void transformer_geglu(
-    device const float* input [[buffer(0)]], // [batch_seq, 2 * inter_dim]
+    device const float* input [[buffer(0)]], // [batch_seq, inter_dim]
     device float* output [[buffer(1)]],      // [batch_seq, inter_dim]
     constant uint& inter_dim [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     // gid.x = inter_dim index
     // gid.y = batch_seq index
-    
+
     if (gid.x >= inter_dim) return;
-    
-    uint row_offset = gid.y * (2 * inter_dim);
-    float gate = input[row_offset + gid.x];            // First half
-    float val = input[row_offset + inter_dim + gid.x]; // Second half
-    
-    output[gid.y * inter_dim + gid.x] = gelu(gate) * val;
+
+    float x = input[gid.y * inter_dim + gid.x];
+    output[gid.y * inter_dim + gid.x] = gelu(x);
 }
 
 // 6b. KV Cache Write
@@ -274,6 +264,10 @@ kernel void transformer_attention_decode_cached(
     constant uint&      kv_len     [[buffer(7)]],
     constant uint&      max_seq_len [[buffer(8)]],
     constant float&     scale      [[buffer(9)]],
+    device const float* W_rel_r    [[buffer(10)]],   // [NH, HD, D_POS] tied rel PE proj
+    device const float* B_rel_r    [[buffer(11)]],   // [NH, total_len]  tied rel PE bias
+    constant uint&      d_pos      [[buffer(12)]],   // = 32
+    constant uint&      total_len  [[buffer(13)]],   // = 64
     uint2 gid [[thread_position_in_grid]]   // gid.x=head_idx, gid.y=batch_idx
 ) {
     const uint h = gid.x;
@@ -290,7 +284,18 @@ kernel void transformer_attention_decode_cached(
     // scores scratch: [batch, NH, max_seq_len]
     const uint score_base = (b * num_heads + h) * max_seq_len;
 
-    // ---- 1. Q·K^T ----
+    // Phase E2.2: pre-compute q_rel[d] = Q[h] @ W_rel_r[h, :, :] → [D_POS=32]
+    // Layout: W_rel_r[h * head_dim * d_pos + hd * d_pos + d]
+    thread float q_rel_vec[32];  // D_POS always <= 32
+    const uint w_rel_head_off = h * head_dim * d_pos;
+    for (uint d = 0; d < d_pos; d++) {
+        float s = 0.0f;
+        for (uint hd = 0; hd < head_dim; hd++)
+            s += Q[q_base + hd] * W_rel_r[w_rel_head_off + hd * d_pos + d];
+        q_rel_vec[d] = s;
+    }
+
+    // ---- 1. Q·K^T + relative PE  (with score clamp for numerical stability) ----
     float max_score = -1e9f;
     for (uint k = 0; k < kv_len; k++) {
         uint k_base = (cache_batch_base + k) * H + h * head_dim;
@@ -298,11 +303,15 @@ kernel void transformer_attention_decode_cached(
         for (uint d = 0; d < head_dim; d++)
             dot += Q[q_base + d] * K_cache[k_base + d];
         dot *= scale;
+        // Phase E2.2: add relative PE (matches E2.1 training formula)
+        //   pos_score = q_rel[k % d_pos] * scale + b_r[h * total_len + k]
+        dot += q_rel_vec[k % d_pos] * scale + B_rel_r[h * total_len + k];
+        dot = clamp(dot, -30.0f, 30.0f);   // guard against NaN from untrained weights
         scores_tmp[score_base + k] = dot;
         if (dot > max_score) max_score = dot;
     }
 
-    // ---- 2. Softmax ----
+    // ---- 2. Softmax  (numerically stable: exp(score - max)) ----
     float sum_exp = 0.0f;
     for (uint k = 0; k < kv_len; k++) {
         float e = exp(scores_tmp[score_base + k] - max_score);
@@ -318,7 +327,8 @@ kernel void transformer_attention_decode_cached(
             uint v_base = (cache_batch_base + k) * H + h * head_dim;
             acc += (scores_tmp[score_base + k] / (sum_exp + 1e-9f)) * V_cache[v_base + d];
         }
-        output[out_base + d] = acc;
+        // Guard against NaN in attention output (e.g. when V_cache contains garbage)
+        output[out_base + d] = isnan(acc) ? 0.0f : acc;
     }
 }
 
@@ -387,6 +397,16 @@ kernel void rmsprop_update(
 }
 
 // 6. Element-wise Add (Residual Connection)
+kernel void element_scale(
+    device float* data [[buffer(0)]],
+    constant float& scale [[buffer(1)]],
+    constant uint& size [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    data[gid] *= scale;
+}
+
 kernel void element_add(
     device const float* a [[buffer(0)]],
     device const float* b [[buffer(1)]],
