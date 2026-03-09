@@ -140,7 +140,7 @@ kernel void transformer_embedding(
     uint gid [[thread_position_in_grid]]
 ) {
     uint seq_len = 65536; // context_length from model
-    uint hidden_size = 512;
+    uint hidden_size = 256;
     
     if (gid >= seq_len) return;
     
@@ -173,7 +173,7 @@ kernel void transformer_self_attention(
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint seq_len = 65536; // Max context (1024 streams * 64 seq)
-    uint hidden_size = 512;
+    uint hidden_size = 256;
     uint head_dim = hidden_size / 8; // 8 attention heads
     uint real_seq_len = 64; // Per-stream sequence length
     
@@ -226,8 +226,8 @@ kernel void transformer_feed_forward(
     uint gid [[thread_position_in_grid]]
 ) {
     uint seq_len = 4096;
-    uint hidden_size = 512;
-    uint ff_size = 2048;
+    uint hidden_size = 256;
+    uint ff_size = 1024;
     
     if (gid >= seq_len) return;
     
@@ -264,7 +264,7 @@ kernel void transformer_output_projection(
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint seq_len = 4096;
-    uint hidden_size = 512;
+    uint hidden_size = 256;
     uint vocab_size = 256;
     
     uint seq_idx = gid.x;
@@ -1701,10 +1701,10 @@ static MetalTransformerModel* create_transformer_model(void) {
     model->command_queue = [device newCommandQueue];
     model->context_length = 1024 * 64; // Max context for batched streams (1024 streams * 64 seq)
     model->vocab_size = 256;         // Byte vocabulary
-    model->hidden_size = 512;        // Balanced performance/memory
+    model->hidden_size = 256;        // Match original NNCP default profile
     model->num_attention_heads = 8;   // Efficient parallel processing
     model->num_layers = 4;           // Sufficient depth
-    model->feed_forward_size = 2048; // 4x hidden size
+    model->feed_forward_size = 1024; // 4x hidden size
     model->max_sequence_length = 64;
     
     // Allocate weight buffers
@@ -1763,30 +1763,8 @@ static MetalTransformerModel* create_transformer_model(void) {
         return NULL;
     }
     
-    // Try loading pre-saved weights; fall back to Xavier init if unavailable
-    {
-        NNWeightsConfig cfg_check = {0};
-        const char* wpath = nn_weights_default_path();
-        bool loaded = nn_weights_load(wpath, &cfg_check,
-            (float*)[model->embedding_weights      contents],
-            (float*)[model->position_embeddings    contents],
-            (float*)[model->attention_weights_q    contents],
-            (float*)[model->attention_weights_k    contents],
-            (float*)[model->attention_weights_v    contents],
-            (float*)[model->attention_output_weights contents],
-            (float*)[model->ffn_weights_1          contents],
-            (float*)[model->ffn_weights_2          contents],
-            (float*)[model->layer_norm_weights     contents],
-            (float*)[model->final_layer_norm_weights contents],
-            (float*)[model->output_projection      contents]);
-
-        if (loaded) {
-            printf("[Weight Loader] Loaded weights from %s\n", wpath);
-        } else {
-            printf("[Weight Loader] No weights file found at %s, using Xavier init\n", wpath);
-            initialize_transformer_weights(model);
-        }
-    }
+    // Always use deterministic Xavier init (LCG seed) — no pre-trained weights
+    initialize_transformer_weights(model);
 
     model->is_initialized = true;
     model->weights_loaded = true;
@@ -1945,36 +1923,6 @@ bool metal_transformer_prediction(MetalTransformerModel* model,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Convenience: save current shared model weights to the default path
-// ---------------------------------------------------------------------------
-
-bool nn_weights_save_model(const char* path, MetalTransformerModel* model) {
-    if (!model) return false;
-    if (!path) path = nn_weights_default_path();
-
-    NNWeightsConfig cfg = {
-        .num_layers  = model->num_layers,
-        .hidden_size = model->hidden_size,
-        .num_heads   = model->num_attention_heads,
-        .ffn_size    = model->feed_forward_size,
-        .vocab_size  = model->vocab_size,
-        .max_seq_len = model->max_sequence_length,
-    };
-
-    return nn_weights_save(path, &cfg,
-        (const float*)[model->embedding_weights        contents],
-        (const float*)[model->position_embeddings      contents],
-        (const float*)[model->attention_weights_q      contents],
-        (const float*)[model->attention_weights_k      contents],
-        (const float*)[model->attention_weights_v      contents],
-        (const float*)[model->attention_output_weights contents],
-        (const float*)[model->ffn_weights_1            contents],
-        (const float*)[model->ffn_weights_2            contents],
-        (const float*)[model->layer_norm_weights       contents],
-        (const float*)[model->final_layer_norm_weights contents],
-        (const float*)[model->output_projection        contents]);
-}
 
 #ifdef __cplusplus
 }

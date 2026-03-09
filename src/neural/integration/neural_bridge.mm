@@ -492,6 +492,7 @@ static BOOL initialize_transformer_layer(MetalTransformerModel *model, Transform
     return TRUE;
 }
 
+#if 0  // dead init: not used by the compression loop (neural_bridge_lossless_cuda.mm path)
 static BOOL initialize_transformer_model(MetalTransformerModel *model, const CUDAProfile *profile) {
     // Set model configuration based on CUDA profile
     model->n_layer = 4;      // Default profile values
@@ -765,6 +766,7 @@ static BOOL initialize_transformer_model(MetalTransformerModel *model, const CUD
     
     return TRUE;
 }
+#endif  // dead init
 
 /************************************************/
 /* Public API Implementation */
@@ -803,14 +805,8 @@ bool neural_bridge_init(const NeuralCompressionConfig* config) {
         return false;
     }
     
-    // Initialize the transformer model
-    if (!initialize_transformer_model(g_transformer_model, profile)) {
-        printf("Failed to initialize transformer model\n");
-        cuda_math_config_free(g_transformer_model->cuda_config);
-        free(g_transformer_model);
-        g_transformer_model = NULL;
-        return false;
-    }
+    // initialize_transformer_model is dead code (#if 0'd above).
+    // Actual model init is done by neural_bridge_lossless_cuda.mm.
     
     g_transformer_initialized = TRUE;
     
