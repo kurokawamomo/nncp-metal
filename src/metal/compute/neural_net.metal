@@ -368,6 +368,24 @@ kernel void sgd_update(
     weight[gid] -= lr * grad[gid];
 }
 
+// RMSProp update (Adam with beta1=0)
+// v[i] = beta2 * v[i] + (1 - beta2) * g[i]^2
+// weight[i] -= lr * g[i] / (sqrt(v[i]) + eps)
+kernel void rmsprop_update(
+    device float*       weight [[buffer(0)]],
+    device const float* grad   [[buffer(1)]],
+    device float*       v      [[buffer(2)]],
+    constant float&     lr     [[buffer(3)]],
+    constant float&     beta2  [[buffer(4)]],
+    constant float&     eps    [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float g  = grad[gid];
+    float vi = beta2 * v[gid] + (1.0f - beta2) * g * g;
+    v[gid]   = vi;
+    weight[gid] -= lr * g / (sqrt(vi) + eps);
+}
+
 // 6. Element-wise Add (Residual Connection)
 kernel void element_add(
     device const float* a [[buffer(0)]],

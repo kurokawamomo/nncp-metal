@@ -134,9 +134,17 @@ struct OnlineTrainer {
     id<MTLBuffer> buf_input;    // int32 [1]
     id<MTLBuffer> buf_target;   // int32 [1]
 
-    // SGD Metal compute
+    // RMSProp (Adam beta1=0) second-moment buffers — same shape as grad_*
+    id<MTLBuffer> v_embed, v_pos, v_q, v_k, v_v, v_o;
+    id<MTLBuffer> v_ffn1, v_ffn2, v_ln, v_final_ln, v_out;
+    float beta2;      // = 0.9999
+    float opt_eps;    // = 1e-8
+    float grad_clip;  // = 0.1
+
+    // Metal compute
     id<MTLCommandQueue>         cmdQueue;
     id<MTLComputePipelineState> ps_sgd;
+    id<MTLComputePipelineState> ps_rmsprop;
 
     bool graph_built;
 
@@ -546,24 +554,33 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
 // SGD pipeline
 // ---------------------------------------------------------------------------
 
-static id<MTLComputePipelineState> load_sgd_pipeline(id<MTLDevice> device) {
-    NSError* err = nil;
+static id<MTLLibrary> load_metal_library(id<MTLDevice> device) {
     id<MTLLibrary> lib = [device newDefaultLibrary];
     if (!lib) {
         NSString* exeDir = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
         NSURL* libURL = [NSURL fileURLWithPath:
                            [exeDir stringByAppendingPathComponent:@"default.metallib"]];
+        NSError* err = nil;
         lib = [device newLibraryWithURL:libURL error:&err];
+        if (!lib) NSLog(@"[OnlineTrainer] Cannot load Metal library: %@", err.localizedDescription);
     }
-    if (!lib) {
-        NSLog(@"[OnlineTrainer] Cannot load Metal library for SGD: %@", err.localizedDescription);
-        return nil;
-    }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"sgd_update"];
-    if (!fn) { NSLog(@"[OnlineTrainer] sgd_update kernel not found"); return nil; }
+    return lib;
+}
+
+static id<MTLComputePipelineState> load_pso(id<MTLDevice> device,
+                                             id<MTLLibrary> lib,
+                                             NSString* name) {
+    if (!lib) return nil;
+    NSError* err = nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:name];
+    if (!fn) { NSLog(@"[OnlineTrainer] kernel '%@' not found", name); return nil; }
     id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&err];
-    if (!pso) NSLog(@"[OnlineTrainer] sgd_update PSO error: %@", err.localizedDescription);
+    if (!pso) NSLog(@"[OnlineTrainer] PSO error for '%@': %@", name, err.localizedDescription);
     return pso;
+}
+
+static id<MTLComputePipelineState> load_sgd_pipeline(id<MTLDevice> device) {
+    return load_pso(device, load_metal_library(device), @"sgd_update");
 }
 
 // Apply SGD: weight -= lr * grad  (GPU)
@@ -581,6 +598,80 @@ static void apply_sgd(id<MTLComputeCommandEncoder> enc,
     NSUInteger tg = MIN((NSUInteger)n_elements, (NSUInteger)256);
     [enc dispatchThreads:MTLSizeMake(n_elements, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+// Apply RMSProp (Adam beta1=0) update  (GPU)
+static void apply_rmsprop(id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState>  pso,
+                          id<MTLBuffer>                weight,
+                          id<MTLBuffer>                grad,
+                          id<MTLBuffer>                v,
+                          float                        lr,
+                          float                        beta2,
+                          float                        eps,
+                          size_t                       n_elements) {
+    if (!weight || !grad || !v || n_elements == 0) return;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:weight offset:0 atIndex:0];
+    [enc setBuffer:grad   offset:0 atIndex:1];
+    [enc setBuffer:v      offset:0 atIndex:2];
+    [enc setBytes:&lr    length:sizeof(float) atIndex:3];
+    [enc setBytes:&beta2 length:sizeof(float) atIndex:4];
+    [enc setBytes:&eps   length:sizeof(float) atIndex:5];
+    NSUInteger tg = MIN((NSUInteger)n_elements, (NSUInteger)256);
+    [enc dispatchThreads:MTLSizeMake(n_elements, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+// Compute L2 norm of a float buffer on CPU
+static float grad_l2_norm(id<MTLBuffer> buf, size_t n) {
+    if (!buf || n == 0) return 0.0f;
+    const float* p = (const float*)[buf contents];
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) { double g = p[i]; sum += g * g; }
+    return (float)sqrt(sum);
+}
+
+// Scale a gradient buffer in-place by scalar (CPU)
+static void scale_grad(id<MTLBuffer> buf, size_t n, float scale) {
+    if (!buf || n == 0 || scale == 1.0f) return;
+    float* p = (float*)[buf contents];
+    for (size_t i = 0; i < n; i++) p[i] *= scale;
+}
+
+// Clip all gradient buffers so global L2 norm <= max_norm
+static void clip_gradients(OnlineTrainer* tr, float max_norm) {
+    if (max_norm <= 0.0f) return;
+    uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V, S=tr->S;
+    double total = 0.0;
+    auto accNorm = [&](id<MTLBuffer> b, size_t n){
+        float nm = grad_l2_norm(b, n); total += (double)nm * nm;
+    };
+    accNorm(tr->grad_embed,    (size_t)V * H);
+    accNorm(tr->grad_pos,      (size_t)S * H);
+    accNorm(tr->grad_q,        (size_t)L * H * H);
+    accNorm(tr->grad_k,        (size_t)L * H * H);
+    accNorm(tr->grad_v,        (size_t)L * H * H);
+    accNorm(tr->grad_o,        (size_t)L * H * H);
+    accNorm(tr->grad_ffn1,     (size_t)L * H * F * 2);
+    accNorm(tr->grad_ffn2,     (size_t)L * F * H);
+    accNorm(tr->grad_ln,       (size_t)L * 2 * H);
+    accNorm(tr->grad_final_ln, (size_t)2 * H);
+    accNorm(tr->grad_out,      (size_t)H * V);
+    float global_norm = (float)sqrt(total);
+    if (global_norm <= max_norm) return;
+    float scale = max_norm / (global_norm + 1e-6f);
+    scale_grad(tr->grad_embed,    (size_t)V * H,       scale);
+    scale_grad(tr->grad_pos,      (size_t)S * H,       scale);
+    scale_grad(tr->grad_q,        (size_t)L * H * H,   scale);
+    scale_grad(tr->grad_k,        (size_t)L * H * H,   scale);
+    scale_grad(tr->grad_v,        (size_t)L * H * H,   scale);
+    scale_grad(tr->grad_o,        (size_t)L * H * H,   scale);
+    scale_grad(tr->grad_ffn1,     (size_t)L * H * F * 2, scale);
+    scale_grad(tr->grad_ffn2,     (size_t)L * F * H,   scale);
+    scale_grad(tr->grad_ln,       (size_t)L * 2 * H,   scale);
+    scale_grad(tr->grad_final_ln, (size_t)2 * H,       scale);
+    scale_grad(tr->grad_out,      (size_t)H * V,       scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +753,28 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->grad_final_ln = newBuf((size_t)2 * H);
     tr->grad_out      = newBuf((size_t)H * V);
 
+    // ---- RMSProp v buffers (zero-initialised) ----
+    auto newZeroBuf = [&](size_t n_floats) -> id<MTLBuffer> {
+        id<MTLBuffer> b = [device newBufferWithLength:n_floats * sizeof(float) options:opts];
+        memset([b contents], 0, n_floats * sizeof(float));
+        return b;
+    };
+    tr->v_embed    = newZeroBuf((size_t)V * H);
+    tr->v_pos      = newZeroBuf((size_t)S * H);
+    tr->v_q        = newZeroBuf((size_t)L * H * H);
+    tr->v_k        = newZeroBuf((size_t)L * H * H);
+    tr->v_v        = newZeroBuf((size_t)L * H * H);
+    tr->v_o        = newZeroBuf((size_t)L * H * H);
+    tr->v_ffn1     = newZeroBuf((size_t)L * H * F * 2);
+    tr->v_ffn2     = newZeroBuf((size_t)L * F * H);
+    tr->v_ln       = newZeroBuf((size_t)L * 2 * H);
+    tr->v_final_ln = newZeroBuf((size_t)2 * H);
+    tr->v_out      = newZeroBuf((size_t)H * V);
+
+    tr->beta2     = 0.9999f;
+    tr->opt_eps   = 1e-8f;
+    tr->grad_clip = 0.1f;
+
     tr->buf_input  = [device newBufferWithLength:sizeof(int32_t) options:opts];
     tr->buf_target = [device newBufferWithLength:sizeof(int32_t) options:opts];
 
@@ -669,12 +782,14 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->batch_buf_input  = [device newBufferWithLength:TRAIN_BATCH_SIZE * sizeof(int32_t) options:opts];
     tr->batch_buf_target = [device newBufferWithLength:TRAIN_BATCH_SIZE * sizeof(int32_t) options:opts];
 
-    // ---- SGD pipeline ----
+    // ---- Optimizer pipelines ----
     tr->cmdQueue = [device newCommandQueue];
-    tr->ps_sgd   = load_sgd_pipeline(device);
+    id<MTLLibrary> metalLib = load_metal_library(device);
+    tr->ps_sgd     = load_pso(device, metalLib, @"sgd_update");
+    tr->ps_rmsprop = load_pso(device, metalLib, @"rmsprop_update");
 
-    if (!tr->ps_sgd) {
-        NSLog(@"[OnlineTrainer] SGD pipeline failed — trainer will be disabled");
+    if (!tr->ps_rmsprop) {
+        NSLog(@"[OnlineTrainer] RMSProp pipeline failed — will fall back to SGD");
     }
 
     return tr;
@@ -774,26 +889,44 @@ bool online_trainer_step(OnlineTrainer* tr,
     copyGrad(tr->t_grad_final_ln, tr->grad_final_ln, (size_t)2 * H);
     copyGrad(tr->t_grad_out,      tr->grad_out,      (size_t)H * V);
 
-    if (!tr->ps_sgd) return true; // gradient computed but SGD disabled
+    if (!tr->ps_rmsprop && !tr->ps_sgd) return true; // gradients computed, optimizer disabled
 
-    // ---- Update LR schedule then apply SGD via Metal kernel ----
+    // ---- Gradient clipping (CPU, in-place) ----
+    clip_gradients(tr, tr->grad_clip);
+
+    // ---- Update LR schedule then apply RMSProp via Metal kernel ----
     tr->lr = compute_lr(tr);
     tr->train_step++;
 
-    id<MTLCommandBuffer>       cmd = [tr->cmdQueue commandBuffer];
+    id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
-    apply_sgd(enc, tr->ps_sgd, wb.pos_embed,tr->grad_pos,      tr->lr, (size_t)S * H);
-    apply_sgd(enc, tr->ps_sgd, wb.attn_q,   tr->grad_q,        tr->lr, (size_t)L * H * H);
-    apply_sgd(enc, tr->ps_sgd, wb.attn_k,   tr->grad_k,        tr->lr, (size_t)L * H * H);
-    apply_sgd(enc, tr->ps_sgd, wb.attn_v,   tr->grad_v,        tr->lr, (size_t)L * H * H);
-    apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        tr->lr, (size_t)L * H * H);
-    apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     tr->lr, (size_t)L * H * F * 2);
-    apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
-    apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 2 * H);
-    apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, tr->lr, (size_t)2 * H);
-    apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
+    if (tr->ps_rmsprop) {
+        float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr;
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.embed,    tr->grad_embed,    tr->v_embed,    lr, b2, ep, (size_t)V * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.pos_embed,tr->grad_pos,      tr->v_pos,      lr, b2, ep, (size_t)S * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_q,   tr->grad_q,        tr->v_q,        lr, b2, ep, (size_t)L * H * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_k,   tr->grad_k,        tr->v_k,        lr, b2, ep, (size_t)L * H * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_v,   tr->grad_v,        tr->v_v,        lr, b2, ep, (size_t)L * H * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_out, tr->grad_o,        tr->v_o,        lr, b2, ep, (size_t)L * H * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn1,     tr->grad_ffn1,     tr->v_ffn1,     lr, b2, ep, (size_t)L * H * F * 2);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, (size_t)L * F * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, (size_t)L * 2 * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.final_ln, tr->grad_final_ln, tr->v_final_ln, lr, b2, ep, (size_t)2 * H);
+        apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, (size_t)H * V);
+    } else {
+        apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
+        apply_sgd(enc, tr->ps_sgd, wb.pos_embed,tr->grad_pos,      tr->lr, (size_t)S * H);
+        apply_sgd(enc, tr->ps_sgd, wb.attn_q,   tr->grad_q,        tr->lr, (size_t)L * H * H);
+        apply_sgd(enc, tr->ps_sgd, wb.attn_k,   tr->grad_k,        tr->lr, (size_t)L * H * H);
+        apply_sgd(enc, tr->ps_sgd, wb.attn_v,   tr->grad_v,        tr->lr, (size_t)L * H * H);
+        apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        tr->lr, (size_t)L * H * H);
+        apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     tr->lr, (size_t)L * H * F * 2);
+        apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
+        apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 2 * H);
+        apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, tr->lr, (size_t)2 * H);
+        apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
+    }
 
     [enc endEncoding];
     [cmd commit];
@@ -891,24 +1024,42 @@ void online_trainer_flush(OnlineTrainer* tr) {
         copyGrad(tr->tb_grad_final_ln, tr->grad_final_ln, (size_t)2 * H);
         copyGrad(tr->tb_grad_out,      tr->grad_out,      (size_t)H * V);
 
-        if (tr->ps_sgd) {
+        if (tr->ps_rmsprop || tr->ps_sgd) {
+            // Gradient clipping (CPU, in-place)
+            clip_gradients(tr, tr->grad_clip);
+
             // Update LR schedule: count N samples, then compute new LR
             tr->train_step += (uint64_t)N;
             tr->lr = compute_lr(tr);
 
             id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
-            apply_sgd(enc, tr->ps_sgd, wb.pos_embed,tr->grad_pos,      tr->lr, (size_t)S * H);
-            apply_sgd(enc, tr->ps_sgd, wb.attn_q,   tr->grad_q,        tr->lr, (size_t)L * H * H);
-            apply_sgd(enc, tr->ps_sgd, wb.attn_k,   tr->grad_k,        tr->lr, (size_t)L * H * H);
-            apply_sgd(enc, tr->ps_sgd, wb.attn_v,   tr->grad_v,        tr->lr, (size_t)L * H * H);
-            apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        tr->lr, (size_t)L * H * H);
-            apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     tr->lr, (size_t)L * H * F * 2);
-            apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
-            apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 2 * H);
-            apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, tr->lr, (size_t)2 * H);
-            apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
+            if (tr->ps_rmsprop) {
+                float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr;
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.embed,    tr->grad_embed,    tr->v_embed,    lr, b2, ep, (size_t)V * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.pos_embed,tr->grad_pos,      tr->v_pos,      lr, b2, ep, (size_t)S * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_q,   tr->grad_q,        tr->v_q,        lr, b2, ep, (size_t)L * H * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_k,   tr->grad_k,        tr->v_k,        lr, b2, ep, (size_t)L * H * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_v,   tr->grad_v,        tr->v_v,        lr, b2, ep, (size_t)L * H * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_out, tr->grad_o,        tr->v_o,        lr, b2, ep, (size_t)L * H * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn1,     tr->grad_ffn1,     tr->v_ffn1,     lr, b2, ep, (size_t)L * H * F * 2);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, (size_t)L * F * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, (size_t)L * 2 * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.final_ln, tr->grad_final_ln, tr->v_final_ln, lr, b2, ep, (size_t)2 * H);
+                apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, (size_t)H * V);
+            } else {
+                apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
+                apply_sgd(enc, tr->ps_sgd, wb.pos_embed,tr->grad_pos,      tr->lr, (size_t)S * H);
+                apply_sgd(enc, tr->ps_sgd, wb.attn_q,   tr->grad_q,        tr->lr, (size_t)L * H * H);
+                apply_sgd(enc, tr->ps_sgd, wb.attn_k,   tr->grad_k,        tr->lr, (size_t)L * H * H);
+                apply_sgd(enc, tr->ps_sgd, wb.attn_v,   tr->grad_v,        tr->lr, (size_t)L * H * H);
+                apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        tr->lr, (size_t)L * H * H);
+                apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     tr->lr, (size_t)L * H * F * 2);
+                apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
+                apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 2 * H);
+                apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, tr->lr, (size_t)2 * H);
+                apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
+            }
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
