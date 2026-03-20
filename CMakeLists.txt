@@ -104,9 +104,6 @@ if(USE_METAL)
     set(NNCP_METAL_SOURCES
         src/metal/nncp_metal.c
         src/metal/compression_integration.c
-        src/metal/algorithm_router.c
-        src/metal/compression_selector_stub.c
-        src/metal/nncp_original_port.c
         src/neural/neural_weights.c
         src/neural/cuda_profiles.c
         src/neural/cuda_math_compat.c

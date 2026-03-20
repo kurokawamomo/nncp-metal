@@ -1261,7 +1261,8 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, /* lr= */ 1e-4f);
+                                                  mps_ctx, /* lr= */ 1e-4f,
+                                                  input_size);
     }
     if (g_online_trainer) {
         online_trainer_reset_session(g_online_trainer, false);
@@ -1485,7 +1486,8 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, /* lr= */ 1e-4f);
+                                                  mps_ctx, /* lr= */ 1e-4f,
+                                                  output_capacity);
     }
     if (g_online_trainer) {
         online_trainer_reset_session(g_online_trainer, false);
@@ -1604,11 +1606,6 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                     // Accumulate target for segment-level training.
                     if (g_online_trainer && t < SEG_LEN)
                         dec_seg_targets[s * SEG_LEN + t] = (int32_t)sym;
-
-                    // Legacy buffered path (no-op when segment graph is used, kept for safety).
-                    if (g_online_trainer && false) {
-                        online_trainer_step_buffered(g_online_trainer, one_tok[s], (int32_t)sym);
-                    }
 
                     // Advance preceding-byte for next position of this stream.
                     last_decoded[s] = (int32_t)sym;

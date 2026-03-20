@@ -84,7 +84,7 @@ struct OnlineTrainer {
 
     // LR schedule state
     uint64_t train_step;       // cumulative sample count (not reset per session)
-    float    lr_init;           // initial LR  (3e-4)
+    float    lr_init;           // initial LR (passed-in value, e.g. 1e-4)
     float    lr_min;            // floor LR    (1e-4)
     uint64_t lr_warmup_steps;   // unused (kept for ABI compat)
     uint64_t lr_decay_steps;    // steps to decay from lr_init to lr_min (156250 = 5e6/32)
@@ -640,10 +640,10 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
     // oneHotWithIndicesTensor + matmul/multiply, which have clean backward passes.
     if (tr->tb_loss && tr->tb_grad_embed && tr->tb_grad_out && tr->tb_grad_ffn1 && tr->tb_grad_b_out) {
         tr->batch_graph_built = true;
-        NSLog(@"[OnlineTrainer] Batch graph built successfully (N=%d)", TRAIN_BATCH_SIZE);
+        //NSLog(@"[OnlineTrainer] Batch graph built successfully (N=%d)", TRAIN_BATCH_SIZE);
     } else {
-        NSLog(@"[OnlineTrainer] Batch graph: gradient tensors nil — "
-              @"falling back to single-sample training");
+        //NSLog(@"[OnlineTrainer] Batch graph: gradient tensors nil — "
+        //      @"falling back to single-sample training");
         tr->batch_graph_built = false;
     }
 }
@@ -908,9 +908,9 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
 
     if (tr->ts_loss && tr->ts_grad_embed && tr->ts_grad_out && tr->ts_grad_b_out) {
         tr->seg_graph_built = true;
-        NSLog(@"[OnlineTrainer] Segment graph built (B=%d, T=%d)", B, T);
+        //NSLog(@"[OnlineTrainer] Segment graph built (B=%d, T=%d)", B, T);
     } else {
-        NSLog(@"[OnlineTrainer] Segment graph: gradient tensors nil — falling back to batch training");
+        //NSLog(@"[OnlineTrainer] Segment graph: gradient tensors nil — falling back to batch training");
         tr->seg_graph_built = false;
     }
 }
@@ -927,7 +927,7 @@ static id<MTLLibrary> load_metal_library(id<MTLDevice> device) {
                            [exeDir stringByAppendingPathComponent:@"default.metallib"]];
         NSError* err = nil;
         lib = [device newLibraryWithURL:libURL error:&err];
-        if (!lib) NSLog(@"[OnlineTrainer] Cannot load Metal library: %@", err.localizedDescription);
+        //if (!lib) NSLog(@"[OnlineTrainer] Cannot load Metal library: %@", err.localizedDescription);
     }
     return lib;
 }
@@ -938,9 +938,9 @@ static id<MTLComputePipelineState> load_pso(id<MTLDevice> device,
     if (!lib) return nil;
     NSError* err = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:name];
-    if (!fn) { NSLog(@"[OnlineTrainer] kernel '%@' not found", name); return nil; }
+    if (!fn) { /*NSLog(@"[OnlineTrainer] kernel '%@' not found", name);*/ return nil; }
     id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&err];
-    if (!pso) NSLog(@"[OnlineTrainer] PSO error for '%@': %@", name, err.localizedDescription);
+    //if (!pso) NSLog(@"[OnlineTrainer] PSO error for '%@': %@", name, err.localizedDescription);
     return pso;
 }
 
@@ -1058,12 +1058,17 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
 // ---------------------------------------------------------------------------
 
 static float compute_lr(OnlineTrainer* tr) {
-    // Linear decay: lr_init → lr_min over lr_decay_steps (no warmup)
-    // lr(t) = lr_init + (lr_min - lr_init) * min(t / lr_decay_steps, 1.0)
     float t     = (float)tr->train_step;
-    float dsteps = (float)tr->lr_decay_steps;
-    float alpha  = (dsteps > 0.0f) ? fminf(t / dsteps, 1.0f) : 1.0f;
-    return tr->lr_init + (tr->lr_min - tr->lr_init) * alpha;
+    float decay = (float)tr->lr_decay_steps;
+    if (t <= 0.0f || decay <= 0.0f) return tr->lr_init;
+    if (t <= decay) {
+        // Phase 1: linear decay lr_init → lr_min
+        float alpha = t / decay;
+        return tr->lr_init + (tr->lr_min - tr->lr_init) * alpha;
+    } else {
+        // Phase 2: inverse sqrt decay (原典 p0.5 profile: lr_min * sqrt(decay/t))
+        return tr->lr_min * sqrtf(decay / t);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,12 +1077,13 @@ static float compute_lr(OnlineTrainer* tr) {
 
 OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
                                      MPSTransformerContext* ctx,
-                                     float                  lr) {
+                                     float                  lr,
+                                     size_t                 total_input_bytes) {
     if (!device || !ctx) return nullptr;
 
     MPSTransformerConfig cfg = mps_transformer_get_config(ctx);
     if (cfg.hidden_size == 0) {
-        NSLog(@"[OnlineTrainer] Could not retrieve config from ctx");
+        //NSLog(@"[OnlineTrainer] Could not retrieve config from ctx");
         return nullptr;
     }
 
@@ -1089,7 +1095,11 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->lr_init         = lr;
     tr->lr_min          = lr * (1.0f / 3.0f);  // decay to 1/3 of init lr
     tr->lr_warmup_steps = 0;       // warmup廃止
-    tr->lr_decay_steps  = 156250;  // 5e6 / 32 (original default profile)
+    const int seg_len = SEG_TRAIN_LEN;  // 32
+    const uint64_t file_steps = (total_input_bytes > 0)
+        ? (uint64_t)(total_input_bytes / (size_t)seg_len)
+        : 0ULL;
+    tr->lr_decay_steps = (file_steps > 156250ULL) ? file_steps : 156250ULL;
     tr->train_step      = 0;
     tr->lr              = lr;   // start at lr_init immediately
     tr->L  = cfg.num_layers;
@@ -1208,177 +1218,10 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->ps_rmsprop = load_pso(device, metalLib, @"rmsprop_update");
 
     if (!tr->ps_rmsprop) {
-        NSLog(@"[OnlineTrainer] RMSProp pipeline failed — will fall back to SGD");
+        //NSLog(@"[OnlineTrainer] RMSProp pipeline failed — will fall back to SGD");
     }
 
     return tr;
-}
-
-bool online_trainer_step(OnlineTrainer* tr,
-                         int32_t        input_token,
-                         int            true_byte) {
-    if (!tr || !tr->graph_built) return false;
-
-    @autoreleasepool {
-
-    // ---- Write inputs to shared buffers ----
-    ((int32_t*)[tr->buf_input  contents])[0] = input_token;
-    ((int32_t*)[tr->buf_target contents])[0] = (int32_t)true_byte;
-
-    // ---- Get current weight buffers ----
-    MPSTransformerWeightBuffers wb;
-    if (!mps_transformer_get_weight_buffers(tr->ctx, &wb)) return false;
-
-    // ---- Build feed dictionary (MPSGraphTensor* → MPSGraphTensorData*) ----
-    auto tdFromBuf = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape,
-                         MPSDataType dt) -> MPSGraphTensorData* {
-        if (!buf) return nil;
-        return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf shape:shape dataType:dt];
-    };
-    auto floatTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
-        return tdFromBuf(buf, shape, MPSDataTypeFloat32);
-    };
-    auto int32TD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
-        return tdFromBuf(buf, shape, MPSDataTypeInt32);
-    };
-
-    uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V, S=tr->S;
-
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{
-        tr->t_input        : int32TD(tr->buf_input,  @[@1]),
-        tr->t_target       : int32TD(tr->buf_target, @[@1]),
-        tr->t_w_embed      : floatTD(wb.embed,     @[@(V), @(H)]),
-        tr->t_w_q          : floatTD(wb.attn_q,    @[@(L), @(H), @(H)]),
-        tr->t_w_k          : floatTD(wb.attn_k,    @[@(L), @(H), @(H)]),
-        tr->t_w_v          : floatTD(wb.attn_v,    @[@(L), @(H), @(H)]),
-        tr->t_w_o          : floatTD(wb.attn_out,  @[@(L), @(H), @(H)]),
-        tr->t_w_ffn1       : floatTD(wb.ffn1,      @[@(L), @(H), @(F)]),
-        tr->t_w_ffn2       : floatTD(wb.ffn2,      @[@(L), @(F), @(H)]),
-        tr->t_w_ln         : floatTD(wb.ln,        @[@(L), @(2), @(H)]),
-        tr->t_w_final_ln   : floatTD(wb.final_ln,  @[@(2), @(H)]),
-        tr->t_w_out        : floatTD(wb.out_proj,  @[@(H), @(V)]),
-        tr->t_w_b_k        : floatTD(wb.b_k,       @[@(L), @(H)]),
-        tr->t_w_b_v        : floatTD(wb.b_v,       @[@(L), @(H)]),
-        tr->t_w_b_o        : floatTD(wb.b_o,       @[@(L), @(H)]),
-        tr->t_w_b_ffn1     : floatTD(wb.b_ffn1,    @[@(L), @(F)]),
-        tr->t_w_b_ffn2     : floatTD(wb.b_ffn2,    @[@(L), @(H)]),
-        tr->t_w_b_out      : floatTD(wb.b_out,     @[@(V)]),
-    };
-
-    // ---- Pre-allocate result MPSGraphTensorData pointing at gradient buffers ----
-    // These are passed as `results` so MPSGraph writes directly into them.
-    auto gradTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
-        return floatTD(buf, shape);
-    };
-
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* grad_targets = @{
-        tr->t_grad_embed    : gradTD(tr->grad_embed,    @[@(V), @(H)]),
-        tr->t_grad_q        : gradTD(tr->grad_q,        @[@(L), @(H), @(H)]),
-        tr->t_grad_k        : gradTD(tr->grad_k,        @[@(L), @(H), @(H)]),
-        tr->t_grad_v        : gradTD(tr->grad_v,        @[@(L), @(H), @(H)]),
-        tr->t_grad_o        : gradTD(tr->grad_o,        @[@(L), @(H), @(H)]),
-        tr->t_grad_ffn1     : gradTD(tr->grad_ffn1,     @[@(L), @(H), @(F)]),
-        tr->t_grad_ffn2     : gradTD(tr->grad_ffn2,     @[@(L), @(F), @(H)]),
-        tr->t_grad_ln       : gradTD(tr->grad_ln,       @[@(L), @(2), @(H)]),
-        tr->t_grad_final_ln : gradTD(tr->grad_final_ln, @[@(2), @(H)]),
-        tr->t_grad_out      : gradTD(tr->grad_out,      @[@(H), @(V)]),
-        tr->t_grad_b_k      : gradTD(tr->grad_b_k,      @[@(L), @(H)]),
-        tr->t_grad_b_v      : gradTD(tr->grad_b_v,      @[@(L), @(H)]),
-        tr->t_grad_b_o      : gradTD(tr->grad_b_o,      @[@(L), @(H)]),
-        tr->t_grad_b_ffn1   : gradTD(tr->grad_b_ffn1,   @[@(L), @(F)]),
-        tr->t_grad_b_ffn2   : gradTD(tr->grad_b_ffn2,   @[@(L), @(H)]),
-        tr->t_grad_b_out    : gradTD(tr->grad_b_out,    @[@(V)]),
-    };
-
-    // ---- Run the training graph (forward + backward) ----
-    NSMutableArray<MPSGraphTensor*>* target_arr = [NSMutableArray arrayWithObject:tr->t_loss];
-    [target_arr addObjectsFromArray:[grad_targets allKeys]];
-
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
-        [tr->graph runWithFeeds:feeds targetTensors:target_arr targetOperations:nil];
-
-    // Copy gradient results into the pre-allocated buffers via readBytes if needed
-    // (MPSGraph may or may not write directly; use readBytes for safety)
-    auto copyGrad = [&](MPSGraphTensor* t_grad, id<MTLBuffer> gbuf, size_t n_floats) {
-        MPSGraphTensorData* td = results[t_grad];
-        if (td && gbuf) {
-            [td.mpsndarray readBytes:[gbuf contents] strideBytes:NULL];
-        }
-    };
-
-    copyGrad(tr->t_grad_embed,    tr->grad_embed,    (size_t)V * H);
-    copyGrad(tr->t_grad_q,        tr->grad_q,        (size_t)L * H * H);
-    copyGrad(tr->t_grad_k,        tr->grad_k,        (size_t)L * H * H);
-    copyGrad(tr->t_grad_v,        tr->grad_v,        (size_t)L * H * H);
-    copyGrad(tr->t_grad_o,        tr->grad_o,        (size_t)L * H * H);
-    copyGrad(tr->t_grad_ffn1,     tr->grad_ffn1,     (size_t)L * H * F);
-    copyGrad(tr->t_grad_ffn2,     tr->grad_ffn2,     (size_t)L * F * H);
-    copyGrad(tr->t_grad_ln,       tr->grad_ln,       (size_t)L * 2 * H);
-    copyGrad(tr->t_grad_final_ln, tr->grad_final_ln, (size_t)2 * H);
-    copyGrad(tr->t_grad_out,      tr->grad_out,      (size_t)H * V);
-    copyGrad(tr->t_grad_b_k,      tr->grad_b_k,      (size_t)L * H);
-    copyGrad(tr->t_grad_b_v,      tr->grad_b_v,      (size_t)L * H);
-    copyGrad(tr->t_grad_b_o,      tr->grad_b_o,      (size_t)L * H);
-    copyGrad(tr->t_grad_b_ffn1,   tr->grad_b_ffn1,   (size_t)L * F);
-    copyGrad(tr->t_grad_b_ffn2,   tr->grad_b_ffn2,   (size_t)L * H);
-    copyGrad(tr->t_grad_b_out,    tr->grad_b_out,    (size_t)V);
-
-    if (!tr->ps_rmsprop && !tr->ps_sgd) return true; // gradients computed, optimizer disabled
-
-    // ---- Gradient clipping (CPU, in-place) ----
-    clip_gradients(tr, tr->grad_clip);
-
-    // ---- Update LR schedule then apply RMSProp via Metal kernel ----
-    tr->lr = compute_lr(tr);
-    tr->train_step++;
-
-    id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-
-    if (tr->ps_rmsprop) {
-        float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr;
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.embed,    tr->grad_embed,    tr->v_embed,    lr, b2, ep, (size_t)V * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_q,   tr->grad_q,        tr->v_q,        lr, b2, ep, (size_t)L * H * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_k,   tr->grad_k,        tr->v_k,        lr, b2, ep, (size_t)L * H * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_v,   tr->grad_v,        tr->v_v,        lr, b2, ep, (size_t)L * H * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_out, tr->grad_o,        tr->v_o,        lr, b2, ep, (size_t)L * H * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn1,     tr->grad_ffn1,     tr->v_ffn1,     lr, b2, ep, (size_t)L * H * F);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, (size_t)L * F * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, (size_t)L * 2 * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.final_ln, tr->grad_final_ln, tr->v_final_ln, lr, b2, ep, (size_t)2 * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, (size_t)H * V);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_k,      tr->grad_b_k,      tr->v_b_k,      lr, b2, ep, (size_t)L * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_v,      tr->grad_b_v,      tr->v_b_v,      lr, b2, ep, (size_t)L * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_o,      tr->grad_b_o,      tr->v_b_o,      lr, b2, ep, (size_t)L * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn1,   tr->grad_b_ffn1,   tr->v_b_ffn1,   lr, b2, ep, (size_t)L * F);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn2,   tr->grad_b_ffn2,   tr->v_b_ffn2,   lr, b2, ep, (size_t)L * H);
-        apply_rmsprop(enc, tr->ps_rmsprop, wb.b_out,    tr->grad_b_out,    tr->v_b_out,    lr, b2, ep, (size_t)V);
-    } else {
-        apply_sgd(enc, tr->ps_sgd, wb.embed,    tr->grad_embed,    tr->lr, (size_t)V * H);
-        apply_sgd(enc, tr->ps_sgd, wb.attn_q,   tr->grad_q,        tr->lr, (size_t)L * H * H);
-        apply_sgd(enc, tr->ps_sgd, wb.attn_k,   tr->grad_k,        tr->lr, (size_t)L * H * H);
-        apply_sgd(enc, tr->ps_sgd, wb.attn_v,   tr->grad_v,        tr->lr, (size_t)L * H * H);
-        apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        tr->lr, (size_t)L * H * H);
-        apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     tr->lr, (size_t)L * H * F);
-        apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
-        apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 2 * H);
-        apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, tr->lr, (size_t)2 * H);
-        apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
-        apply_sgd(enc, tr->ps_sgd, wb.b_k,      tr->grad_b_k,      tr->lr, (size_t)L * H);
-        apply_sgd(enc, tr->ps_sgd, wb.b_v,      tr->grad_b_v,      tr->lr, (size_t)L * H);
-        apply_sgd(enc, tr->ps_sgd, wb.b_o,      tr->grad_b_o,      tr->lr, (size_t)L * H);
-        apply_sgd(enc, tr->ps_sgd, wb.b_ffn1,   tr->grad_b_ffn1,   tr->lr, (size_t)L * F);
-        apply_sgd(enc, tr->ps_sgd, wb.b_ffn2,   tr->grad_b_ffn2,   tr->lr, (size_t)L * H);
-        apply_sgd(enc, tr->ps_sgd, wb.b_out,    tr->grad_b_out,    tr->lr, (size_t)V);
-    }
-
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-
-    return true;
-
-    } // @autoreleasepool
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,11 +1385,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
         }
 
         } // @autoreleasepool — releases feeds dict, results dict, TensorData wrappers
-    } else {
-        // ---- Fallback: separate single-sample steps (partial mini-batch or graph unavailable) ----
-        for (int i = 0; i < N; i++) {
-            online_trainer_step(tr, tr->input_buf[start + i], (int)tr->target_buf[start + i]);
-        }
     }
 
     } // for mini-batch loop
@@ -1565,14 +1403,9 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                                          int seg_len) {
     if (!tr) return false;
 
-    // If dimensions don't match or graph unavailable, fall back to buffered-batch path.
-    // Also allow disabling segment graph via env var NNCP_NO_SEG_TRAIN=1 for debugging.
-    if (!tr->seg_graph_built || seg_len != SEG_TRAIN_LEN || getenv("NNCP_NO_SEG_TRAIN")) {
-        const int total = n_streams * seg_len;
-        for (int i = 0; i < total; i++)
-            online_trainer_step_buffered(tr, seg_inputs[i], seg_targets[i]);
-        online_trainer_flush(tr);
-        return true;
+    if (!tr->seg_graph_built || seg_len != SEG_TRAIN_LEN) {
+        //NSLog(@"[OnlineTrainer] train_segment_batch: seg_graph not ready, skipping");
+        return false;
     }
 
     // Process each stream independently (B=1, T=SEG_TRAIN_LEN) for determinism.
@@ -1708,7 +1541,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
         clip_gradients(tr, tr->grad_clip);
-        tr->train_step += (uint64_t)SEG_TRAIN_BT;
+        tr->train_step += 1;  // += 1 per (stream × segment), matches original NNCP step semantics
         tr->lr = compute_lr(tr);
 
         id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
@@ -1764,23 +1597,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     return true;
 }
 
-void online_trainer_step_buffered(OnlineTrainer* tr,
-                                   int32_t        input_token,
-                                   int32_t        true_byte) {
-    if (!tr) return;
-    if (tr->buf_len >= MAX_TRAIN_BUF) {
-        // Safety guard: should not happen if callers flush at segment boundaries.
-        // Log and drop rather than overflow the fixed-size buffer.
-        NSLog(@"[OnlineTrainer] WARNING: buf overflow (buf_len=%d >= MAX_TRAIN_BUF=%d), dropping sample",
-              tr->buf_len, MAX_TRAIN_BUF);
-        return;
-    }
-    tr->input_buf[tr->buf_len]  = input_token;
-    tr->target_buf[tr->buf_len] = true_byte;
-    tr->buf_len++;
-    // No auto-flush here — callers must call online_trainer_flush() explicitly
-    // at segment boundaries to keep compress/decompress weight updates symmetric.
-}
 
 void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
     if (!tr) return;

@@ -97,30 +97,10 @@ bool memory_manager_init(size_t max_blocks, size_t block_size);
 void memory_manager_shutdown(void);
 
 /**
- * Allocate memory from pool or system
- * @param size Size in bytes to allocate
- * @return Pointer to allocated memory or NULL on failure
- */
-void* memory_manager_alloc(size_t size);
-
-/**
- * Free memory back to pool or system
- * @param ptr Pointer to memory to free
- * @param size Size of the allocated block
- */
-void memory_manager_free(void* ptr, size_t size);
-
-/**
  * Get current memory usage statistics
  * @return Pointer to memory manager statistics
  */
 const MemoryManager* memory_manager_get_stats(void);
-
-/**
- * Force cleanup of unused memory blocks
- * @param max_age_ms Maximum age in milliseconds before block is freed
- */
-void memory_manager_cleanup(uint64_t max_age_ms);
 
 bool compression_integration_init(const CompressionConfig* config);
 
@@ -177,29 +157,11 @@ size_t compression_integration_estimate_output_size(
 );
 
 /**
- * @brief Get algorithm selection based on data characteristics
- * @param input_data Input data for analysis
- * @param input_size Size of input data
- * @return Recommended compression algorithm
- */
-CompressionAlgorithm compression_integration_select_algorithm(
-    const uint8_t* input_data,
-    size_t input_size
-);
-
-/**
  * @brief Get human-readable name for compression algorithm
  * @param algorithm Compression algorithm enum
  * @return String name of the algorithm
  */
 const char* compression_integration_algorithm_name(CompressionAlgorithm algorithm);
-
-/**
- * @brief Check if a specific algorithm is available
- * @param algorithm Algorithm to check
- * @return true if algorithm is available, false otherwise
- */
-bool compression_integration_algorithm_available(CompressionAlgorithm algorithm);
 
 #ifdef __cplusplus
 }
