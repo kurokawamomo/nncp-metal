@@ -26,61 +26,69 @@ typedef struct {
     const char* input_file;
     const char* output_file;
     const char* command;
+    float lr_override;         // 0.0 = use default 1e-4; set via --lr
     bool verbose;
 } NNCPMetalArgs;
 
 static void show_usage(const char* program_name) {
-    printf("Usage: %s c|d <input> <output>\n\n", program_name);
+    printf("Usage: %s [options] c|d <input> <output>\n\n", program_name);
     printf("Commands:\n");
     printf("  c, compress    Compress input file\n");
     printf("  d, decompress  Decompress input file\n");
     printf("Options:\n");
-    printf("  -v, --verbose  Enable verbose output\n");
-    printf("  -h, --help     Show this help\n");
+    printf("  --lr <value>      Learning rate override (default: 1e-4)\n");
+    printf("  -v, --verbose     Enable verbose output\n");
+    printf("  -h, --help        Show this help\n");
 }
 
 static int parse_args(int argc, char** argv, NNCPMetalArgs* args) {
-    if (argc < 2) {
-        return -1;
+    if (argc < 2) return -1;
+
+    args->command      = NULL;
+    args->input_file   = NULL;
+    args->output_file  = NULL;
+    args->lr_override  = 0.0f;
+    args->verbose      = false;
+
+    const char* positional[8] = {0};
+    int npos = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
+            args->lr_override = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            args->verbose = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            return 1;
+        } else {
+            if (npos < 8) positional[npos++] = argv[i];
+        }
     }
-    
-    // Initialize defaults
-    args->command = argv[1];
-    args->input_file = NULL;
-    args->output_file = NULL;
-    args->verbose = false;
-    
-    // Parse command with better argument validation
+
+    if (npos < 1) return -1;
+    args->command = positional[0];
+
     if (strcmp(args->command, "c") == 0 || strcmp(args->command, "compress") == 0) {
-        if (argc < 4) {
-            printf("Error: compress command requires input and output file arguments\n");
+        if (npos < 3) {
+            printf("Error: compress requires input and output file arguments\n");
             return -1;
         }
-        args->input_file = argv[2];
-        args->output_file = argv[3];
+        args->input_file  = positional[1];
+        args->output_file = positional[2];
     } else if (strcmp(args->command, "d") == 0 || strcmp(args->command, "decompress") == 0) {
-        if (argc < 4) {
-            printf("Error: decompress command requires input and output file arguments\n");
+        if (npos < 3) {
+            printf("Error: decompress requires input and output file arguments\n");
             return -1;
         }
-        args->input_file = argv[2];
-        args->output_file = argv[3];
+        args->input_file  = positional[1];
+        args->output_file = positional[2];
     } else if (strcmp(args->command, "test") == 0) {
-        // Test command doesn't need files
-    } else if (strcmp(args->command, "-h") == 0 || strcmp(args->command, "--help") == 0) {
-        return 1; // Show help
+        // no files needed
     } else {
         printf("Error: Unknown command '%s'\n", args->command);
         return -1;
     }
-    
-    // Parse options
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            args->verbose = true;
-        }
-    }
-    
+
     return 0;
 }
 
@@ -577,6 +585,10 @@ int main(int argc, char** argv) {
     }
     
 #ifdef USE_METAL
+    g_lr_override = args.lr_override;
+    if (args.lr_override > 0.0f && args.verbose)
+        printf("LR override: %.2e\n", args.lr_override);
+
     // Execute command
     if (strcmp(args.command, "test") == 0) {
         return run_metal_tests(args.verbose);

@@ -12,6 +12,8 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <mach/mach_time.h>
+#include <unistd.h>
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
@@ -25,6 +27,8 @@
 #ifndef BOOL
 #define BOOL bool
 #endif
+
+float g_lr_override = 0.0f;  // 0 = use default 1e-4; set via --lr CLI flag
 
 #ifdef __cplusplus
 extern "C" {
@@ -1218,6 +1222,8 @@ static MPSTransformerContext* get_shared_mps_ctx() {
 #define MEM_LEN      32      // mem_len (original default=32)
 #define BLOCK_LEN    500000  // lookahead block size (original default)
 
+static mach_timebase_info_data_t g_tb = {};
+
 // Main CUDA-compatible lossless compression function — segment-based (Case 3 architecture)
 size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size,
                                            uint8_t* output_data, size_t output_capacity,
@@ -1261,12 +1267,17 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, /* lr= */ 1e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 1e-4f,
                                                   input_size);
     }
     if (g_online_trainer) {
         online_trainer_reset_session(g_online_trainer, false);
     }
+
+    if (g_tb.denom == 0) mach_timebase_info(&g_tb);
+    int    perf_count        = 0;
+    double perf_decode_total = 0.0;
+    double perf_train_total  = 0.0;
 
     // ---- Segment-level working buffers (heap: 16×32×256×4 ≈ 512 KB) ----
     float*   seg_logits  = (float*)  malloc((size_t)NUM_STREAMS * SEG_LEN * vocab_size * sizeof(float));
@@ -1312,9 +1323,11 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
             }
 
             // 2. Segment forward pass → seg_logits[NUM_STREAMS × SEG_LEN × vocab_size].
+            uint64_t perf_t0 = mach_absolute_time();
             mps_transformer_execute_segment(mps_ctx, seg_tokens, NUM_STREAMS, SEG_LEN, seg_logits);
+            uint64_t perf_t1 = mach_absolute_time();
 
-            // 3. Arithmetic encode + buffer training pairs (t outer, s inner for training symmetry).
+            // 4. Arithmetic encode + buffer training pairs (t outer, s inner for training symmetry).
             for (int t = 0; t < SEG_LEN; t++) {
                 const size_t abs_pos = file_pos + block_idx + (size_t)t;
                 if (abs_pos >= file_pos + block_bytes) break;  // past this block
@@ -1353,12 +1366,25 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                 }
             }
 
-            // 4. One backward pass over the full [NUM_STREAMS × SEG_LEN] segment.
-            if (g_online_trainer && !getenv("NNCP_NO_TRAIN"))
+            // 5. One backward pass over the full [NUM_STREAMS × SEG_LEN] segment.
+            uint64_t perf_t2 = perf_t1;
+            if (g_online_trainer && !getenv("NNCP_NO_TRAIN")) {
                 online_trainer_train_segment_batch(g_online_trainer,
                     seg_tokens, seg_targets, NUM_STREAMS, SEG_LEN);
+                perf_t2 = mach_absolute_time();
+            }
 
             block_idx += SEG_LEN;
+
+            ++perf_count;
+            double decode_ms = (double)(perf_t1 - perf_t0) * g_tb.numer / g_tb.denom * 1e-6;
+            double train_ms  = (double)(perf_t2 - perf_t1) * g_tb.numer / g_tb.denom * 1e-6;
+            perf_decode_total += decode_ms;
+            perf_train_total  += train_ms;
+            if (perf_count % 5 == 0 && !isatty(STDERR_FILENO)) {
+                fprintf(stderr, "[PERF] seg=%d decode=%.1fms train=%.1fms\n",
+                        perf_count, decode_ms, train_ms);
+            }
 
             double pct = (double)(file_pos + block_idx) / (double)stride * 100.0;
             if (pct > 100.0) pct = 100.0;
@@ -1368,6 +1394,13 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
 
         block_num++;
         file_pos += block_bytes;
+    }
+
+    if (perf_count > 0 && !isatty(STDERR_FILENO)) {
+        fprintf(stderr, "[PERF] compress total: segs=%d decode_avg=%.1fms train_avg=%.1fms\n",
+                perf_count,
+                perf_decode_total / perf_count,
+                perf_train_total  / perf_count);
     }
 
     free(seg_logits);
@@ -1486,7 +1519,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, /* lr= */ 1e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 1e-4f,
                                                   output_capacity);
     }
     if (g_online_trainer) {
@@ -1763,10 +1796,10 @@ static MetalTransformerModel* create_transformer_model(void) {
     model->command_queue = [device newCommandQueue];
     model->context_length = 1024 * 64; // Max context for batched streams (1024 streams * 64 seq)
     model->vocab_size = 256;         // Byte vocabulary
-    model->hidden_size = 256;        // Match original NNCP default profile
-    model->num_attention_heads = 8;   // Efficient parallel processing
-    model->num_layers = 4;           // Sufficient depth
-    model->feed_forward_size = 512; // 2x hidden size (original default: d_inner = d_model * 2)
+    model->hidden_size          = 256;
+    model->num_attention_heads  = 8;
+    model->num_layers           = 4;
+    model->feed_forward_size    = 512;
     model->max_sequence_length = MEM_LEN;
     
     // Allocate weight buffers

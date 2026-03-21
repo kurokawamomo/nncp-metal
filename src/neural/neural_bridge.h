@@ -283,6 +283,9 @@ size_t neural_bridge_lossless_decompress(
     size_t output_capacity
 );
 
+/** Global LR override set by --lr CLI flag. 0.0 = use default (1e-4). */
+extern float g_lr_override;
+
 #ifdef __cplusplus
 }
 #endif
