@@ -1244,7 +1244,7 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- Arithmetic encoders ----
     PutBitState encoders[NUM_STREAMS];
     uint8_t* stream_buffers[NUM_STREAMS];
-    const size_t est_capacity = stride + (stride / 8) + 4096;
+    const size_t est_capacity = stride * 2 + 4096;
     for (int i = 0; i < NUM_STREAMS; i++) {
         stream_buffers[i] = (uint8_t*)malloc(est_capacity);
         if (!stream_buffers[i]) {

@@ -856,8 +856,15 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
     MPSGraphTensor* logits = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:tr->ts_w_out name:nil] secondaryTensor:tr->ts_w_b_out name:nil];
 
     // ---- Loss: mean cross-entropy over all B*T positions ----
+    // Numerically stable cross-entropy: add eps before log to avoid log(0)=-inf → -inf*0=NaN.
+    // When the model becomes confident, softmax can underflow to 0.0 in float32 for rare
+    // classes, producing log(0)=-inf.  Multiplied by one_hot=0, that gives -inf*0=NaN (IEEE 754).
+    // Adding 1e-7 ensures log(p+eps) is always finite.  For p>>eps the gradient is unchanged.
+    MPSGraphTensor* probs    = [g softMaxWithTensor:logits axis:-1 name:nil]; // [B*T, V]
     MPSGraphTensor* log_probs = [g logarithmWithTensor:
-                                     [g softMaxWithTensor:logits axis:-1 name:nil] name:nil]; // [B*T, V]
+                                    [g additionWithPrimaryTensor:probs
+                                                secondaryTensor:[g constantWithScalar:1e-7f dataType:MPSDataTypeFloat32]
+                                                            name:nil] name:nil]; // [B*T, V]
     // One-hot target mask to avoid scatter_nd in backward
     MPSGraphTensor* one_hot_tgt = [g oneHotWithIndicesTensor:tr->ts_seg_target
                                                        depth:V
@@ -996,7 +1003,8 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
         if (!b || n == 0) return;
         float* p = (float*)[b contents];
         for (size_t i = 0; i < n; i++) {
-            if      (p[i] >  max_norm) p[i] =  max_norm;
+            if (!isfinite(p[i]))       p[i] =  0.0f;
+            else if (p[i] >  max_norm) p[i] =  max_norm;
             else if (p[i] < -max_norm) p[i] = -max_norm;
         }
     };
