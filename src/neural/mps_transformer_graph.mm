@@ -964,38 +964,31 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
             k = [graph transposeTensor:[graph reshapeTensor:k withShape:@[@(batch_size), @(seq_len), @(NH), @(HD)] name:nil] dimension:1 withDimension:2 name:nil];
             v = [graph transposeTensor:[graph reshapeTensor:v withShape:@[@(batch_size), @(seq_len), @(NH), @(HD)] name:nil] dimension:1 withDimension:2 name:nil];
 
-            float scale = 1.0f / sqrtf((float)HD);
-            MPSGraphTensor* k_t    = [graph transposeTensor:k dimension:2 withDimension:3 name:nil];
-            MPSGraphTensor* scores = [graph matrixMultiplicationWithPrimaryTensor:q secondaryTensor:k_t name:nil];
-            scores = [graph multiplicationWithPrimaryTensor:scores
-                                           secondaryTensor:[graph constantWithScalar:scale dataType:MPSDataTypeFloat32] name:nil];
-
-            // Causal mask: scores shape [batch, NH, seq_len, seq_len]
-            // mask[qi][ki] = -1e9 if ki > qi else 0  (prevent attending to future tokens)
-            // Built once at graph-compile time as a float32 constant [seq_len, seq_len]
-            // and broadcast-added across the batch and head dimensions.
+            // WWDC24 SDPA: fused Q·Kᵀ/scale/softmax/·V (macOS 15+, memory-efficient vs MEM_LEN growth).
+            // q, k, v: [batch, NH, seq, HD]; causal additive bias broadcasts over [batch, NH].
+            MPSGraphTensor* attn_out;
             {
                 size_t mask_elems = (size_t)seq_len * seq_len;
                 float* mask_buf = (float*)calloc(mask_elems, sizeof(float));
-                for (size_t qi = 0; qi < seq_len; qi++) {
-                    for (size_t ki = qi + 1; ki < seq_len; ki++) {
+                for (size_t qi = 0; qi < seq_len; qi++)
+                    for (size_t ki = qi + 1; ki < seq_len; ki++)
                         mask_buf[qi * seq_len + ki] = -1e9f;
-                    }
-                }
                 NSData* mask_data = [NSData dataWithBytesNoCopy:mask_buf
                                                          length:mask_elems * sizeof(float)
                                                    freeWhenDone:YES];
                 MPSGraphTensor* causal_mask = [graph constantWithData:mask_data
                                                                 shape:@[@(seq_len), @(seq_len)]
                                                              dataType:MPSDataTypeFloat32];
-                scores = [graph additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
+                float scale = 1.0f / sqrtf((float)HD);
+                MPSGraphTensor* attn_mh = [graph scaledDotProductAttentionWithQueryTensor:q
+                                                                               keyTensor:k
+                                                                             valueTensor:v
+                                                                              maskTensor:causal_mask
+                                                                                   scale:scale
+                                                                                    name:nil];
+                attn_out = [graph reshapeTensor:[graph transposeTensor:attn_mh dimension:1 withDimension:2 name:nil]
+                                      withShape:@[@(batch_size), @(seq_len), @(H)] name:nil];
             }
-
-            scores = [graph softMaxWithTensor:scores axis:-1 name:nil];
-
-            MPSGraphTensor* attn_out = [graph matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v name:nil];
-            attn_out = [graph transposeTensor:attn_out dimension:1 withDimension:2 name:nil];
-            attn_out = [graph reshapeTensor:attn_out withShape:@[@(batch_size), @(seq_len), @(H)] name:nil];
             attn_out = [graph additionWithPrimaryTensor:[graph matrixMultiplicationWithPrimaryTensor:attn_out secondaryTensor:w_o name:nil] secondaryTensor:bo_i name:nil];
 
             // Post-LN 1: LN(residual + attn_out)
