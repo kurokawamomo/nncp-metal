@@ -1267,7 +1267,7 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 1e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
                                                   input_size);
     }
     if (g_online_trainer) {
@@ -1519,7 +1519,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 1e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
                                                   output_capacity);
     }
     if (g_online_trainer) {

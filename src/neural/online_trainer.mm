@@ -1041,15 +1041,14 @@ static float compute_lr(OnlineTrainer* tr) {
     if (warmup > 0.0f && t < warmup) {
         return tr->lr_init * ((t + 1.0f) / warmup);
     }
-    // Phase 1+: linear decay → inverse sqrt (warmup分をシフト)
+    // Phase 1: linear decay lr_init → lr_min; Phase 2 removed (steady lr_min)
     float t2 = t - warmup;
     if (t2 <= 0.0f || decay <= 0.0f) return tr->lr_init;
-    if (t2 <= decay) {
+    if (t2 < decay) {
         float alpha = t2 / decay;
         return tr->lr_init + (tr->lr_min - tr->lr_init) * alpha;
-    } else {
-        return tr->lr_min * sqrtf(decay / t2);
     }
+    return tr->lr_min;
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1079,7 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     const uint64_t file_steps = (total_input_bytes > 0)
         ? (uint64_t)(total_input_bytes / (size_t)seg_len)
         : 0ULL;
-    tr->lr_decay_steps = (file_steps > 156250ULL) ? file_steps : 156250ULL;
+    tr->lr_decay_steps = 156250ULL; // fixed (original NNCP default profile)
     tr->train_step      = 0;
     tr->lr              = lr;   // start at lr_init immediately
     tr->L  = cfg.num_layers;
