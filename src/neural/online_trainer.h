@@ -80,6 +80,13 @@ bool online_trainer_train_segment_batch(OnlineTrainer* trainer,
                                          int            n_streams,
                                          int            seg_len);
 
+/**
+ * Latch the current KV cache memory slots as the pre-segment snapshot.
+ * Call BEFORE mps_transformer_execute_segment so the training graph receives
+ * the previous segment's KV as memory (not the post-forward shifted state).
+ */
+void online_trainer_latch_kv_memory(OnlineTrainer* trainer);
+
 #ifdef __cplusplus
 }
 #endif

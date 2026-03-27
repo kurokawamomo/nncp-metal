@@ -259,6 +259,11 @@ struct OnlineTrainer {
     MPSGraphTensor* ts_kv_mem_v[SEG_MAX_LAYERS];
     id<MTLBuffer>   kv_mem_buf_k[SEG_MAX_LAYERS]; // staging: stream's memory K [MEM_LEN * H]
     id<MTLBuffer>   kv_mem_buf_v[SEG_MAX_LAYERS];
+
+    // Phase M: pre-segment KV snapshot (latched before execute_segment)
+    id<MTLBuffer>   kv_pre_seg_buf_k[SEG_MAX_LAYERS];
+    id<MTLBuffer>   kv_pre_seg_buf_v[SEG_MAX_LAYERS];
+    bool            kv_pre_seg_valid;
 };
 
 // ---------------------------------------------------------------------------
@@ -1176,6 +1181,23 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         }
     }
 
+    // Phase M: pre-segment KV snapshot buffers
+    {
+        const size_t pre_seg_kv_size = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_LEN * H * sizeof(float);
+        for (int li = 0; li < SEG_MAX_LAYERS; li++) {
+            tr->kv_pre_seg_buf_k[li] = [device newBufferWithLength:pre_seg_kv_size options:opts];
+            tr->kv_pre_seg_buf_v[li] = [device newBufferWithLength:pre_seg_kv_size options:opts];
+            if (!tr->kv_pre_seg_buf_k[li] || !tr->kv_pre_seg_buf_v[li]) {
+                NSLog(@"online_trainer_create: failed to alloc pre_seg_kv buffers layer %d", li);
+                online_trainer_destroy(tr);
+                return NULL;
+            }
+            memset([tr->kv_pre_seg_buf_k[li] contents], 0, pre_seg_kv_size);
+            memset([tr->kv_pre_seg_buf_v[li] contents], 0, pre_seg_kv_size);
+        }
+        tr->kv_pre_seg_valid = false;
+    }
+
     tr->beta2     = 0.9999f;
     tr->opt_eps   = 1e-8f;
     tr->grad_clip = 0.1f;
@@ -1376,6 +1398,42 @@ void online_trainer_flush(OnlineTrainer* tr) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase M: latch pre-segment KV memory snapshot
+// ---------------------------------------------------------------------------
+
+void online_trainer_latch_kv_memory(OnlineTrainer* tr) {
+    if (!tr || !tr->ctx) return;
+    id<MTLBuffer> kv_cache_k = nil, kv_cache_v = nil;
+    uint32_t kv_batch = 0, kv_total_len = 0, kv_mem_len = 0;
+    bool have_kv = mps_transformer_get_kv_cache_buffers(tr->ctx, &kv_cache_k, &kv_cache_v,
+                                                        &kv_batch, &kv_total_len, &kv_mem_len);
+    if (!have_kv || !kv_cache_k || !kv_cache_v) { tr->kv_pre_seg_valid = false; return; }
+    if (kv_mem_len != (uint32_t)SEG_TRAIN_LEN || kv_batch < (uint32_t)SEG_TRAIN_STREAMS) {
+        tr->kv_pre_seg_valid = false; return;
+    }
+    const float* k_base = (const float*)[kv_cache_k contents];
+    const float* v_base = (const float*)[kv_cache_v contents];
+    const int L = (int)tr->L;
+    const int H = (int)tr->H;
+    for (int li = 0; li < L && li < SEG_MAX_LAYERS; li++) {
+        if (!tr->kv_pre_seg_buf_k[li] || !tr->kv_pre_seg_buf_v[li]) continue;
+        size_t layer_stride  = (size_t)kv_batch * kv_total_len * H;
+        size_t stream_stride = (size_t)kv_total_len * H;
+        float* dst_k = (float*)[tr->kv_pre_seg_buf_k[li] contents];
+        float* dst_v = (float*)[tr->kv_pre_seg_buf_v[li] contents];
+        for (int si = 0; si < SEG_TRAIN_STREAMS; si++) {
+            memcpy(dst_k + (size_t)si * kv_mem_len * H,
+                   k_base + li * layer_stride + (size_t)si * stream_stride,
+                   (size_t)kv_mem_len * H * sizeof(float));
+            memcpy(dst_v + (size_t)si * kv_mem_len * H,
+                   v_base + li * layer_stride + (size_t)si * stream_stride,
+                   (size_t)kv_mem_len * H * sizeof(float));
+        }
+    }
+    tr->kv_pre_seg_valid = true;
+}
+
+// ---------------------------------------------------------------------------
 // Segment-level training: run ONE backward pass over a full [B, T] segment
 // ---------------------------------------------------------------------------
 
@@ -1410,33 +1468,16 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
 
     uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V;
 
-    // Phase E2.3: extract KV memory for ALL streams from the KV cache → [n_streams*MEM_LEN, H]
+    // Phase M: use pre-segment KV snapshot (latched before execute_segment)
     {
-        id<MTLBuffer> kv_cache_k = nil, kv_cache_v = nil;
-        uint32_t kv_batch = 0, kv_total_len = 0, kv_mem_len = 0;
-        bool have_kv = mps_transformer_get_kv_cache_buffers(tr->ctx, &kv_cache_k, &kv_cache_v,
-                                                            &kv_batch, &kv_total_len, &kv_mem_len);
         const size_t buf_slots = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_LEN;
-        if (have_kv && kv_cache_k && kv_cache_v && kv_mem_len == (uint32_t)SEG_TRAIN_LEN
-                && kv_batch >= (uint32_t)n_streams) {
-            const float* k_base = (const float*)[kv_cache_k contents];
-            const float* v_base = (const float*)[kv_cache_v contents];
-            for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-                size_t layer_stride  = (size_t)kv_batch * kv_total_len * H;
-                size_t stream_stride = (size_t)kv_total_len * H;
-                float* dst_k = (float*)[tr->kv_mem_buf_k[li] contents];
-                float* dst_v = (float*)[tr->kv_mem_buf_v[li] contents];
-                for (int si = 0; si < n_streams; si++) {
-                    memcpy(dst_k + (size_t)si * kv_mem_len * H,
-                           k_base + li * layer_stride + (size_t)si * stream_stride,
-                           (size_t)kv_mem_len * H * sizeof(float));
-                    memcpy(dst_v + (size_t)si * kv_mem_len * H,
-                           v_base + li * layer_stride + (size_t)si * stream_stride,
-                           (size_t)kv_mem_len * H * sizeof(float));
-                }
-            }
-        } else {
-            for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+        for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li] && tr->kv_pre_seg_buf_v[li]) {
+                memcpy([tr->kv_mem_buf_k[li] contents], [tr->kv_pre_seg_buf_k[li] contents],
+                       buf_slots * H * sizeof(float));
+                memcpy([tr->kv_mem_buf_v[li] contents], [tr->kv_pre_seg_buf_v[li] contents],
+                       buf_slots * H * sizeof(float));
+            } else {
                 memset([tr->kv_mem_buf_k[li] contents], 0, buf_slots * H * sizeof(float));
                 memset([tr->kv_mem_buf_v[li] contents], 0, buf_slots * H * sizeof(float));
             }

@@ -1322,6 +1322,9 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                 }
             }
 
+            // Phase M: latch pre-segment KV memory BEFORE forward pass
+            if (g_online_trainer) online_trainer_latch_kv_memory(g_online_trainer);
+
             // 2. Segment forward pass → seg_logits[NUM_STREAMS × SEG_LEN × vocab_size].
             uint64_t perf_t0 = mach_absolute_time();
             mps_transformer_execute_segment(mps_ctx, seg_tokens, NUM_STREAMS, SEG_LEN, seg_logits);
@@ -1564,6 +1567,9 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         // ---- Segment loop within block ----
         size_t block_idx = 0;
         while (block_idx < block_bytes) {
+
+            // Phase M: latch pre-segment KV memory BEFORE the per-byte forward passes
+            if (g_online_trainer) online_trainer_latch_kv_memory(g_online_trainer);
 
             // ---- Position loop within segment (autoregressive: token known after each decode) ----
             for (int t = 0; t < SEG_LEN; t++) {
