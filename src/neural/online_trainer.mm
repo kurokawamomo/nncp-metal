@@ -1673,7 +1673,41 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
 void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
     if (!tr) return;
 
-    tr->buf_len = 0;  // always drain the buffer at session start
+    // Reset optimizer state so compress and decompress see identical update trajectories.
+    tr->buf_len    = 0;
+    tr->train_step = 0;
+    tr->opt_step   = 0;
+    tr->kv_pre_seg_valid = false;
+
+    auto zeroBuf = [](id<MTLBuffer> b, size_t n) {
+        if (b) memset([b contents], 0, n * sizeof(float));
+    };
+    const uint32_t rL=tr->L, rH=tr->H, rF=tr->F, rV=tr->V;
+    zeroBuf(tr->v_embed,    (size_t)rV * rH);
+    zeroBuf(tr->v_q,        (size_t)rL * rH * rH);
+    zeroBuf(tr->v_k,        (size_t)rL * rH * rH);
+    zeroBuf(tr->v_v,        (size_t)rL * rH * rH);
+    zeroBuf(tr->v_o,        (size_t)rL * rH * rH);
+    zeroBuf(tr->v_ffn1,     (size_t)rL * rH * rF);
+    zeroBuf(tr->v_ffn2,     (size_t)rL * rF * rH);
+    zeroBuf(tr->v_ln,       (size_t)rL * 2 * rH);
+    zeroBuf(tr->v_final_ln, (size_t)2 * rH);
+    zeroBuf(tr->v_out,      (size_t)rH * rV);
+    zeroBuf(tr->v_b_k,      (size_t)rL * rH);
+    zeroBuf(tr->v_b_v,      (size_t)rL * rH);
+    zeroBuf(tr->v_b_o,      (size_t)rL * rH);
+    zeroBuf(tr->v_b_ffn1,   (size_t)rL * rF);
+    zeroBuf(tr->v_b_ffn2,   (size_t)rL * rH);
+    zeroBuf(tr->v_b_out,    (size_t)rV);
+    zeroBuf(tr->v_rel_r,    (size_t)tr->NH * tr->HD * SEG_TRAIN_LEN);
+    zeroBuf(tr->v_b_rel_r,  (size_t)tr->NH * SEG_TRAIN_LEN * 2);
+    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_LEN;
+    for (int li = 0; li < SEG_MAX_LAYERS; li++) {
+        zeroBuf(tr->kv_mem_buf_k[li],     MEM_SLOTS * rH);
+        zeroBuf(tr->kv_mem_buf_v[li],     MEM_SLOTS * rH);
+        zeroBuf(tr->kv_pre_seg_buf_k[li], MEM_SLOTS * rH);
+        zeroBuf(tr->kv_pre_seg_buf_v[li], MEM_SLOTS * rH);
+    }
 
     if (!deterministic_init) return; // leave weights as-is
 
