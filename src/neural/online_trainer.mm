@@ -801,22 +801,62 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
                                    secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
                                               name:nil];
 
-        // Phase E2.3: Extended Relative PE — B-general implementation
-        // w_rel_r: [NH,HD,D_POS] → [1,NH,HD,D_POS] for broadcasting over B
-        // q_mh:    [B,NH,T,HD] @ [1,NH,HD,D_POS] = [B,NH,T,D_POS]
+        // Phase N: True relative distance PE
+        // q_mh: [B,NH,T,HD] → q_rel_raw: [B,NH,T,D_POS]
         MPSGraphTensor* w_r_4d    = [g reshapeTensor:tr->ts_w_rel_r
                                           withShape:@[@1, @(NH), @(HD), @(D_POS)] name:nil];
         MPSGraphTensor* q_rel_raw = [g matrixMultiplicationWithPrimaryTensor:q_mh
                                                              secondaryTensor:w_r_4d name:nil]; // [B,NH,T,D_POS]
-        MPSGraphTensor* q_rel_ext = [g concatTensors:@[q_rel_raw, q_rel_raw] dimension:3 name:nil]; // [B,NH,T,64]
-        q_rel_ext = [g multiplicationWithPrimaryTensor:q_rel_ext
-                                      secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
-                                                 name:nil];
-        // b_r: [NH, 64] → [1, NH, 1, 64] — broadcasts to [B, NH, T, 64] for any B
-        MPSGraphTensor* b_r_bc = [g reshapeTensor:tr->ts_b_rel_r
-                                        withShape:@[@1, @(NH), @1, @(EXT_LEN)] name:nil];
-        q_rel_ext = [g additionWithPrimaryTensor:q_rel_ext secondaryTensor:b_r_bc name:nil]; // [B,NH,T,64]
-        scores = [g additionWithPrimaryTensor:scores secondaryTensor:q_rel_ext name:nil];    // [B,NH,T,64]
+        {
+            // Build constant distance index tables (computed once at graph build time)
+            // dist = MEM_LEN + ti - k  (query pos = MEM_LEN+ti, key pos = k)
+            int32_t q_dist_data[T * EXT_LEN], b_dist_data[T * EXT_LEN];
+            for (int ti2 = 0; ti2 < T; ti2++) {
+                for (int k2 = 0; k2 < EXT_LEN; k2++) {
+                    int d = MEM_LEN + ti2 - k2;
+                    q_dist_data[ti2 * EXT_LEN + k2] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+                    b_dist_data[ti2 * EXT_LEN + k2] = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN-1 : d);
+                }
+            }
+            MPSGraphTensor* q_dist_const = [g constantWithData:
+                [NSData dataWithBytes:q_dist_data length:(size_t)T*EXT_LEN*sizeof(int32_t)]
+                shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeInt32];
+            MPSGraphTensor* b_dist_const = [g constantWithData:
+                [NSData dataWithBytes:b_dist_data length:(size_t)T*EXT_LEN*sizeof(int32_t)]
+                shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeInt32];
+
+            // q_rel gather: for each (b,nh,ti,k), look up q_rel_raw[b,nh,ti, q_dist[ti,k]]
+            MPSGraphTensor* q_rel_flat = [g reshapeTensor:q_rel_raw
+                                                withShape:@[@(B*NH*T), @(D_POS)] name:nil]; // [B*NH*T, D_POS]
+            MPSGraphTensor* q_dist_tiled = [g tileTensor:q_dist_const
+                                          withMultiplier:@[@(B*NH), @1] name:nil]; // [B*NH*T, EXT_LEN]
+            MPSGraphTensor* q_rel_gathered = [g gatherWithUpdatesTensor:q_rel_flat
+                                                          indicesTensor:q_dist_tiled
+                                                                   axis:1
+                                                        batchDimensions:1
+                                                                   name:nil]; // [B*NH*T, EXT_LEN]
+            MPSGraphTensor* q_rel_ext = [g reshapeTensor:q_rel_gathered
+                                                withShape:@[@(B), @(NH), @(T), @(EXT_LEN)] name:nil];
+            q_rel_ext = [g multiplicationWithPrimaryTensor:q_rel_ext
+                                          secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
+                                                     name:nil];
+
+            // b_rel gather: for each (nh,ti,k), look up b_rel_r[nh, b_dist[ti,k]]
+            MPSGraphTensor* b_r_t = [g transposeTensor:tr->ts_b_rel_r
+                                             dimension:0 withDimension:1 name:nil]; // [EXT_LEN, NH]
+            MPSGraphTensor* b_gathered = [g gatherWithUpdatesTensor:b_r_t
+                                                      indicesTensor:b_dist_const
+                                                               axis:0
+                                                    batchDimensions:0
+                                                               name:nil]; // [T, EXT_LEN, NH]
+            MPSGraphTensor* b_tmp = [g transposeTensor:b_gathered dimension:0 withDimension:2 name:nil]; // [NH, EXT_LEN, T]
+            MPSGraphTensor* b_rel_ext = [g transposeTensor:b_tmp dimension:1 withDimension:2 name:nil]; // [NH, T, EXT_LEN]
+            MPSGraphTensor* b_r_bc = [g reshapeTensor:b_rel_ext
+                                            withShape:@[@1, @(NH), @(T), @(EXT_LEN)] name:nil]; // [1,NH,T,EXT_LEN]
+
+            MPSGraphTensor* rel_pe = [g additionWithPrimaryTensor:q_rel_ext secondaryTensor:b_r_bc name:nil];
+            scores = [g additionWithPrimaryTensor:scores secondaryTensor:rel_pe name:nil]; // [B,NH,T,64]
+        }
 
         // Extended causal mask [T, 64] broadcasts to [B,NH,T,64]
         scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
