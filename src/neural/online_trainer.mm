@@ -363,8 +363,8 @@ static void build_training_graph(OnlineTrainer* tr) {
                                               name:nil];
         // Clamp before softmax (Post-LN stability: prevent attention score explosion)
         scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-20.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:20.0f dataType:MPSDataTypeFloat32]
+                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
+                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
                                name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil]; // [1, NH, 1, 1]
 
@@ -555,8 +555,8 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
                                               name:nil];
         // Clamp before softmax (Post-LN stability)
         scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-20.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:20.0f dataType:MPSDataTypeFloat32]
+                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
+                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
                                name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil];
 
@@ -861,8 +861,8 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
         // Extended causal mask [T, 64] broadcasts to [B,NH,T,64]
         scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
         scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-20.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:20.0f dataType:MPSDataTypeFloat32]
+                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
+                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
                                name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil]; // [B,NH,T,64]
 
@@ -1124,7 +1124,7 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     const uint64_t file_steps = (total_input_bytes > 0)
         ? (uint64_t)(total_input_bytes / (size_t)seg_len)
         : 0ULL;
-    tr->lr_decay_steps = 156250ULL; // fixed (original NNCP default profile)
+    tr->lr_decay_steps = (file_steps > 156250ULL) ? file_steps : 156250ULL;
     tr->train_step      = 0;
     tr->lr              = lr;   // start at lr_init immediately
     tr->L  = cfg.num_layers;
