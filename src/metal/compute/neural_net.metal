@@ -266,7 +266,7 @@ kernel void transformer_attention_decode_cached(
     constant float&     scale      [[buffer(9)]],
     device const float* W_rel_r    [[buffer(10)]],   // [NH, HD, D_POS] tied rel PE proj
     device const float* B_rel_r    [[buffer(11)]],   // [NH, total_len]  tied rel PE bias
-    constant uint&      d_pos      [[buffer(12)]],   // = 32
+    constant uint&      d_pos      [[buffer(12)]],   // up to 64
     constant uint&      total_len  [[buffer(13)]],   // = 64
     uint2 gid [[thread_position_in_grid]]   // gid.x=head_idx, gid.y=batch_idx
 ) {
@@ -286,7 +286,7 @@ kernel void transformer_attention_decode_cached(
 
     // Phase E2.2: pre-compute q_rel[d] = Q[h] @ W_rel_r[h, :, :] → [D_POS=32]
     // Layout: W_rel_r[h * head_dim * d_pos + hd * d_pos + d]
-    thread float q_rel_vec[32];  // D_POS always <= 32
+    thread float q_rel_vec[64];  // D_POS always <= 64
     const uint w_rel_head_off = h * head_dim * d_pos;
     for (uint d = 0; d < d_pos; d++) {
         float s = 0.0f;

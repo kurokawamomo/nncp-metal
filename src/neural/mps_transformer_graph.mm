@@ -200,7 +200,7 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
     cacheWeight(@"w_o",        ctx->w_attn_out, @[@(L), @(H), @(H)]);
     cacheWeight(@"w_ffn1",     ctx->w_ffn_1,    @[@(L), @(H), @(FFN)]);
     cacheWeight(@"w_ffn2",     ctx->w_ffn_2,    @[@(L), @(FFN), @(H)]);
-    cacheWeight(@"w_ln",       ctx->w_ln,       @[@(L), @(2), @(H)]);
+    cacheWeight(@"w_ln",       ctx->w_ln,       @[@(L), @(4), @(H)]);
     cacheWeight(@"w_final_ln", ctx->w_final_ln, @[@(2), @(H)]);
     cacheWeight(@"w_out",      ctx->w_out_proj, @[@(H), @(V)]);
     cacheWeight(@"b_k",        ctx->w_b_k,      @[@(L), @(H)]);
@@ -571,7 +571,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         const NSUInteger off_HH    = (NSUInteger)layer * H   * H   * sizeof(float);
         const NSUInteger off_FFN1  = (NSUInteger)layer * H   * FFN * sizeof(float);
         const NSUInteger off_FFN2  = (NSUInteger)layer * FFN * H   * sizeof(float);
-        const NSUInteger off_LN    = (NSUInteger)layer * 2   * H   * sizeof(float);
+        const NSUInteger off_LN    = (NSUInteger)layer * 4   * H   * sizeof(float);
         const NSUInteger off_bias_H   = (NSUInteger)layer * H   * sizeof(float);
         const NSUInteger off_bias_FFN = (NSUInteger)layer * FFN * sizeof(float);
 
@@ -656,8 +656,8 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         const NSUInteger kv_layer_off =
             (NSUInteger)layer * batch_size * max_sl * H * sizeof(float);
 
-        // Phase E2.2: relative PE constants (D_POS=HD=32, total_len=max_sl=64)
-        uint32_t d_pos_val    = HD;      // D_POS = head_dim = 32
+        // Phase E2.2: relative PE constants (D_POS=total_len=64)
+        uint32_t d_pos_val    = max_sl;  // D_POS = total_len = 64
         uint32_t total_len_v  = max_sl;  // kv_total_len = 64
 
         [enc setComputePipelineState:ctx->ps_attn_decode_cached];
@@ -766,10 +766,10 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
         // ---- Post-LN 2: dec_buf_ln2 → dec_buf_embed   grid = [batch_size, 1, 1] ----
         [enc setComputePipelineState:ctx->ps_layer_norm];
-        [enc setBuffer:ctx->dec_buf_ln2   offset:0                        atIndex:0];
-        [enc setBuffer:ctx->dec_buf_embed offset:0                        atIndex:1];
-        [enc setBuffer:ctx->w_ln          offset:off_LN                   atIndex:2];
-        [enc setBuffer:ctx->w_ln          offset:off_LN + H*sizeof(float) atIndex:3];
+        [enc setBuffer:ctx->dec_buf_ln2   offset:0                            atIndex:0];
+        [enc setBuffer:ctx->dec_buf_embed offset:0                            atIndex:1];
+        [enc setBuffer:ctx->w_ln          offset:off_LN + 2*H*sizeof(float)  atIndex:2];
+        [enc setBuffer:ctx->w_ln          offset:off_LN + 3*H*sizeof(float)  atIndex:3];
         [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&eps length:sizeof(float)    atIndex:5];
         [enc dispatchThreads:MTLSizeMake(batch_size, 1, 1)
@@ -908,7 +908,7 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
                                                           dataType:MPSDataTypeFloat32 name:@"w_ffn1"];
         MPSGraphTensor* w_ffn2_all   = [graph placeholderWithShape:@[@(L), @(FFN), @(H)]
                                                           dataType:MPSDataTypeFloat32 name:@"w_ffn2"];
-        MPSGraphTensor* w_ln_all     = [graph placeholderWithShape:@[@(L), @(2), @(H)]
+        MPSGraphTensor* w_ln_all     = [graph placeholderWithShape:@[@(L), @(4), @(H)]
                                                           dataType:MPSDataTypeFloat32 name:@"w_ln"];
         MPSGraphTensor* w_final_ln_t = [graph placeholderWithShape:@[@(2), @(H)]
                                                           dataType:MPSDataTypeFloat32 name:@"w_final_ln"];
@@ -954,6 +954,8 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
             MPSGraphTensor* w_ln_layer = [graph squeezeTensor:[graph sliceTensor:w_ln_all dimension:0 start:i length:1 name:nil] axis:0 name:nil];
             MPSGraphTensor* gamma1 = [graph squeezeTensor:[graph sliceTensor:w_ln_layer dimension:0 start:0 length:1 name:nil] axis:0 name:nil];
             MPSGraphTensor* beta1  = [graph squeezeTensor:[graph sliceTensor:w_ln_layer dimension:0 start:1 length:1 name:nil] axis:0 name:nil];
+            MPSGraphTensor* gamma2 = [graph squeezeTensor:[graph sliceTensor:w_ln_layer dimension:0 start:2 length:1 name:nil] axis:0 name:nil];
+            MPSGraphTensor* beta2  = [graph squeezeTensor:[graph sliceTensor:w_ln_layer dimension:0 start:3 length:1 name:nil] axis:0 name:nil];
 
             // Post-LN: no pre-norm; use x directly for Q/K/V
             MPSGraphTensor* q = [graph matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_q name:nil];
@@ -1003,7 +1005,7 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
             MPSGraphTensor* ffn_out = [graph additionWithPrimaryTensor:[graph matrixMultiplicationWithPrimaryTensor:ffn_mid secondaryTensor:w_ffn2 name:nil] secondaryTensor:bffn2_i name:nil];
 
             // Post-LN 2: LN(residual + ffn_out)
-            x = layer_norm(graph, [graph additionWithPrimaryTensor:residual secondaryTensor:ffn_out name:nil], gamma1, beta1);
+            x = layer_norm(graph, [graph additionWithPrimaryTensor:residual secondaryTensor:ffn_out name:nil], gamma2, beta2);
         }
 
         // Final LN + output proj

@@ -119,7 +119,7 @@ typedef struct MetalTransformerModel {
     id<MTLBuffer> bias_ffn1;  /* [num_layers x feed_forward_size] */
     id<MTLBuffer> bias_ffn2;  /* [num_layers x hidden_size] */
     id<MTLBuffer> bias_out;   /* [vocab_size] */
-    id<MTLBuffer> rel_r;      /* [NH * HD * D_POS] = [8*32*32] rel PE proj  */
+    id<MTLBuffer> rel_r;      /* [NH * HD * D_POS] = [8*32*64] rel PE proj  */
     id<MTLBuffer> b_rel_r;    /* [NH * total_len]  = [8*64]    rel PE bias  */
 
     // Computation buffers
@@ -1075,7 +1075,7 @@ static float* g_session_init_attn_v    = NULL;  /* [L * H * H]      */
 static float* g_session_init_attn_out  = NULL;  /* [L * H * H]      */
 static float* g_session_init_ffn1      = NULL;  /* [L * H * FFS]    */
 static float* g_session_init_ffn2      = NULL;  /* [L * FFS * H]    */
-static float* g_session_init_ln        = NULL;  /* [L * 2 * H]      */
+static float* g_session_init_ln        = NULL;  /* [L * 4 * H]      */
 static float* g_session_init_final_ln  = NULL;  /* [2 * H]          */
 static float* g_session_init_out_proj  = NULL;  /* [H * V]          */
 static float* g_session_init_bias_k    = NULL;  /* [L * H]          */
@@ -1111,7 +1111,7 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     SNAPSHOT(g_session_init_attn_out, model->attention_output_weights, L * H * H);
     SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS);
     SNAPSHOT(g_session_init_ffn2,     model->ffn_weights_2,           L * FFS * H);
-    SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 2 * H);
+    SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 4 * H);
     SNAPSHOT(g_session_init_final_ln, model->final_layer_norm_weights, 2 * H);
     SNAPSHOT(g_session_init_out_proj, model->output_projection,       H * V);
     SNAPSHOT(g_session_init_bias_k,    model->bias_k,    L * H);
@@ -1123,7 +1123,7 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     {
         const size_t NH_ = model->num_attention_heads;     /* 8  */
         const size_t HD_ = model->hidden_size / NH_;       /* 32 */
-        SNAPSHOT(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 32); /* [NH,HD,D_POS] */
+        SNAPSHOT(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 64); /* [NH,HD,D_POS] */
         SNAPSHOT(g_session_init_b_rel_r, model->b_rel_r, NH_ * 64);       /* [NH,total_len]*/
     }
 
@@ -1152,7 +1152,7 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     RESTORE(g_session_init_attn_out, model->attention_output_weights,  L * H * H);
     RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS);
     RESTORE(g_session_init_ffn2,     model->ffn_weights_2,            L * FFS * H);
-    RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 2 * H);
+    RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 4 * H);
     RESTORE(g_session_init_final_ln, model->final_layer_norm_weights,  2 * H);
     RESTORE(g_session_init_out_proj, model->output_projection,        H * V);
     RESTORE(g_session_init_bias_k,    model->bias_k,    L * H);
@@ -1164,7 +1164,7 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     {
         const size_t NH_ = model->num_attention_heads;
         const size_t HD_ = model->hidden_size / NH_;
-        if (g_session_init_rel_r)   RESTORE(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 32);
+        if (g_session_init_rel_r)   RESTORE(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 64);
         if (g_session_init_b_rel_r) RESTORE(g_session_init_b_rel_r, model->b_rel_r, NH_ * 64);
     }
 
@@ -1777,7 +1777,7 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
         const uint32_t HD_ = H / NH_;                   /* 32 */
         nn_weights_init_uniform(
             (float*)model->rel_r.contents,
-            (size_t)NH_ * HD_ * 32, INIT_SCALE, 50u);   /* [NH, HD, D_POS=32] */
+            (size_t)NH_ * HD_ * 64, INIT_SCALE, 50u);   /* [NH, HD, D_POS=64] */
         memset([model->b_rel_r contents], 0, (size_t)NH_ * 64 * sizeof(float)); /* [NH, total_len=64] */
     }
 
@@ -1826,7 +1826,7 @@ static MetalTransformerModel* create_transformer_model(void) {
                                                 options:MTLResourceStorageModeShared];
     model->ffn_weights_2 = [device newBufferWithLength:model->num_layers * model->feed_forward_size * model->hidden_size * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
-    model->layer_norm_weights = [device newBufferWithLength:model->num_layers * 2 * model->hidden_size * sizeof(float)
+    model->layer_norm_weights = [device newBufferWithLength:model->num_layers * 4 * model->hidden_size * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
     model->final_layer_norm_weights = [device newBufferWithLength:2 * model->hidden_size * sizeof(float)
                                                           options:MTLResourceStorageModeShared];
@@ -1845,9 +1845,9 @@ static MetalTransformerModel* create_transformer_model(void) {
         model->bias_out  = [device newBufferWithLength:V     * sizeof(float) options:opts];
         const size_t NH_ = model->num_attention_heads; /* 8  */
         const size_t HD_ = H / NH_;                    /* 32 */
-        model->rel_r   = [device newBufferWithLength:NH_ * HD_ * 32 * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
+        model->rel_r   = [device newBufferWithLength:NH_ * HD_ * 64 * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
         model->b_rel_r = [device newBufferWithLength:NH_ * 64        * sizeof(float) options:opts]; /* [NH,total_len] */
-        if (model->rel_r)   memset([model->rel_r   contents], 0, NH_ * HD_ * 32 * sizeof(float));
+        if (model->rel_r)   memset([model->rel_r   contents], 0, NH_ * HD_ * 64 * sizeof(float));
         if (model->b_rel_r) memset([model->b_rel_r contents], 0, NH_ * 64        * sizeof(float));
         if (model->bias_k)    memset([model->bias_k    contents], 0, L * H * sizeof(float));
         if (model->bias_v)    memset([model->bias_v    contents], 0, L * H * sizeof(float));
