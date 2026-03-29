@@ -793,10 +793,6 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
 
         // Extended causal mask [T, 64] broadcasts to [B,NH,T,64]
         scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
-        scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
-                               name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil]; // [B,NH,T,64]
 
         // Weighted sum: [B,NH,T,64] @ [B,NH,64,HD] = [B,NH,T,HD]
@@ -1475,14 +1471,11 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     copyGrad(tr->ts_grad_rel_r,    tr->grad_rel_r);
     copyGrad(tr->ts_grad_b_rel_r,  tr->grad_b_rel_r);
 
-    // [WQNORM-DIAG] raw grad_q norm (before clip) and weight norm, every 2000 steps
-    if ((tr->train_step + (uint64_t)n_streams) % 2000 < (uint64_t)n_streams) {
+    // [WQNORM-DIAG] raw grad norms (before clip): first step + every 2000 steps
+    bool _wq_diag = (tr->train_step == 0) ||
+                    ((tr->train_step + (uint64_t)n_streams) % 2000 < (uint64_t)n_streams);
+    if (_wq_diag) {
         size_t n = (size_t)tr->L * (size_t)tr->H * (size_t)tr->H;
-        // w_q norm
-        float* wq = (float*)[wb.attn_q contents];
-        double wsq = 0.0;
-        for (size_t ii = 0; ii < n; ii++) wsq += (double)wq[ii] * (double)wq[ii];
-        // raw grad_q norm (before clip)
         float gnorm_raw = 0.0f, gnorm_ffn1 = 0.0f, gnorm_embed = 0.0f;
         if (tr->grad_q) {
             float* gq = (float*)[tr->grad_q contents];
@@ -1504,9 +1497,18 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             for (size_t ii = 0; ii < ne; ii++) gsq += (double)ge[ii] * (double)ge[ii];
             gnorm_embed = sqrtf((float)gsq);
         }
-        fprintf(stderr, "[WQNORM] step=%llu wnorm=%.6f raw_gq=%.6f gffn1=%.6f gembed=%.6f\n",
-                (unsigned long long)(tr->train_step + n_streams), sqrtf((float)wsq),
-                gnorm_raw, gnorm_ffn1, gnorm_embed);
+        auto lnorm = [](id<MTLBuffer> b, size_t n_) -> float {
+            if (!b) return 0.0f; float* p = (float*)[b contents];
+            double s = 0.0; for (size_t ii = 0; ii < n_; ii++) s += (double)p[ii]*(double)p[ii];
+            return sqrtf((float)s);
+        };
+        float gnorm_k    = lnorm(tr->grad_k,     n);
+        float gnorm_v    = lnorm(tr->grad_v,     n);
+        float gnorm_o    = lnorm(tr->grad_o,     n);
+        float gnorm_relr = lnorm(tr->grad_rel_r, (size_t)tr->NH * tr->HD * SEG_TRAIN_LEN * 2);
+        fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f\n",
+                (unsigned long long)(tr->train_step + n_streams),
+                gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed);
     }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
@@ -1524,6 +1526,9 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             }
         }
 
+        // WqFix: grelr scatter-add is non-deterministic; zero it to preserve roundtrip
+        if (tr->grad_rel_r)   memset([tr->grad_rel_r contents],   0, tr->grad_rel_r.length);
+        if (tr->grad_b_rel_r) memset([tr->grad_b_rel_r contents], 0, tr->grad_b_rel_r.length);
         id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (tr->ps_rmsprop) {

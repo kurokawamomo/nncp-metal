@@ -9,6 +9,7 @@ cmake_install.cmake
 install_manifest.txt
 Makefile
 *.cmake
+.clangd
 
 # Compiled binaries
 nncp
@@ -64,6 +65,8 @@ src/version.h
 .idea/
 *.xcodeproj/
 *.xcworkspace/
+.claude
+.cursor
 
 # Log files
 *.log
