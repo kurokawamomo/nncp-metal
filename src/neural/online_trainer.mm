@@ -1736,13 +1736,15 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
     if (wb.ffn2)
         memset([wb.ffn2 contents], 0, (size_t)L * F * H * sizeof(float));
 
-    // LayerNorm [L, 2, H]: gamma=1, beta=0
+    // LayerNorm [L, 4, H]: gamma1=1, beta1=0, gamma2=1, beta2=0
     if (wb.ln) {
         float* p = (float*)[wb.ln contents];
         for (uint32_t l = 0; l < L; l++) {
-            float* gamma = p + l * 2 * H;
-            float* beta  = gamma + H;
-            for (uint32_t i = 0; i < H; i++) { gamma[i] = 1.0f; beta[i] = 0.0f; }
+            float* base   = p + (size_t)l * 4 * H;
+            float* gamma1 = base,             *beta1  = base + H;
+            float* gamma2 = base + 2 * H,     *beta2  = base + 3 * H;
+            for (uint32_t i = 0; i < H; i++) { gamma1[i] = 1.0f; beta1[i] = 0.0f; }
+            for (uint32_t i = 0; i < H; i++) { gamma2[i] = 1.0f; beta2[i] = 0.0f; }
         }
     }
     if (wb.final_ln) {
