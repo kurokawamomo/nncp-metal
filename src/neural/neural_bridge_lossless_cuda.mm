@@ -1293,8 +1293,8 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         const size_t block_bytes = ((stride - file_pos) < (size_t)BLOCK_LEN)
                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
 
-        // Transformer-XL: shift oldest KV context into memory at each block boundary.
-        mps_transformer_memory_shift(mps_ctx);
+        // Original NNCP trf_reset(): zero KV memory at each block boundary (fresh context per block).
+        mps_transformer_reset_kv_cache(mps_ctx);
 
         // ---- Segment loop within this block ----
         size_t block_idx = 0;
@@ -1555,8 +1555,8 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         const size_t block_bytes = ((stride - file_pos) < (size_t)BLOCK_LEN)
                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
 
-        // Transformer-XL: shift oldest KV context into memory at each block boundary.
-        mps_transformer_memory_shift(mps_ctx);
+        // Original NNCP trf_reset(): zero KV memory at each block boundary (fresh context per block).
+        mps_transformer_reset_kv_cache(mps_ctx);
 
         // ---- Segment loop within block ----
         size_t block_idx = 0;
