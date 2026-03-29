@@ -51,7 +51,6 @@ bool gpu_transformer_set_weights(GPUTransformerContext* ctx,
                                 id<MTLBuffer> ffn_1,
                                 id<MTLBuffer> ffn_2,
                                 id<MTLBuffer> ln_weights,
-                                id<MTLBuffer> final_ln_weights,
                                 id<MTLBuffer> out_proj);
 
 /**

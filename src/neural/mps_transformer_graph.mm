@@ -34,7 +34,6 @@ struct MPSTransformerContext {
     id<MTLBuffer> w_ffn_1;
     id<MTLBuffer> w_ffn_2;
     id<MTLBuffer> w_ln;
-    id<MTLBuffer> w_final_ln;
     id<MTLBuffer> w_out_proj;
 
     // Bias buffers (use_bias=1, query_bias=0: no b_q per original NNCP default)
@@ -81,7 +80,6 @@ struct MPSTransformerContext {
     id<MTLBuffer> dec_buf_ffn1;         // [FFN]      float
     id<MTLBuffer> dec_buf_geglu;        // [FFN]      float
     id<MTLBuffer> dec_buf_ffn2;         // [H]        float  (also used as next-layer x)
-    id<MTLBuffer> dec_buf_final_ln;     // [H]        float
     id<MTLBuffer> dec_buf_logits;       // [V]        float
 
     // Zero-bias buffers (models have no explicit bias terms)
@@ -145,7 +143,6 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
                                  id<MTLBuffer> ffn_1,
                                  id<MTLBuffer> ffn_2,
                                  id<MTLBuffer> ln_weights,
-                                 id<MTLBuffer> final_ln_weights,
                                  id<MTLBuffer> out_proj,
                                  id<MTLBuffer> b_k,
                                  id<MTLBuffer> b_v,
@@ -166,7 +163,6 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
     ctx->w_ffn_1     = ffn_1;
     ctx->w_ffn_2     = ffn_2;
     ctx->w_ln        = ln_weights;
-    ctx->w_final_ln  = final_ln_weights;
     ctx->w_out_proj  = out_proj;
     ctx->w_b_k       = b_k;
     ctx->w_b_v       = b_v;
@@ -201,7 +197,6 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
     cacheWeight(@"w_ffn1",     ctx->w_ffn_1,    @[@(L), @(H), @(FFN)]);
     cacheWeight(@"w_ffn2",     ctx->w_ffn_2,    @[@(L), @(FFN), @(H)]);
     cacheWeight(@"w_ln",       ctx->w_ln,       @[@(L), @(4), @(H)]);
-    cacheWeight(@"w_final_ln", ctx->w_final_ln, @[@(2), @(H)]);
     cacheWeight(@"w_out",      ctx->w_out_proj, @[@(H), @(V)]);
     cacheWeight(@"b_k",        ctx->w_b_k,      @[@(L), @(H)]);
     cacheWeight(@"b_v",        ctx->w_b_v,      @[@(L), @(H)]);
@@ -240,7 +235,6 @@ bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,
     out->ffn1      = ctx->w_ffn_1;
     out->ffn2      = ctx->w_ffn_2;
     out->ln        = ctx->w_ln;
-    out->final_ln  = ctx->w_final_ln;
     out->out_proj  = ctx->w_out_proj;
     out->b_k       = ctx->w_b_k;
     out->b_v       = ctx->w_b_v;
@@ -463,7 +457,6 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->dec_buf_ffn1     = newBuf(batch_size * FFN * sizeof(float));
     ctx->dec_buf_geglu    = newBuf(batch_size * FFN * sizeof(float));
     ctx->dec_buf_ffn2     = newBuf(batch_size * H   * sizeof(float));
-    ctx->dec_buf_final_ln = newBuf(batch_size * H   * sizeof(float));
     ctx->dec_buf_logits   = newBuf(batch_size * V   * sizeof(float));
 
     // Zero bias buffers — broadcast across batch, not batch-dependent
@@ -492,7 +485,6 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
 //   w_ffn_1           : [L, H, FFN]      → layer offset = i * H*FFN
 //   w_ffn_2           : [L, FFN, H]      → layer offset = i * FFN*H
 //   w_ln              : [L, 2, H]        → gamma at 0, beta at H
-//   w_final_ln        : [2, H]           → gamma at 0, beta at H
 //   w_out_proj        : [H, V]
 // ---------------------------------------------------------------------------
 
@@ -781,26 +773,11 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     }
 
     // ------------------------------------------------------------------
-    // Final Layer Norm: grid = [batch_size, 1, 1]
-    // ------------------------------------------------------------------
-    [enc setComputePipelineState:ctx->ps_layer_norm];
-    [enc setBuffer:x_buf                 offset:0               atIndex:0];
-    [enc setBuffer:ctx->dec_buf_final_ln offset:0               atIndex:1];
-    [enc setBuffer:ctx->w_final_ln       offset:0               atIndex:2];
-    [enc setBuffer:ctx->w_final_ln       offset:H*sizeof(float) atIndex:3];
-    [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
-    [enc setBytes:&eps length:sizeof(float)    atIndex:5];
-    [enc dispatchThreads:MTLSizeMake(batch_size, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(MIN(batch_size, 64u), 1, 1)];
-
-    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-    // ------------------------------------------------------------------
     // Output Projection: [batch, H] → [batch, V]   grid = [V, batch_size, 1]
     // ------------------------------------------------------------------
     id<MTLBuffer> b_out_buf = ctx->w_b_out ?: ctx->dec_zero_V;
     [enc setComputePipelineState:ctx->ps_linear];
-    [enc setBuffer:ctx->dec_buf_final_ln offset:0 atIndex:0];
+    [enc setBuffer:x_buf                 offset:0 atIndex:0];
     [enc setBuffer:ctx->w_out_proj       offset:0 atIndex:1];
     [enc setBuffer:b_out_buf             offset:0 atIndex:2];
     [enc setBuffer:ctx->dec_buf_logits   offset:0 atIndex:3];
@@ -910,8 +887,6 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
                                                           dataType:MPSDataTypeFloat32 name:@"w_ffn2"];
         MPSGraphTensor* w_ln_all     = [graph placeholderWithShape:@[@(L), @(4), @(H)]
                                                           dataType:MPSDataTypeFloat32 name:@"w_ln"];
-        MPSGraphTensor* w_final_ln_t = [graph placeholderWithShape:@[@(2), @(H)]
-                                                          dataType:MPSDataTypeFloat32 name:@"w_final_ln"];
         MPSGraphTensor* w_out_t      = [graph placeholderWithShape:@[@(H), @(V)]
                                                           dataType:MPSDataTypeFloat32 name:@"w_out"];
         MPSGraphTensor* b_k_all      = [graph placeholderWithShape:@[@(L), @(H)]
@@ -1008,10 +983,7 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
             x = layer_norm(graph, [graph additionWithPrimaryTensor:residual secondaryTensor:ffn_out name:nil], gamma2, beta2);
         }
 
-        // Final LN + output proj
-        MPSGraphTensor* gamma_f = [graph squeezeTensor:[graph sliceTensor:w_final_ln_t dimension:0 start:0 length:1 name:nil] axis:0 name:nil];
-        MPSGraphTensor* beta_f  = [graph squeezeTensor:[graph sliceTensor:w_final_ln_t dimension:0 start:1 length:1 name:nil] axis:0 name:nil];
-        x = layer_norm(graph, x, gamma_f, beta_f);
+        // Output proj
         x = [graph additionWithPrimaryTensor:[graph matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_out_t name:nil] secondaryTensor:b_out_t name:nil];
 
         ctx->outputTensor = x;
@@ -1028,7 +1000,6 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
                                             @"w_ffn1":      w_ffn1_all,
                                             @"w_ffn2":      w_ffn2_all,
                                             @"w_ln":        w_ln_all,
-                                            @"w_final_ln":  w_final_ln_t,
                                             @"w_out":       w_out_t,
                                             @"b_k":         b_k_all,
                                             @"b_v":         b_v_all,

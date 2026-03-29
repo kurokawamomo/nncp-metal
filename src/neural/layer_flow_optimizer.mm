@@ -76,15 +76,14 @@ bool flow_optimizer_set_transformer_weights(FlowOptimizerContext* ctx,
                                            id<MTLBuffer> ffn_1,
                                            id<MTLBuffer> ffn_2,
                                            id<MTLBuffer> ln_weights,
-                                           id<MTLBuffer> final_ln_weights,
                                            id<MTLBuffer> out_proj) {
     if (!ctx || !ctx->transformer_ctx) return false;
-    
+
     return gpu_transformer_set_weights(ctx->transformer_ctx,
                                       embed, pos_embed,
                                       attn_q, attn_k, attn_v, attn_out,
                                       ffn_1, ffn_2,
-                                      ln_weights, final_ln_weights, out_proj);
+                                      ln_weights, out_proj);
 }
 
 bool flow_optimizer_setup_lstm(FlowOptimizerContext* ctx, GPULSTMConfig config) {

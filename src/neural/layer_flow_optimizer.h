@@ -51,7 +51,6 @@ bool flow_optimizer_set_transformer_weights(FlowOptimizerContext* ctx,
                                            id<MTLBuffer> ffn_1,
                                            id<MTLBuffer> ffn_2,
                                            id<MTLBuffer> ln_weights,
-                                           id<MTLBuffer> final_ln_weights,
                                            id<MTLBuffer> out_proj);
 
 /**

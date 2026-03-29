@@ -48,7 +48,6 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
                                 id<MTLBuffer> ffn_1,
                                 id<MTLBuffer> ffn_2,
                                 id<MTLBuffer> ln_weights,
-                                id<MTLBuffer> final_ln_weights,
                                 id<MTLBuffer> out_proj,
                                 id<MTLBuffer> b_k,
                                 id<MTLBuffer> b_v,
@@ -85,7 +84,6 @@ typedef struct {
     id<MTLBuffer> ffn1;       /* [L, H, F] */
     id<MTLBuffer> ffn2;       /* [L, F, H] */
     id<MTLBuffer> ln;         /* [L, 2, H] */
-    id<MTLBuffer> final_ln;   /* [2, H] */
     id<MTLBuffer> out_proj;   /* [H, V] */
     id<MTLBuffer> b_k;        /* [L, H] */
     id<MTLBuffer> b_v;        /* [L, H] */

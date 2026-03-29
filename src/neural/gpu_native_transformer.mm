@@ -35,7 +35,6 @@ struct GPUTransformerContext {
     id<MTLBuffer> w_ffn_1;
     id<MTLBuffer> w_ffn_2;
     id<MTLBuffer> w_ln;
-    id<MTLBuffer> w_final_ln;
     id<MTLBuffer> w_out_proj;
     
     bool is_ready;
@@ -136,7 +135,6 @@ bool gpu_transformer_set_weights(GPUTransformerContext* ctx,
                                 id<MTLBuffer> ffn_1,
                                 id<MTLBuffer> ffn_2,
                                 id<MTLBuffer> ln_weights,
-                                id<MTLBuffer> final_ln_weights,
                                 id<MTLBuffer> out_proj) {
     if (!ctx) return false;
     
@@ -368,12 +366,12 @@ bool gpu_transformer_encode_batch(GPUTransformerContext* ctx,
         [enc dispatchThreads:MTLSizeMake(total_elems, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     }
     
-    // Final LN
+    // Final LN (uses per-layer LN weights as fallback)
     [enc setComputePipelineState:ctx->pipeline_norm];
     [enc setBuffer:buf_embed offset:off_embed atIndex:0];
     [enc setBuffer:buf_embed offset:off_embed atIndex:1];
-    [enc setBuffer:ctx->w_final_ln ? ctx->w_final_ln : ctx->w_ln offset:0 atIndex:2];
-    [enc setBuffer:ctx->w_final_ln ? ctx->w_final_ln : ctx->w_ln offset:d_model*sizeof(float) atIndex:3];
+    [enc setBuffer:ctx->w_ln offset:0 atIndex:2];
+    [enc setBuffer:ctx->w_ln offset:d_model*sizeof(float) atIndex:3];
     [enc setBytes:&d_model length:sizeof(uint32_t) atIndex:4];
     float eps = 1e-5;
     [enc setBytes:&eps length:sizeof(float) atIndex:5];

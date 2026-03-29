@@ -109,7 +109,6 @@ typedef struct MetalTransformerModel {
     id<MTLBuffer> ffn_weights_1;         // [num_layers x hidden_size x feed_forward_size] 
     id<MTLBuffer> ffn_weights_2;         // [num_layers x feed_forward_size x hidden_size]
     id<MTLBuffer> layer_norm_weights;    // [num_layers x 2 x hidden_size] pre/post norm
-    id<MTLBuffer> final_layer_norm_weights; // [2 x hidden_size] final norm
     id<MTLBuffer> output_projection;     // [hidden_size x vocab_size] final projection
 
     // Bias buffers (use_bias=1: learned by gradient descent, zero-initialized)
@@ -1046,7 +1045,6 @@ static FlowOptimizerContext* get_shared_flow_context() {
                 model->ffn_weights_1,
                 model->ffn_weights_2,
                 model->layer_norm_weights,
-                model->final_layer_norm_weights,
                 model->output_projection
             );
         }
@@ -1076,7 +1074,6 @@ static float* g_session_init_attn_out  = NULL;  /* [L * H * H]      */
 static float* g_session_init_ffn1      = NULL;  /* [L * H * FFS]    */
 static float* g_session_init_ffn2      = NULL;  /* [L * FFS * H]    */
 static float* g_session_init_ln        = NULL;  /* [L * 4 * H]      */
-static float* g_session_init_final_ln  = NULL;  /* [2 * H]          */
 static float* g_session_init_out_proj  = NULL;  /* [H * V]          */
 static float* g_session_init_bias_k    = NULL;  /* [L * H]          */
 static float* g_session_init_bias_v    = NULL;  /* [L * H]          */
@@ -1112,7 +1109,6 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS);
     SNAPSHOT(g_session_init_ffn2,     model->ffn_weights_2,           L * FFS * H);
     SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 4 * H);
-    SNAPSHOT(g_session_init_final_ln, model->final_layer_norm_weights, 2 * H);
     SNAPSHOT(g_session_init_out_proj, model->output_projection,       H * V);
     SNAPSHOT(g_session_init_bias_k,    model->bias_k,    L * H);
     SNAPSHOT(g_session_init_bias_v,    model->bias_v,    L * H);
@@ -1153,7 +1149,6 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS);
     RESTORE(g_session_init_ffn2,     model->ffn_weights_2,            L * FFS * H);
     RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 4 * H);
-    RESTORE(g_session_init_final_ln, model->final_layer_norm_weights,  2 * H);
     RESTORE(g_session_init_out_proj, model->output_projection,        H * V);
     RESTORE(g_session_init_bias_k,    model->bias_k,    L * H);
     RESTORE(g_session_init_bias_v,    model->bias_v,    L * H);
@@ -1202,7 +1197,6 @@ static MPSTransformerContext* get_shared_mps_ctx() {
                 model->ffn_weights_1,
                 model->ffn_weights_2,
                 model->layer_norm_weights,
-                model->final_layer_norm_weights,
                 model->output_projection,
                 model->bias_k,
                 model->bias_v,
@@ -1764,8 +1758,6 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
     // LayerNorm: gamma=1, beta=0
     nn_weights_init_layer_norm(
         (float*)model->layer_norm_weights.contents, H, L);
-    nn_weights_init_layer_norm(
-        (float*)model->final_layer_norm_weights.contents, H, 1);
 
     // Output projection (seed 49)
     nn_weights_init_uniform(
@@ -1829,8 +1821,6 @@ static MetalTransformerModel* create_transformer_model(void) {
                                                 options:MTLResourceStorageModeShared];
     model->layer_norm_weights = [device newBufferWithLength:model->num_layers * 4 * model->hidden_size * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    model->final_layer_norm_weights = [device newBufferWithLength:2 * model->hidden_size * sizeof(float)
-                                                          options:MTLResourceStorageModeShared];
     model->output_projection = [device newBufferWithLength:model->hidden_size * model->vocab_size * sizeof(float)
                                                    options:MTLResourceStorageModeShared];
 
@@ -1880,7 +1870,7 @@ static MetalTransformerModel* create_transformer_model(void) {
     if (!model->embedding_weights || !model->position_embeddings ||
         !model->attention_weights_q || !model->attention_weights_k || !model->attention_weights_v ||
         !model->attention_output_weights || !model->ffn_weights_1 || !model->ffn_weights_2 ||
-        !model->layer_norm_weights || !model->final_layer_norm_weights || !model->output_projection ||
+        !model->layer_norm_weights || !model->output_projection ||
         !model->bias_k || !model->bias_v || !model->bias_o ||
         !model->bias_ffn1 || !model->bias_ffn2 || !model->bias_out ||
         !model->rel_r || !model->b_rel_r ||
