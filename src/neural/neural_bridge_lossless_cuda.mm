@@ -1756,9 +1756,10 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
     nn_weights_init_uniform(
         (float*)model->ffn_weights_1.contents,
         (size_t)L * H * FFS, INIT_SCALE, 47u);
+    const float ff2_scale = INIT_SCALE * sqrtf((float)H / (float)FFS);  // ≈ 0.0442
     nn_weights_init_uniform(
         (float*)model->ffn_weights_2.contents,
-        (size_t)L * FFS * H, INIT_SCALE, 48u);
+        (size_t)L * FFS * H, ff2_scale, 48u);
 
     // LayerNorm: gamma=1, beta=0
     nn_weights_init_layer_norm(
