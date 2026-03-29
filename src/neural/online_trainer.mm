@@ -111,7 +111,6 @@ struct OnlineTrainer {
     MPSGraphTensor* t_w_out;
 
     // Bias placeholders for single-sample graph
-    MPSGraphTensor* t_w_b_k, *t_w_b_v, *t_w_b_o;
     MPSGraphTensor* t_w_b_ffn1, *t_w_b_ffn2, *t_w_b_out;
 
     // Target: loss + gradient tensors (same order as weight_keys below)
@@ -126,7 +125,6 @@ struct OnlineTrainer {
     MPSGraphTensor* t_grad_ffn2;
     MPSGraphTensor* t_grad_ln;
     MPSGraphTensor* t_grad_out;
-    MPSGraphTensor* t_grad_b_k, *t_grad_b_v, *t_grad_b_o;
     MPSGraphTensor* t_grad_b_ffn1, *t_grad_b_ffn2, *t_grad_b_out;
 
     // Pre-allocated gradient MTLBuffers (StorageModeShared — CPU + GPU)
@@ -140,7 +138,6 @@ struct OnlineTrainer {
     id<MTLBuffer> grad_ffn2;
     id<MTLBuffer> grad_ln;
     id<MTLBuffer> grad_out;
-    id<MTLBuffer> grad_b_k, grad_b_v, grad_b_o;
     id<MTLBuffer> grad_b_ffn1, grad_b_ffn2, grad_b_out;
 
     // Tiny input/target buffers
@@ -150,7 +147,6 @@ struct OnlineTrainer {
     // RMSProp (Adam beta1=0) second-moment buffers — same shape as grad_*
     id<MTLBuffer> v_embed, v_pos, v_q, v_k, v_v, v_o;
     id<MTLBuffer> v_ffn1, v_ffn2, v_ln, v_out;
-    id<MTLBuffer> v_b_k, v_b_v, v_b_o;
     id<MTLBuffer> v_b_ffn1, v_b_ffn2, v_b_out;
     float beta2;      // = 0.9999
     float opt_eps;    // = 1e-8
@@ -188,7 +184,6 @@ struct OnlineTrainer {
     MPSGraphTensor* tb_w_out;
 
     // Bias placeholders for batch graph
-    MPSGraphTensor* tb_w_b_k, *tb_w_b_v, *tb_w_b_o;
     MPSGraphTensor* tb_w_b_ffn1, *tb_w_b_ffn2, *tb_w_b_out;
 
     // Batch loss + gradient tensors (same weight shapes as single-sample graph)
@@ -203,7 +198,6 @@ struct OnlineTrainer {
     MPSGraphTensor* tb_grad_ffn2;
     MPSGraphTensor* tb_grad_ln;
     MPSGraphTensor* tb_grad_out;
-    MPSGraphTensor* tb_grad_b_k, *tb_grad_b_v, *tb_grad_b_o;
     MPSGraphTensor* tb_grad_b_ffn1, *tb_grad_b_ffn2, *tb_grad_b_out;
 
     // Shared input / target buffers sized for the batch
@@ -225,7 +219,6 @@ struct OnlineTrainer {
     MPSGraphTensor* ts_w_ln;          // [L, 4, H]
     MPSGraphTensor* ts_w_out;         // [H, V]
     // Bias placeholders for segment graph
-    MPSGraphTensor* ts_w_b_k, *ts_w_b_v, *ts_w_b_o;
     MPSGraphTensor* ts_w_b_ffn1, *ts_w_b_ffn2, *ts_w_b_out;
 
     MPSGraphTensor* ts_loss;
@@ -233,7 +226,6 @@ struct OnlineTrainer {
     MPSGraphTensor* ts_grad_q, *ts_grad_k, *ts_grad_v, *ts_grad_o;
     MPSGraphTensor* ts_grad_ffn1, *ts_grad_ffn2;
     MPSGraphTensor* ts_grad_ln, *ts_grad_out;
-    MPSGraphTensor* ts_grad_b_k, *ts_grad_b_v, *ts_grad_b_o;
     MPSGraphTensor* ts_grad_b_ffn1, *ts_grad_b_ffn2, *ts_grad_b_out;
     id<MTLBuffer>   seg_buf_input;    // [B*T] int32
     id<MTLBuffer>   seg_buf_target;   // [B*T] int32
@@ -287,9 +279,6 @@ static void build_training_graph(OnlineTrainer* tr) {
     tr->t_w_ffn2     = [g placeholderWithShape:@[@(L), @(F), @(H)]   dataType:MPSDataTypeFloat32 name:@"w_ffn2"];
     tr->t_w_ln       = [g placeholderWithShape:@[@(L), @(4), @(H)]   dataType:MPSDataTypeFloat32 name:@"w_ln"];
     tr->t_w_out      = [g placeholderWithShape:@[@(H), @(V)]         dataType:MPSDataTypeFloat32 name:@"w_out"];
-    tr->t_w_b_k      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"b_k"];
-    tr->t_w_b_v      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"b_v"];
-    tr->t_w_b_o      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"b_o"];
     tr->t_w_b_ffn1   = [g placeholderWithShape:@[@(L), @(F)]         dataType:MPSDataTypeFloat32 name:@"b_ffn1"];
     tr->t_w_b_ffn2   = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"b_ffn2"];
     tr->t_w_b_out    = [g placeholderWithShape:@[@(V)]               dataType:MPSDataTypeFloat32 name:@"b_out"];
@@ -320,9 +309,6 @@ static void build_training_graph(OnlineTrainer* tr) {
         MPSGraphTensor* w_o_i    = slice_reshape(tr->t_w_o,    @[@(H), @(H)]);
         MPSGraphTensor* w_ffn1_i = slice_reshape(tr->t_w_ffn1, @[@(H), @(F)]);
         MPSGraphTensor* w_ffn2_i = slice_reshape(tr->t_w_ffn2, @[@(F), @(H)]);
-        MPSGraphTensor* b_k_i    = slice_reshape(tr->t_w_b_k,   @[@(H)]);
-        MPSGraphTensor* b_v_i    = slice_reshape(tr->t_w_b_v,   @[@(H)]);
-        MPSGraphTensor* b_o_i    = slice_reshape(tr->t_w_b_o,   @[@(H)]);
         MPSGraphTensor* b_ffn1_i = slice_reshape(tr->t_w_b_ffn1, @[@(F)]);
         MPSGraphTensor* b_ffn2_i = slice_reshape(tr->t_w_b_ffn2, @[@(H)]);
 
@@ -335,8 +321,8 @@ static void build_training_graph(OnlineTrainer* tr) {
 
         // Post-LN: no pre-norm; QKV use x directly
         MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_q_i name:nil];
-        MPSGraphTensor* k = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil] secondaryTensor:b_k_i name:nil];
-        MPSGraphTensor* v = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil] secondaryTensor:b_v_i name:nil];
+        MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil];
+        MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil];
 
         // Reshape for multi-head: [1, H] → [1, NH, 1, HD]
         NSArray<NSNumber*>* mh_shape = @[@1, @(NH), @1, @(HD)];
@@ -366,7 +352,7 @@ static void build_training_graph(OnlineTrainer* tr) {
         attn = [g reshapeTensor:attn withShape:@[@1, @(H)] name:nil];         // [1, H]
 
         // Attention output projection + bias
-        attn = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil] secondaryTensor:b_o_i name:nil]; // [1, H]
+        attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil]; // [1, H]
 
         // Post-LN 1: LN(residual + attn)
         x = tr_layer_norm(g, [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil], gamma1, beta1);
@@ -404,7 +390,6 @@ static void build_training_graph(OnlineTrainer* tr) {
         tr->t_w_q,   tr->t_w_k,   tr->t_w_v,   tr->t_w_o,
         tr->t_w_ffn1, tr->t_w_ffn2,
         tr->t_w_ln,  tr->t_w_out,
-        tr->t_w_b_k, tr->t_w_b_v, tr->t_w_b_o,
         tr->t_w_b_ffn1, tr->t_w_b_ffn2, tr->t_w_b_out
     ];
 
@@ -420,9 +405,6 @@ static void build_training_graph(OnlineTrainer* tr) {
     tr->t_grad_ffn2     = grads[tr->t_w_ffn2];
     tr->t_grad_ln       = grads[tr->t_w_ln];
     tr->t_grad_out      = grads[tr->t_w_out];
-    tr->t_grad_b_k      = grads[tr->t_w_b_k];
-    tr->t_grad_b_v      = grads[tr->t_w_b_v];
-    tr->t_grad_b_o      = grads[tr->t_w_b_o];
     tr->t_grad_b_ffn1   = grads[tr->t_w_b_ffn1];
     tr->t_grad_b_ffn2   = grads[tr->t_w_b_ffn2];
     tr->t_grad_b_out    = grads[tr->t_w_b_out];
@@ -459,9 +441,6 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
     tr->tb_w_ffn2     = [g placeholderWithShape:@[@(L), @(F), @(H)]   dataType:MPSDataTypeFloat32 name:@"b_w_ffn2"];
     tr->tb_w_ln       = [g placeholderWithShape:@[@(L), @(4), @(H)]   dataType:MPSDataTypeFloat32 name:@"b_w_ln"];
     tr->tb_w_out      = [g placeholderWithShape:@[@(H), @(V)]         dataType:MPSDataTypeFloat32 name:@"b_w_out"];
-    tr->tb_w_b_k      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"bb_k"];
-    tr->tb_w_b_v      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"bb_v"];
-    tr->tb_w_b_o      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"bb_o"];
     tr->tb_w_b_ffn1   = [g placeholderWithShape:@[@(L), @(F)]         dataType:MPSDataTypeFloat32 name:@"bb_ffn1"];
     tr->tb_w_b_ffn2   = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"bb_ffn2"];
     tr->tb_w_b_out    = [g placeholderWithShape:@[@(V)]               dataType:MPSDataTypeFloat32 name:@"bb_out"];
@@ -502,9 +481,6 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
         MPSGraphTensor* w_o_i    = slice2d(tr->tb_w_o,    @[@(H), @(H)]);
         MPSGraphTensor* w_ffn1_i = slice2d(tr->tb_w_ffn1, @[@(H), @(F)]);
         MPSGraphTensor* w_ffn2_i = slice2d(tr->tb_w_ffn2, @[@(F), @(H)]);
-        MPSGraphTensor* b_k_i    = slice2d(tr->tb_w_b_k,   @[@(H)]);
-        MPSGraphTensor* b_v_i    = slice2d(tr->tb_w_b_v,   @[@(H)]);
-        MPSGraphTensor* b_o_i    = slice2d(tr->tb_w_b_o,   @[@(H)]);
         MPSGraphTensor* b_ffn1_i = slice2d(tr->tb_w_b_ffn1, @[@(F)]);
         MPSGraphTensor* b_ffn2_i = slice2d(tr->tb_w_b_ffn2, @[@(H)]);
 
@@ -517,8 +493,8 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
 
         // Post-LN: no pre-norm; QKV use x directly
         MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_q_i name:nil];
-        MPSGraphTensor* k = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil] secondaryTensor:b_k_i name:nil];
-        MPSGraphTensor* v = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil] secondaryTensor:b_v_i name:nil];
+        MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil];
+        MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil];
 
         // Multi-head: [N, H] → [N, NH, 1, HD]
         NSArray<NSNumber*>* mh = @[@(N), @(NH), @1, @(HD)];
@@ -543,7 +519,7 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
         attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil]; // [N, 1, NH, HD]
         attn = [g reshapeTensor:attn withShape:@[@(N), @(H)] name:nil];       // [N, H]
 
-        attn = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil] secondaryTensor:b_o_i name:nil]; // [N, H]
+        attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil]; // [N, H]
 
         // Post-LN 1: LN(residual + attn)
         x = tr_layer_norm(g, [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil], gamma1, beta1);
@@ -588,7 +564,6 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
         tr->tb_w_q,   tr->tb_w_k,   tr->tb_w_v,   tr->tb_w_o,
         tr->tb_w_ffn1, tr->tb_w_ffn2,
         tr->tb_w_ln,  tr->tb_w_out,
-        tr->tb_w_b_k, tr->tb_w_b_v, tr->tb_w_b_o,
         tr->tb_w_b_ffn1, tr->tb_w_b_ffn2, tr->tb_w_b_out
     ];
 
@@ -604,9 +579,6 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
     tr->tb_grad_ffn2     = grads[tr->tb_w_ffn2];
     tr->tb_grad_ln       = grads[tr->tb_w_ln];
     tr->tb_grad_out      = grads[tr->tb_w_out];
-    tr->tb_grad_b_k      = grads[tr->tb_w_b_k];
-    tr->tb_grad_b_v      = grads[tr->tb_w_b_v];
-    tr->tb_grad_b_o      = grads[tr->tb_w_b_o];
     tr->tb_grad_b_ffn1   = grads[tr->tb_w_b_ffn1];
     tr->tb_grad_b_ffn2   = grads[tr->tb_w_b_ffn2];
     tr->tb_grad_b_out    = grads[tr->tb_w_b_out];
@@ -659,9 +631,6 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
     tr->ts_w_ffn2     = [g placeholderWithShape:@[@(L), @(F), @(H)]   dataType:MPSDataTypeFloat32 name:@"sw_ffn2"];
     tr->ts_w_ln       = [g placeholderWithShape:@[@(L), @(4), @(H)]   dataType:MPSDataTypeFloat32 name:@"sw_ln"];
     tr->ts_w_out      = [g placeholderWithShape:@[@(H), @(V)]         dataType:MPSDataTypeFloat32 name:@"sw_out"];
-    tr->ts_w_b_k      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"sb_k"];
-    tr->ts_w_b_v      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"sb_v"];
-    tr->ts_w_b_o      = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"sb_o"];
     tr->ts_w_b_ffn1   = [g placeholderWithShape:@[@(L), @(F)]         dataType:MPSDataTypeFloat32 name:@"sb_ffn1"];
     tr->ts_w_b_ffn2   = [g placeholderWithShape:@[@(L), @(H)]         dataType:MPSDataTypeFloat32 name:@"sb_ffn2"];
     tr->ts_w_b_out    = [g placeholderWithShape:@[@(V)]               dataType:MPSDataTypeFloat32 name:@"sb_out"];
@@ -725,9 +694,6 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
         MPSGraphTensor* w_o_i    = sliceW(tr->ts_w_o,    @[@(H), @(H)]);
         MPSGraphTensor* w_ffn1_i = sliceW(tr->ts_w_ffn1, @[@(H), @(F)]);
         MPSGraphTensor* w_ffn2_i = sliceW(tr->ts_w_ffn2, @[@(F), @(H)]);
-        MPSGraphTensor* b_k_i    = sliceW(tr->ts_w_b_k,   @[@(H)]);
-        MPSGraphTensor* b_v_i    = sliceW(tr->ts_w_b_v,   @[@(H)]);
-        MPSGraphTensor* b_o_i    = sliceW(tr->ts_w_b_o,   @[@(H)]);
         MPSGraphTensor* b_ffn1_i = sliceW(tr->ts_w_b_ffn1, @[@(F)]);
         MPSGraphTensor* b_ffn2_i = sliceW(tr->ts_w_b_ffn2, @[@(H)]);
 
@@ -740,8 +706,8 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
 
         // Post-LN: no pre-norm; QKV use x directly
         MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_q_i name:nil];
-        MPSGraphTensor* k = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil] secondaryTensor:b_k_i name:nil];
-        MPSGraphTensor* v = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil] secondaryTensor:b_v_i name:nil];
+        MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_k_i name:nil];
+        MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:w_v_i name:nil];
 
         // Reshape & transpose: [B*T, H] → [B, T, NH, HD] → [B, NH, T, HD]
         auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
@@ -841,7 +807,7 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
         attn = [g reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];      // [B*T,H]
 
         // Output projection + bias
-        attn = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil] secondaryTensor:b_o_i name:nil];
+        attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o_i name:nil];
 
         // Post-LN 1: LN(residual + attn)
         x = tr_layer_norm(g, [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil], gamma1, beta1);
@@ -887,7 +853,6 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
         tr->ts_w_q, tr->ts_w_k, tr->ts_w_v, tr->ts_w_o,
         tr->ts_w_ffn1, tr->ts_w_ffn2,
         tr->ts_w_ln, tr->ts_w_out,
-        tr->ts_w_b_k, tr->ts_w_b_v, tr->ts_w_b_o,
         tr->ts_w_b_ffn1, tr->ts_w_b_ffn2, tr->ts_w_b_out,
         tr->ts_w_rel_r, tr->ts_b_rel_r
     ];
@@ -904,9 +869,6 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
     tr->ts_grad_ffn2     = grads[tr->ts_w_ffn2];
     tr->ts_grad_ln       = grads[tr->ts_w_ln];
     tr->ts_grad_out      = grads[tr->ts_w_out];
-    tr->ts_grad_b_k      = grads[tr->ts_w_b_k];
-    tr->ts_grad_b_v      = grads[tr->ts_w_b_v];
-    tr->ts_grad_b_o      = grads[tr->ts_w_b_o];
     tr->ts_grad_b_ffn1   = grads[tr->ts_w_b_ffn1];
     tr->ts_grad_b_ffn2   = grads[tr->ts_w_b_ffn2];
     tr->ts_grad_b_out    = grads[tr->ts_w_b_out];
@@ -1019,9 +981,6 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
     clipBuf(tr->grad_ffn2,     (size_t)L * F * H);
     clipBuf(tr->grad_ln,       (size_t)L * 4 * H);
     clipBuf(tr->grad_out,      (size_t)H * V);
-    clipBuf(tr->grad_b_k,    (size_t)L * H);
-    clipBuf(tr->grad_b_v,    (size_t)L * H);
-    clipBuf(tr->grad_b_o,    (size_t)L * H);
     clipBuf(tr->grad_b_ffn1, (size_t)L * F);
     clipBuf(tr->grad_b_ffn2, (size_t)L * H);
     clipBuf(tr->grad_b_out,  (size_t)V);
@@ -1123,9 +1082,6 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->grad_ffn2     = newBuf((size_t)L * F * H);
     tr->grad_ln       = newBuf((size_t)L * 4 * H);
     tr->grad_out      = newBuf((size_t)H * V);
-    tr->grad_b_k      = newBuf((size_t)L * H);
-    tr->grad_b_v      = newBuf((size_t)L * H);
-    tr->grad_b_o      = newBuf((size_t)L * H);
     tr->grad_b_ffn1   = newBuf((size_t)L * F);
     tr->grad_b_ffn2   = newBuf((size_t)L * H);
     tr->grad_b_out    = newBuf((size_t)V);
@@ -1145,9 +1101,6 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->v_ffn2     = newZeroBuf((size_t)L * F * H);
     tr->v_ln       = newZeroBuf((size_t)L * 4 * H);
     tr->v_out      = newZeroBuf((size_t)H * V);
-    tr->v_b_k      = newZeroBuf((size_t)L * H);
-    tr->v_b_v      = newZeroBuf((size_t)L * H);
-    tr->v_b_o      = newZeroBuf((size_t)L * H);
     tr->v_b_ffn1   = newZeroBuf((size_t)L * F);
     tr->v_b_ffn2   = newZeroBuf((size_t)L * H);
     tr->v_b_out    = newZeroBuf((size_t)V);
@@ -1275,9 +1228,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
             tr->tb_w_ffn2       : floatTD(wb.ffn2,      @[@(L), @(F), @(H)]),
             tr->tb_w_ln         : floatTD(wb.ln,        @[@(L), @(4), @(H)]),
             tr->tb_w_out        : floatTD(wb.out_proj,  @[@(H), @(V)]),
-            tr->tb_w_b_k        : floatTD(wb.b_k,       @[@(L), @(H)]),
-            tr->tb_w_b_v        : floatTD(wb.b_v,       @[@(L), @(H)]),
-            tr->tb_w_b_o        : floatTD(wb.b_o,       @[@(L), @(H)]),
             tr->tb_w_b_ffn1     : floatTD(wb.b_ffn1,    @[@(L), @(F)]),
             tr->tb_w_b_ffn2     : floatTD(wb.b_ffn2,    @[@(L), @(H)]),
             tr->tb_w_b_out      : floatTD(wb.b_out,     @[@(V)]),
@@ -1295,9 +1245,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
         if (tr->tb_grad_ffn2)     [targets addObject:tr->tb_grad_ffn2];
         if (tr->tb_grad_ln)       [targets addObject:tr->tb_grad_ln];
         if (tr->tb_grad_out)      [targets addObject:tr->tb_grad_out];
-        if (tr->tb_grad_b_k)      [targets addObject:tr->tb_grad_b_k];
-        if (tr->tb_grad_b_v)      [targets addObject:tr->tb_grad_b_v];
-        if (tr->tb_grad_b_o)      [targets addObject:tr->tb_grad_b_o];
         if (tr->tb_grad_b_ffn1)   [targets addObject:tr->tb_grad_b_ffn1];
         if (tr->tb_grad_b_ffn2)   [targets addObject:tr->tb_grad_b_ffn2];
         if (tr->tb_grad_b_out)    [targets addObject:tr->tb_grad_b_out];
@@ -1320,9 +1267,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
         copyGrad(tr->tb_grad_ffn2,     tr->grad_ffn2,     (size_t)L * F * H);
         copyGrad(tr->tb_grad_ln,       tr->grad_ln,       (size_t)L * 4 * H);
         copyGrad(tr->tb_grad_out,      tr->grad_out,      (size_t)H * V);
-        copyGrad(tr->tb_grad_b_k,      tr->grad_b_k,      (size_t)L * H);
-        copyGrad(tr->tb_grad_b_v,      tr->grad_b_v,      (size_t)L * H);
-        copyGrad(tr->tb_grad_b_o,      tr->grad_b_o,      (size_t)L * H);
         copyGrad(tr->tb_grad_b_ffn1,   tr->grad_b_ffn1,   (size_t)L * F);
         copyGrad(tr->tb_grad_b_ffn2,   tr->grad_b_ffn2,   (size_t)L * H);
         copyGrad(tr->tb_grad_b_out,    tr->grad_b_out,    (size_t)V);
@@ -1350,9 +1294,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, bc, (size_t)L * F * H);
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, bc, (size_t)L * 4 * H);
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, bc, (size_t)H * V);
-                apply_rmsprop(enc, tr->ps_rmsprop, wb.b_k,      tr->grad_b_k,      tr->v_b_k,      lr, b2, ep, bc, (size_t)L * H);
-                apply_rmsprop(enc, tr->ps_rmsprop, wb.b_v,      tr->grad_b_v,      tr->v_b_v,      lr, b2, ep, bc, (size_t)L * H);
-                apply_rmsprop(enc, tr->ps_rmsprop, wb.b_o,      tr->grad_b_o,      tr->v_b_o,      lr, b2, ep, bc, (size_t)L * H);
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn1,   tr->grad_b_ffn1,   tr->v_b_ffn1,   lr, b2, ep, bc, (size_t)L * F);
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn2,   tr->grad_b_ffn2,   tr->v_b_ffn2,   lr, b2, ep, bc, (size_t)L * H);
                 apply_rmsprop(enc, tr->ps_rmsprop, wb.b_out,    tr->grad_b_out,    tr->v_b_out,    lr, b2, ep, bc, (size_t)V);
@@ -1366,9 +1307,6 @@ void online_trainer_flush(OnlineTrainer* tr) {
                 apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     tr->lr, (size_t)L * F * H);
                 apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       tr->lr, (size_t)L * 4 * H);
                 apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      tr->lr, (size_t)H * V);
-                apply_sgd(enc, tr->ps_sgd, wb.b_k,      tr->grad_b_k,      tr->lr, (size_t)L * H);
-                apply_sgd(enc, tr->ps_sgd, wb.b_v,      tr->grad_b_v,      tr->lr, (size_t)L * H);
-                apply_sgd(enc, tr->ps_sgd, wb.b_o,      tr->grad_b_o,      tr->lr, (size_t)L * H);
                 apply_sgd(enc, tr->ps_sgd, wb.b_ffn1,   tr->grad_b_ffn1,   tr->lr, (size_t)L * F);
                 apply_sgd(enc, tr->ps_sgd, wb.b_ffn2,   tr->grad_b_ffn2,   tr->lr, (size_t)L * H);
                 apply_sgd(enc, tr->ps_sgd, wb.b_out,    tr->grad_b_out,    tr->lr, (size_t)V);
@@ -1485,9 +1423,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     feeds[tr->ts_w_ffn2]     = floatTD(wb.ffn2,     @[@(L), @(F), @(H)]);
     feeds[tr->ts_w_ln]       = floatTD(wb.ln,       @[@(L), @(4), @(H)]);
     feeds[tr->ts_w_out]      = floatTD(wb.out_proj, @[@(H), @(V)]);
-    feeds[tr->ts_w_b_k]      = floatTD(wb.b_k,      @[@(L), @(H)]);
-    feeds[tr->ts_w_b_v]      = floatTD(wb.b_v,      @[@(L), @(H)]);
-    feeds[tr->ts_w_b_o]      = floatTD(wb.b_o,      @[@(L), @(H)]);
     feeds[tr->ts_w_b_ffn1]   = floatTD(wb.b_ffn1,   @[@(L), @(F)]);
     feeds[tr->ts_w_b_ffn2]   = floatTD(wb.b_ffn2,   @[@(L), @(H)]);
     feeds[tr->ts_w_b_out]    = floatTD(wb.b_out,    @[@(V)]);
@@ -1511,9 +1446,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     if (tr->ts_grad_ffn2)     [targets addObject:tr->ts_grad_ffn2];
     if (tr->ts_grad_ln)       [targets addObject:tr->ts_grad_ln];
     if (tr->ts_grad_out)      [targets addObject:tr->ts_grad_out];
-    if (tr->ts_grad_b_k)      [targets addObject:tr->ts_grad_b_k];
-    if (tr->ts_grad_b_v)      [targets addObject:tr->ts_grad_b_v];
-    if (tr->ts_grad_b_o)      [targets addObject:tr->ts_grad_b_o];
     if (tr->ts_grad_b_ffn1)   [targets addObject:tr->ts_grad_b_ffn1];
     if (tr->ts_grad_b_ffn2)   [targets addObject:tr->ts_grad_b_ffn2];
     if (tr->ts_grad_b_out)    [targets addObject:tr->ts_grad_b_out];
@@ -1537,14 +1469,45 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     copyGrad(tr->ts_grad_ffn2,     tr->grad_ffn2);
     copyGrad(tr->ts_grad_ln,       tr->grad_ln);
     copyGrad(tr->ts_grad_out,      tr->grad_out);
-    copyGrad(tr->ts_grad_b_k,      tr->grad_b_k);
-    copyGrad(tr->ts_grad_b_v,      tr->grad_b_v);
-    copyGrad(tr->ts_grad_b_o,      tr->grad_b_o);
     copyGrad(tr->ts_grad_b_ffn1,   tr->grad_b_ffn1);
     copyGrad(tr->ts_grad_b_ffn2,   tr->grad_b_ffn2);
     copyGrad(tr->ts_grad_b_out,    tr->grad_b_out);
     copyGrad(tr->ts_grad_rel_r,    tr->grad_rel_r);
     copyGrad(tr->ts_grad_b_rel_r,  tr->grad_b_rel_r);
+
+    // [WQNORM-DIAG] raw grad_q norm (before clip) and weight norm, every 2000 steps
+    if ((tr->train_step + (uint64_t)n_streams) % 2000 < (uint64_t)n_streams) {
+        size_t n = (size_t)tr->L * (size_t)tr->H * (size_t)tr->H;
+        // w_q norm
+        float* wq = (float*)[wb.attn_q contents];
+        double wsq = 0.0;
+        for (size_t ii = 0; ii < n; ii++) wsq += (double)wq[ii] * (double)wq[ii];
+        // raw grad_q norm (before clip)
+        float gnorm_raw = 0.0f, gnorm_ffn1 = 0.0f, gnorm_embed = 0.0f;
+        if (tr->grad_q) {
+            float* gq = (float*)[tr->grad_q contents];
+            double gsq = 0.0;
+            for (size_t ii = 0; ii < n; ii++) gsq += (double)gq[ii] * (double)gq[ii];
+            gnorm_raw = sqrtf((float)gsq);
+        }
+        if (tr->grad_ffn1) {
+            float* gf = (float*)[tr->grad_ffn1 contents];
+            size_t nf = (size_t)tr->L * (size_t)tr->H * (size_t)tr->F;
+            double gsq = 0.0;
+            for (size_t ii = 0; ii < nf; ii++) gsq += (double)gf[ii] * (double)gf[ii];
+            gnorm_ffn1 = sqrtf((float)gsq);
+        }
+        if (tr->grad_embed) {
+            float* ge = (float*)[tr->grad_embed contents];
+            size_t ne = (size_t)tr->V * (size_t)tr->H;
+            double gsq = 0.0;
+            for (size_t ii = 0; ii < ne; ii++) gsq += (double)ge[ii] * (double)ge[ii];
+            gnorm_embed = sqrtf((float)gsq);
+        }
+        fprintf(stderr, "[WQNORM] step=%llu wnorm=%.6f raw_gq=%.6f gffn1=%.6f gembed=%.6f\n",
+                (unsigned long long)(tr->train_step + n_streams), sqrtf((float)wsq),
+                gnorm_raw, gnorm_ffn1, gnorm_embed);
+    }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
         clip_gradients(tr, tr->grad_clip);
@@ -1576,9 +1539,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, bc, (size_t)L * F * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, bc, (size_t)L * 4 * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, bc, (size_t)H * V);
-            apply_rmsprop(enc, tr->ps_rmsprop, wb.b_k,      tr->grad_b_k,      tr->v_b_k,      lr, b2, ep, bc, (size_t)L * H);
-            apply_rmsprop(enc, tr->ps_rmsprop, wb.b_v,      tr->grad_b_v,      tr->v_b_v,      lr, b2, ep, bc, (size_t)L * H);
-            apply_rmsprop(enc, tr->ps_rmsprop, wb.b_o,      tr->grad_b_o,      tr->v_b_o,      lr, b2, ep, bc, (size_t)L * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn1,   tr->grad_b_ffn1,   tr->v_b_ffn1,   lr, b2, ep, bc, (size_t)L * F);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.b_ffn2,   tr->grad_b_ffn2,   tr->v_b_ffn2,   lr, b2, ep, bc, (size_t)L * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.b_out,    tr->grad_b_out,    tr->v_b_out,    lr, b2, ep, bc, (size_t)V);
@@ -1595,9 +1555,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     lr, (size_t)L * F * H);
             apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       lr, (size_t)L * 4 * H);
             apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      lr, (size_t)H * V);
-            apply_sgd(enc, tr->ps_sgd, wb.b_k,      tr->grad_b_k,      lr, (size_t)L * H);
-            apply_sgd(enc, tr->ps_sgd, wb.b_v,      tr->grad_b_v,      lr, (size_t)L * H);
-            apply_sgd(enc, tr->ps_sgd, wb.b_o,      tr->grad_b_o,      lr, (size_t)L * H);
             apply_sgd(enc, tr->ps_sgd, wb.b_ffn1,   tr->grad_b_ffn1,   lr, (size_t)L * F);
             apply_sgd(enc, tr->ps_sgd, wb.b_ffn2,   tr->grad_b_ffn2,   lr, (size_t)L * H);
             apply_sgd(enc, tr->ps_sgd, wb.b_out,    tr->grad_b_out,    lr, (size_t)V);
@@ -1636,9 +1593,6 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
     zeroBuf(tr->v_ffn2,     (size_t)rL * rF * rH);
     zeroBuf(tr->v_ln,       (size_t)rL * 4 * rH);
     zeroBuf(tr->v_out,      (size_t)rH * rV);
-    zeroBuf(tr->v_b_k,      (size_t)rL * rH);
-    zeroBuf(tr->v_b_v,      (size_t)rL * rH);
-    zeroBuf(tr->v_b_o,      (size_t)rL * rH);
     zeroBuf(tr->v_b_ffn1,   (size_t)rL * rF);
     zeroBuf(tr->v_b_ffn2,   (size_t)rL * rH);
     zeroBuf(tr->v_b_out,    (size_t)rV);
@@ -1705,9 +1659,6 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
         memset([wb.out_proj contents], 0, (size_t)H * V * sizeof(float));
 
     // Biases: zero-init
-    if (wb.b_k)    memset([wb.b_k    contents], 0, (size_t)L * H * sizeof(float));
-    if (wb.b_v)    memset([wb.b_v    contents], 0, (size_t)L * H * sizeof(float));
-    if (wb.b_o)    memset([wb.b_o    contents], 0, (size_t)L * H * sizeof(float));
     if (wb.b_ffn1) memset([wb.b_ffn1 contents], 0, (size_t)L * F * sizeof(float));
     if (wb.b_ffn2) memset([wb.b_ffn2 contents], 0, (size_t)L * H * sizeof(float));
     if (wb.b_out)  memset([wb.b_out  contents], 0, (size_t)V     * sizeof(float));
