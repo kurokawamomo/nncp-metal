@@ -1618,7 +1618,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             apply_rmsprop(enc, tr->ps_rmsprop, wb.attn_out, tr->grad_o,        tr->v_o,        lr, b2, ep, bc, (size_t)L * H * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn1,     tr->grad_ffn1,     tr->v_ffn1,     lr, b2, ep, bc, (size_t)L * H * F);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.ffn2,     tr->grad_ffn2,     tr->v_ffn2,     lr, b2, ep, bc, (size_t)L * F * H);
-            apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, bc, (size_t)L * 2 * H);
+            apply_rmsprop(enc, tr->ps_rmsprop, wb.ln,       tr->grad_ln,       tr->v_ln,       lr, b2, ep, bc, (size_t)L * 4 * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.final_ln, tr->grad_final_ln, tr->v_final_ln, lr, b2, ep, bc, (size_t)2 * H);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.out_proj, tr->grad_out,      tr->v_out,      lr, b2, ep, bc, (size_t)H * V);
             apply_rmsprop(enc, tr->ps_rmsprop, wb.b_k,      tr->grad_b_k,      tr->v_b_k,      lr, b2, ep, bc, (size_t)L * H);
@@ -1638,7 +1638,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             apply_sgd(enc, tr->ps_sgd, wb.attn_out, tr->grad_o,        lr, (size_t)L * H * H);
             apply_sgd(enc, tr->ps_sgd, wb.ffn1,     tr->grad_ffn1,     lr, (size_t)L * H * F);
             apply_sgd(enc, tr->ps_sgd, wb.ffn2,     tr->grad_ffn2,     lr, (size_t)L * F * H);
-            apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       lr, (size_t)L * 2 * H);
+            apply_sgd(enc, tr->ps_sgd, wb.ln,       tr->grad_ln,       lr, (size_t)L * 4 * H);
             apply_sgd(enc, tr->ps_sgd, wb.final_ln, tr->grad_final_ln, lr, (size_t)2 * H);
             apply_sgd(enc, tr->ps_sgd, wb.out_proj, tr->grad_out,      lr, (size_t)H * V);
             apply_sgd(enc, tr->ps_sgd, wb.b_k,      tr->grad_b_k,      lr, (size_t)L * H);
