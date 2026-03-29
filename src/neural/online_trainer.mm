@@ -338,11 +338,6 @@ static void build_training_graph(OnlineTrainer* tr) {
         scores = [g multiplicationWithPrimaryTensor:scores
                                    secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
                                               name:nil];
-        // Clamp before softmax (Post-LN stability: prevent attention score explosion)
-        scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
-                               name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil]; // [1, NH, 1, 1]
 
         // Weighted sum: [1, NH, 1, 1] @ [1, NH, 1, HD] → [1, NH, 1, HD]
@@ -508,11 +503,6 @@ static void build_batch_training_graph(OnlineTrainer* tr) {
         scores = [g multiplicationWithPrimaryTensor:scores
                                    secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
                                               name:nil];
-        // Clamp before softmax (Post-LN stability)
-        scores = [g clampWithTensor:scores
-                    minValueTensor:[g constantWithScalar:-30.0f dataType:MPSDataTypeFloat32]
-                    maxValueTensor:[g constantWithScalar:30.0f dataType:MPSDataTypeFloat32]
-                               name:nil];
         scores = [g softMaxWithTensor:scores axis:-1 name:nil];
 
         MPSGraphTensor* attn = [g matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v_r name:nil]; // [N, NH, 1, HD]
@@ -758,30 +748,61 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
                 [NSData dataWithBytes:b_dist_data length:(size_t)T*EXT_LEN*sizeof(int32_t)]
                 shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeInt32];
 
-            // q_rel gather: for each (b,nh,ti,k), look up q_rel_raw[b,nh,ti, q_dist[ti,k]]
-            MPSGraphTensor* q_rel_flat = [g reshapeTensor:q_rel_raw
-                                                withShape:@[@(B*NH*T), @(D_POS)] name:nil]; // [B*NH*T, D_POS]
-            MPSGraphTensor* q_dist_tiled = [g tileTensor:q_dist_const
-                                          withMultiplier:@[@(B*NH), @1] name:nil]; // [B*NH*T, EXT_LEN]
-            MPSGraphTensor* q_rel_gathered = [g gatherWithUpdatesTensor:q_rel_flat
-                                                          indicesTensor:q_dist_tiled
-                                                                   axis:1
-                                                        batchDimensions:1
-                                                                   name:nil]; // [B*NH*T, EXT_LEN]
-            MPSGraphTensor* q_rel_ext = [g reshapeTensor:q_rel_gathered
-                                                withShape:@[@(B), @(NH), @(T), @(EXT_LEN)] name:nil];
+            // q_rel oneHot+matmul: deterministic backward (replaces scatter-add gather)
+            // q_rel_raw [B,NH,T,D_POS] → [B*NH, T, D_POS]
+            MPSGraphTensor* q_rel_bnh = [g reshapeTensor:q_rel_raw
+                                               withShape:@[@(B*NH), @(T), @(D_POS)] name:nil];
+            NSMutableArray<MPSGraphTensor*>* q_slices = [NSMutableArray array];
+            for (int ti = 0; ti < T; ti++) {
+                // P_t [D_POS, EXT_LEN]: P_t[d,k]=1 iff d == q_dist_data[ti*EXT_LEN+k]
+                const size_t p_sz = (size_t)D_POS * EXT_LEN;
+                float p_buf[p_sz];
+                memset(p_buf, 0, p_sz * sizeof(float));
+                for (int k = 0; k < EXT_LEN; k++) {
+                    int d = q_dist_data[ti * EXT_LEN + k];
+                    p_buf[d * EXT_LEN + k] = 1.0f;
+                }
+                MPSGraphTensor* P_t = [g constantWithData:
+                    [NSData dataWithBytes:p_buf length:p_sz * sizeof(float)]
+                    shape:@[@(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+                // Slice t: [B*NH, 1, D_POS] → [B*NH, D_POS]
+                MPSGraphTensor* q_t = [g sliceTensor:q_rel_bnh dimension:1 start:ti length:1 name:nil];
+                q_t = [g reshapeTensor:q_t withShape:@[@(B*NH), @(D_POS)] name:nil];
+                // [B*NH, D_POS] @ [D_POS, EXT_LEN] → [B*NH, 1, EXT_LEN]
+                q_t = [g matrixMultiplicationWithPrimaryTensor:q_t secondaryTensor:P_t name:nil];
+                q_t = [g reshapeTensor:q_t withShape:@[@(B*NH), @1, @(EXT_LEN)] name:nil];
+                [q_slices addObject:q_t];
+            }
+            // [B*NH, T, EXT_LEN] → [B, NH, T, EXT_LEN]
+            MPSGraphTensor* q_rel_ext = [g concatTensors:q_slices dimension:1 name:nil];
+            q_rel_ext = [g reshapeTensor:q_rel_ext withShape:@[@(B), @(NH), @(T), @(EXT_LEN)] name:nil];
             q_rel_ext = [g multiplicationWithPrimaryTensor:q_rel_ext
                                           secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32]
                                                      name:nil];
 
-            // b_rel gather: for each (nh,ti,k), look up b_rel_r[nh, b_dist[ti,k]]
+            // b_rel oneHot+matmul: deterministic backward (replaces scatter-add gather)
             MPSGraphTensor* b_r_t = [g transposeTensor:tr->ts_b_rel_r
                                              dimension:0 withDimension:1 name:nil]; // [EXT_LEN, NH]
-            MPSGraphTensor* b_gathered = [g gatherWithUpdatesTensor:b_r_t
-                                                      indicesTensor:b_dist_const
-                                                               axis:0
-                                                    batchDimensions:0
-                                                               name:nil]; // [T, EXT_LEN, NH]
+            NSMutableArray<MPSGraphTensor*>* b_slices = [NSMutableArray array];
+            for (int ti = 0; ti < T; ti++) {
+                // Q_t [EXT_LEN, EXT_LEN]: Q_t[k,d]=1 iff d == b_dist_data[ti*EXT_LEN+k]
+                const size_t b_sz = (size_t)EXT_LEN * EXT_LEN;
+                float b_buf[b_sz];
+                memset(b_buf, 0, b_sz * sizeof(float));
+                for (int k = 0; k < EXT_LEN; k++) {
+                    int d = b_dist_data[ti * EXT_LEN + k];
+                    b_buf[k * EXT_LEN + d] = 1.0f;
+                }
+                MPSGraphTensor* Q_t = [g constantWithData:
+                    [NSData dataWithBytes:b_buf length:b_sz * sizeof(float)]
+                    shape:@[@(EXT_LEN), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+                // [EXT_LEN, EXT_LEN] @ [EXT_LEN, NH] → [1, EXT_LEN, NH]
+                MPSGraphTensor* b_t = [g matrixMultiplicationWithPrimaryTensor:Q_t secondaryTensor:b_r_t name:nil];
+                b_t = [g reshapeTensor:b_t withShape:@[@1, @(EXT_LEN), @(NH)] name:nil];
+                [b_slices addObject:b_t];
+            }
+            // [T, EXT_LEN, NH]
+            MPSGraphTensor* b_gathered = [g concatTensors:b_slices dimension:0 name:nil];
             MPSGraphTensor* b_tmp = [g transposeTensor:b_gathered dimension:0 withDimension:2 name:nil]; // [NH, EXT_LEN, T]
             MPSGraphTensor* b_rel_ext = [g transposeTensor:b_tmp dimension:1 withDimension:2 name:nil]; // [NH, T, EXT_LEN]
             MPSGraphTensor* b_r_bc = [g reshapeTensor:b_rel_ext
@@ -1526,9 +1547,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             }
         }
 
-        // WqFix: grelr scatter-add is non-deterministic; zero it to preserve roundtrip
-        if (tr->grad_rel_r)   memset([tr->grad_rel_r contents],   0, tr->grad_rel_r.length);
-        if (tr->grad_b_rel_r) memset([tr->grad_b_rel_r contents], 0, tr->grad_b_rel_r.length);
         id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (tr->ps_rmsprop) {
