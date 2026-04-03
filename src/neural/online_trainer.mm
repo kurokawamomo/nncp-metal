@@ -976,33 +976,49 @@ static void apply_rmsprop(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
-// Clip all gradient buffers per-element to [-max_norm, max_norm]
+// Compute sanitized L2 norm: replace NaN/Inf with 0, return ||buf||₂
+static float sanitize_and_l2(id<MTLBuffer> buf, size_t n) {
+    if (!buf || n == 0) return 0.0f;
+    float* p = (float*)[buf contents];
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(p[i])) { p[i] = 0.0f; continue; }
+        double g = p[i];
+        sum += g * g;
+    }
+    return (float)sqrt(sum);
+}
+
+// Scale a gradient buffer in-place by scalar (CPU)
+static void scale_grad(id<MTLBuffer> buf, size_t n, float scale) {
+    if (!buf || n == 0 || scale == 1.0f) return;
+    float* p = (float*)[buf contents];
+    for (size_t i = 0; i < n; i++) p[i] *= scale;
+}
+
+// Per-tensor L2 norm clip (matches original libnc sgd_opt_update_var behavior)
+// Each gradient tensor is independently scaled so ||g||₂ <= max_norm
 static void clip_gradients(OnlineTrainer* tr, float max_norm) {
     if (max_norm <= 0.0f) return;
-    uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V, S=tr->S;
-    auto clipBuf = [&](id<MTLBuffer> b, size_t n) {
-        if (!b || n == 0) return;
-        float* p = (float*)[b contents];
-        for (size_t i = 0; i < n; i++) {
-            if (!isfinite(p[i]))       p[i] =  0.0f;
-            else if (p[i] >  max_norm) p[i] =  max_norm;
-            else if (p[i] < -max_norm) p[i] = -max_norm;
-        }
+    uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V;
+    auto clipTensor = [&](id<MTLBuffer> b, size_t n) {
+        float norm = sanitize_and_l2(b, n);
+        if (norm > max_norm) scale_grad(b, n, max_norm / norm);
     };
-    clipBuf(tr->grad_embed,    (size_t)V * H);
-    clipBuf(tr->grad_q,        (size_t)L * H * H);
-    clipBuf(tr->grad_k,        (size_t)L * H * H);
-    clipBuf(tr->grad_v,        (size_t)L * H * H);
-    clipBuf(tr->grad_o,        (size_t)L * H * H);
-    clipBuf(tr->grad_ffn1,     (size_t)L * H * F);
-    clipBuf(tr->grad_ffn2,     (size_t)L * F * H);
-    clipBuf(tr->grad_ln,       (size_t)L * 4 * H);
-    clipBuf(tr->grad_out,      (size_t)H * V);
-    clipBuf(tr->grad_b_ffn1, (size_t)L * F);
-    clipBuf(tr->grad_b_ffn2, (size_t)L * H);
-    clipBuf(tr->grad_b_out,  (size_t)V);
-    if (tr->grad_rel_r)   clipBuf(tr->grad_rel_r,   (size_t)tr->NH * tr->HD * SEG_TRAIN_LEN * 2);
-    if (tr->grad_b_rel_r) clipBuf(tr->grad_b_rel_r, (size_t)tr->NH * SEG_TRAIN_LEN * 2);
+    clipTensor(tr->grad_embed,    (size_t)V * H);
+    clipTensor(tr->grad_q,        (size_t)L * H * H);
+    clipTensor(tr->grad_k,        (size_t)L * H * H);
+    clipTensor(tr->grad_v,        (size_t)L * H * H);
+    clipTensor(tr->grad_o,        (size_t)L * H * H);
+    clipTensor(tr->grad_ffn1,     (size_t)L * H * F);
+    clipTensor(tr->grad_ffn2,     (size_t)L * F * H);
+    clipTensor(tr->grad_ln,       (size_t)L * 4 * H);
+    clipTensor(tr->grad_out,      (size_t)H * V);
+    clipTensor(tr->grad_b_ffn1,   (size_t)L * F);
+    clipTensor(tr->grad_b_ffn2,   (size_t)L * H);
+    clipTensor(tr->grad_b_out,    (size_t)V);
+    if (tr->grad_rel_r)   clipTensor(tr->grad_rel_r,   (size_t)tr->NH * tr->HD * SEG_TRAIN_LEN * 2);
+    if (tr->grad_b_rel_r) clipTensor(tr->grad_b_rel_r, (size_t)tr->NH * SEG_TRAIN_LEN * 2);
 }
 
 // ---------------------------------------------------------------------------
