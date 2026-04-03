@@ -1543,6 +1543,11 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
 
     size_t total_decoded = 0;
 
+    if (g_tb.denom == 0) mach_timebase_info(&g_tb);
+    int    perf_count        = 0;
+    double perf_decode_total = 0.0;
+    double perf_train_total  = 0.0;
+
     // Transformer-XL: reset KV cache at session start.
     mps_transformer_reset_kv_cache(mps_ctx);
 
@@ -1564,6 +1569,8 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
 
             // Phase M: latch pre-segment KV memory BEFORE the per-byte forward passes
             if (g_online_trainer) online_trainer_latch_kv_memory(g_online_trainer);
+
+            uint64_t perf_t0 = mach_absolute_time();
 
             // ---- Position loop within segment (autoregressive: token known after each decode) ----
             for (int t = 0; t < SEG_LEN; t++) {
@@ -1645,17 +1652,31 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                 }
             }
 
+            uint64_t perf_t1 = mach_absolute_time();
+
             // 4. One backward pass over the full segment (mirrors compress).
             if (g_online_trainer && !getenv("NNCP_NO_TRAIN"))
                 online_trainer_train_segment_batch(g_online_trainer,
                     dec_seg_inputs, dec_seg_targets, (int)file_num_streams, SEG_LEN);
 
+            uint64_t perf_t2 = mach_absolute_time();
+
             block_idx += SEG_LEN;
+
+            ++perf_count;
+            double decode_ms = (double)(perf_t1 - perf_t0) * g_tb.numer / g_tb.denom * 1e-6;
+            double train_ms  = (double)(perf_t2 - perf_t1) * g_tb.numer / g_tb.denom * 1e-6;
+            perf_decode_total += decode_ms;
+            perf_train_total  += train_ms;
+            if (perf_count % 5 == 0 && !isatty(STDERR_FILENO)) {
+                fprintf(stderr, "[PERF] seg=%d decode=%.1fms train=%.1fms\n",
+                        perf_count, decode_ms, train_ms);
+            }
 
             double pct = (double)(file_pos + block_idx) / (double)stride * 100.0;
             if (pct > 100.0) pct = 100.0;
-            printf("\rdecompress %.1f%%", pct);
-            fflush(stdout);
+            fprintf(stderr, "\rdecompress %.1f%%", pct);
+            fflush(stderr);
         }
 
         block_num++;
@@ -1673,7 +1694,14 @@ done:
     free(stream_limits);
     free(decoded_counts);
 
-    printf("\rdecompress %u -> %zu bytes\n", embedded_original_size, total_decoded);
+    if (perf_count > 0 && !isatty(STDERR_FILENO)) {
+        fprintf(stderr, "[PERF] decompress total: segs=%d decode_avg=%.1fms train_avg=%.1fms\n",
+                perf_count,
+                perf_decode_total / perf_count,
+                perf_train_total  / perf_count);
+    }
+
+    fprintf(stderr, "\rdecompress %u -> %zu bytes\n", embedded_original_size, total_decoded);
     return total_decoded;
 }
 

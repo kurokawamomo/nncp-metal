@@ -62,8 +62,9 @@ Measured on Apple Silicon (online learning, deterministic seed):
 | Dictionary text | 10 KB | ~6.3 KB | **63.5%** |
 | Natural language | 10 KB | ~6.2 KB | **62.4%** |
 | C source code | 50 KB | ~21.3 KB | **42.5%** |
+| enwik8 | 100 MB | ~22.8 MB | **22.8%** |
 
-Compression speed: ~6 s / 10 KB, ~30 s / 50 KB (M-series, online learning included).
+Compression speed: ~6 s / 10 KB, ~30 s / 50 KB, ~100 min / 100 MB (M-series, online learning included).
 
 ## How it works
 

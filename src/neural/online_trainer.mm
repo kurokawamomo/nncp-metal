@@ -808,12 +808,27 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
             MPSGraphTensor* b_r_bc = [g reshapeTensor:b_rel_ext
                                             withShape:@[@1, @(NH), @(T), @(EXT_LEN)] name:nil]; // [1,NH,T,EXT_LEN]
 
-            MPSGraphTensor* rel_pe = [g additionWithPrimaryTensor:q_rel_ext secondaryTensor:b_r_bc name:nil];
+            // Scale b_rel_r by sqrt(d_model) to match original NNCP:
+            // original: b_r * sqrt(d_key*d_model) added to unscaled QK^T, then *1/sqrt(d_key) => b_r * sqrt(d_model)
+            // our scores are already divided by 1/sqrt(d_head), so we apply sqrt(d_model) directly.
+            MPSGraphTensor* sqrt_dm = [g constantWithScalar:sqrtf((float)H) dataType:MPSDataTypeFloat32];
+            MPSGraphTensor* b_r_bc_scaled = [g multiplicationWithPrimaryTensor:b_r_bc secondaryTensor:sqrt_dm name:nil];
+            MPSGraphTensor* rel_pe = [g additionWithPrimaryTensor:q_rel_ext secondaryTensor:b_r_bc_scaled name:nil];
             scores = [g additionWithPrimaryTensor:scores secondaryTensor:rel_pe name:nil]; // [B,NH,T,64]
         }
 
         // Extended causal mask [T, 64] broadcasts to [B,NH,T,64]
         scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
+        // Phase AB: pre-softmax score clamp ±50 to prevent Metal exp() overflow → NaN.
+        // CUDA handles exp(Inf)/sum=1.0 naturally; Metal returns NaN.
+        // clampWithTensor is banned (broken backward); use separate min/max instead.
+        // Causal mask positions (-1e9 → -50 after clamp) still give exp(-100)≈0 in softmax.
+        {
+            MPSGraphTensor* cap_pos = [g constantWithScalar: 50.0f dataType:MPSDataTypeFloat32];
+            MPSGraphTensor* cap_neg = [g constantWithScalar:-50.0f dataType:MPSDataTypeFloat32];
+            scores = [g minimumWithPrimaryTensor:scores secondaryTensor:cap_pos name:nil];
+            scores = [g maximumWithPrimaryTensor:scores secondaryTensor:cap_neg name:nil];
+        }
         scores = [g softMaxWithTensor:scores axis:-1 name:nil]; // [B,NH,T,64]
 
         // Weighted sum: [B,NH,T,64] @ [B,NH,64,HD] = [B,NH,T,HD]
@@ -841,28 +856,19 @@ static void build_segment_training_graph(OnlineTrainer* tr) {
     // ---- Output projection: [B*T, H] @ [H, V] + bias = [B*T, V] ----
     MPSGraphTensor* logits = [g additionWithPrimaryTensor:[g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:tr->ts_w_out name:nil] secondaryTensor:tr->ts_w_b_out name:nil];
 
-    // ---- Loss: mean cross-entropy over all B*T positions ----
-    // Numerically stable cross-entropy: add eps before log to avoid log(0)=-inf → -inf*0=NaN.
-    // When the model becomes confident, softmax can underflow to 0.0 in float32 for rare
-    // classes, producing log(0)=-inf.  Multiplied by one_hot=0, that gives -inf*0=NaN (IEEE 754).
-    // Adding 1e-7 ensures log(p+eps) is always finite.  For p>>eps the gradient is unchanged.
-    MPSGraphTensor* probs    = [g softMaxWithTensor:logits axis:-1 name:nil]; // [B*T, V]
-    MPSGraphTensor* log_probs = [g logarithmWithTensor:
-                                    [g additionWithPrimaryTensor:probs
-                                                secondaryTensor:[g constantWithScalar:1e-7f dataType:MPSDataTypeFloat32]
-                                                            name:nil] name:nil]; // [B*T, V]
-    // One-hot target mask to avoid scatter_nd in backward
+    // ---- Loss: MPSGraph built-in softmax cross-entropy (numerically stable, has gradient) ----
+    // softMaxCrossEntropyWithSourceTensor uses log-sum-exp internally; no manual max-shift needed.
+    // MPSGraphLossReductionTypeMean reduces over B*T → scalar.
     MPSGraphTensor* one_hot_tgt = [g oneHotWithIndicesTensor:tr->ts_seg_target
                                                        depth:V
                                                         axis:1
                                                     dataType:MPSDataTypeFloat32
                                                         name:nil]; // [B*T, V]
-    MPSGraphTensor* sel = [g reductionSumWithTensor:
-                               [g multiplicationWithPrimaryTensor:log_probs
-                                                 secondaryTensor:one_hot_tgt name:nil]
-                                              axis:1 name:nil]; // [B*T]
-    MPSGraphTensor* nll = [g negativeWithTensor:sel name:nil]; // [B*T]
-    tr->ts_loss = [g meanOfTensor:nll axes:@[@0] name:@"seg_loss"]; // scalar
+    tr->ts_loss = [g softMaxCrossEntropyWithSourceTensor:logits
+                                            labelsTensor:one_hot_tgt
+                                                    axis:-1
+                                           reductionType:MPSGraphLossReductionTypeMean
+                                                    name:@"seg_loss"]; // scalar
 
     // ---- Gradients ----
     NSArray<MPSGraphTensor*>* weight_tensors = @[
@@ -1069,8 +1075,9 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->lr_min          = lr * (1.0f / 3.0f);  // decay to 1/3 of init lr
     tr->lr_warmup_steps = 0;  // bias correction handles cold-start; warmup not needed
     const int seg_len = SEG_TRAIN_LEN;  // 32
+    // One train_step = one segment = SEG_TRAIN_STREAMS * seg_len bytes (matching original nncp.c)
     const uint64_t file_steps = (total_input_bytes > 0)
-        ? (uint64_t)(total_input_bytes / (size_t)seg_len)
+        ? (uint64_t)(total_input_bytes / (size_t)(SEG_TRAIN_STREAMS * seg_len))
         : 0ULL;
     tr->lr_decay_steps = (file_steps > 156250ULL) ? file_steps : 156250ULL;
     tr->train_step      = 0;
@@ -1508,9 +1515,9 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     copyGrad(tr->ts_grad_rel_r,    tr->grad_rel_r);
     copyGrad(tr->ts_grad_b_rel_r,  tr->grad_b_rel_r);
 
-    // [WQNORM-DIAG] raw grad norms (before clip): first step + every 2000 steps
+    // [WQNORM-DIAG] raw grad norms (before clip): first step + every 2000 segments
     bool _wq_diag = (tr->train_step == 0) ||
-                    ((tr->train_step + (uint64_t)n_streams) % 2000 < (uint64_t)n_streams);
+                    ((tr->train_step + 1ULL) % 2000 == 0);
     if (_wq_diag) {
         size_t n = (size_t)tr->L * (size_t)tr->H * (size_t)tr->H;
         float gnorm_raw = 0.0f, gnorm_ffn1 = 0.0f, gnorm_embed = 0.0f;
@@ -1544,13 +1551,13 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         float gnorm_o    = lnorm(tr->grad_o,     n);
         float gnorm_relr = lnorm(tr->grad_rel_r, (size_t)tr->NH * tr->HD * SEG_TRAIN_LEN * 2);
         fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f\n",
-                (unsigned long long)(tr->train_step + n_streams),
+                (unsigned long long)(tr->train_step + 1),
                 gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed);
     }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
         clip_gradients(tr, tr->grad_clip);
-        tr->train_step += (uint64_t)n_streams;  // all streams in one call = n_streams steps
+        tr->train_step += 1ULL;  // +1 per segment (= n_streams * seg_len bytes), matching original nncp.c
         tr->lr = compute_lr(tr);
 
         if ((tr->train_step % 160) == 0 && !isatty(STDERR_FILENO)) {

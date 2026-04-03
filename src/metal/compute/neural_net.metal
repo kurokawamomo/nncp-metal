@@ -306,8 +306,8 @@ kernel void transformer_attention_decode_cached(
         // Phase N: true relative distance PE
         //   dist = kv_len-1-k  (0 = self/latest, increases toward oldest)
         const uint dist = kv_len - 1 - k;
-        dot += q_rel_vec[dist % d_pos] * scale + B_rel_r[h * total_len + dist];
-        dot = clamp(dot, -30.0f, 30.0f);   // guard against NaN from untrained weights
+        dot += q_rel_vec[dist % d_pos] * scale + B_rel_r[h * total_len + dist] * 16.0f;
+        dot = clamp(dot, -50.0f, 50.0f);
         scores_tmp[score_base + k] = dot;
         if (dot > max_score) max_score = dot;
     }
