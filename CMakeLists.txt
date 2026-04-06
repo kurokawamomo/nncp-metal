@@ -119,6 +119,7 @@ if(USE_METAL)
         src/neural/dynamic_context.c
         src/neural/enhanced_selector.c
         src/neural/content_analyzer.c
+        src/neural/preprocess.c
         ${METAL_WRAPPER_SOURCES}
         ${NEURAL_LSTM_SOURCES}
     )

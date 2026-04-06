@@ -56,7 +56,8 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
                                 id<MTLBuffer> b_ffn2,
                                 id<MTLBuffer> b_out,
                                 id<MTLBuffer> w_rel_r,
-                                id<MTLBuffer> b_rel_r);
+                                id<MTLBuffer> b_rel_r,
+                                id<MTLBuffer> ln_final_weights);
 
 /**
  * Destroy Context
@@ -93,6 +94,7 @@ typedef struct {
     id<MTLBuffer> b_out;      /* [V] */
     id<MTLBuffer> w_rel_r;    /* [NH, HD, D_POS] tied rel PE proj */
     id<MTLBuffer> b_rel_r;    /* [NH, total_len] tied rel PE bias */
+    id<MTLBuffer> ln_final;   /* [2, H]: gamma_f, beta_f for LN_FINAL */
 } MPSTransformerWeightBuffers;
 
 bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,

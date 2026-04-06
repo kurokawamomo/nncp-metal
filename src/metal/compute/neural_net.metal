@@ -33,72 +33,56 @@ kernel void transformer_embedding_lookup(
     }
 }
 
-// 2. Layer Normalization
-// input: [batch_seq, hidden]
-// output: [batch_seq, hidden]
-// gamma, beta: [hidden]
+// RMSNorm: x / sqrt(mean(x²) + ε) * γ  (no mean subtraction, beta unused)
+// SIMD-parallel: 32 threads per vector, dispatch [batch*32, 1, 1], threadgroup [32, 1, 1]
 kernel void transformer_layer_norm(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
     device const float* gamma [[buffer(2)]],
-    device const float* beta [[buffer(3)]],
-    constant uint& hidden_size [[buffer(4)]],
-    constant float& eps [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]
+    device const float* beta  [[buffer(3)]],   // unused in RMSNorm
+    constant uint&  hidden_size [[buffer(4)]],
+    constant float& eps         [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    // grid is [batch_seq]
-    // Each thread processes one vector (naive parallel reduction within thread for now)
-    
-    uint offset = gid * hidden_size;
-    
-    // Mean
-    float sum = 0.0f;
-    for (uint i = 0; i < hidden_size; i++) {
-        sum += input[offset + i];
+    uint batch_idx = gid / 32;
+    uint base = batch_idx * hidden_size;
+
+    float partial_ms = 0.0f;
+    for (uint i = lane; i < hidden_size; i += 32) {
+        float v = input[base + i];
+        partial_ms += v * v;
     }
-    float mean = sum / (float)hidden_size;
-    
-    // Variance
-    float sq_sum = 0.0f;
-    for (uint i = 0; i < hidden_size; i++) {
-        float diff = input[offset + i] - mean;
-        sq_sum += diff * diff;
-    }
-    float var = sq_sum / (float)hidden_size;
-    float inv_std = rsqrt(var + eps);
-    
-    // Normalize + Scale + Shift
-    for (uint i = 0; i < hidden_size; i++) {
-        output[offset + i] = (input[offset + i] - mean) * inv_std * gamma[i] + beta[i];
-    }
+    float ms = simd_sum(partial_ms) / (float)hidden_size;
+    float inv_rms = rsqrt(ms + eps);
+
+    for (uint i = lane; i < hidden_size; i += 32)
+        output[base + i] = input[base + i] * inv_rms * gamma[i];
 }
 
-// 3. QKV Projection (Linear)
-// input: [batch_seq, hidden]
-// weights: [hidden, 3 * hidden] or separate. Usually separate in NNCP.
-// Let's assume standard linear: Y = XW + b
+// 3. Linear projection: Y = X @ W + b
+// SIMD-parallel: 32 lanes per output element, dispatch [out_dim*32, batch, 1], threadgroup [32, 8, 1]
 kernel void transformer_linear(
-    device const float* input [[buffer(0)]],
-    device const float* weight [[buffer(1)]], // [in_dim, out_dim] (row-major)
-    device const float* bias [[buffer(2)]],   // [out_dim]
-    device float* output [[buffer(3)]],
-    constant uint& in_dim [[buffer(4)]],
+    device const float* input  [[buffer(0)]],
+    device const float* weight [[buffer(1)]],  // [in_dim, out_dim] row-major
+    device const float* bias   [[buffer(2)]],  // [out_dim]
+    device float*       output [[buffer(3)]],
+    constant uint& in_dim  [[buffer(4)]],
     constant uint& out_dim [[buffer(5)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint2 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
 ) {
-    // gid.x = output feature index (0..out_dim-1)
-    // gid.y = batch_seq index
-    
-    if (gid.x >= out_dim) return;
-    
+    uint out_idx   = gid.x / 32;
     uint batch_idx = gid.y;
-    uint out_idx = gid.x;
-    
-    float sum = bias[out_idx];
-    for (uint i = 0; i < in_dim; i++) {
-        sum += input[batch_idx * in_dim + i] * weight[i * out_dim + out_idx];
-    }
-    output[batch_idx * out_dim + out_idx] = sum;
+    if (out_idx >= out_dim) return;
+
+    float partial = (lane == 0) ? bias[out_idx] : 0.0f;
+    for (uint i = lane; i < in_dim; i += 32)
+        partial += input[batch_idx * in_dim + i] * weight[i * out_dim + out_idx];
+
+    float sum = simd_sum(partial);
+    if (lane == 0)
+        output[batch_idx * out_dim + out_idx] = sum;
 }
 
 // 4. Multi-Head Attention: Score Computation (Q * K^T) + Mask + Softmax + (Score * V)
@@ -212,51 +196,70 @@ kernel void transformer_attention_value(
 }
 
 // 5. GELU Feed Forward activation
-// Input: [batch_seq, inter_dim]  (result of W1 linear projection, hidden → ffn_size)
-// Output: [batch_seq, inter_dim]  element-wise GELU
+// GeGLU: GELU(first_half) * second_half
+// Input: [batch_seq, 2*inter_dim]: first inter_dim = value, second inter_dim = gate
+// Output: [batch_seq, inter_dim]
 kernel void transformer_geglu(
-    device const float* input [[buffer(0)]], // [batch_seq, inter_dim]
+    device const float* input [[buffer(0)]], // [batch_seq, 2*inter_dim]
     device float* output [[buffer(1)]],      // [batch_seq, inter_dim]
     constant uint& inter_dim [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    // gid.x = inter_dim index
+    // gid.x = output index in [0, inter_dim)
     // gid.y = batch_seq index
 
     if (gid.x >= inter_dim) return;
 
-    float x = input[gid.y * inter_dim + gid.x];
-    output[gid.y * inter_dim + gid.x] = gelu(x);
+    float val  = input[gid.y * 2u * inter_dim + gid.x];
+    float gate = input[gid.y * 2u * inter_dim + inter_dim + gid.x];
+    output[gid.y * inter_dim + gid.x] = gelu(val) * gate;
 }
 
-// 6b. KV Cache Write
-// Copies `length` floats from src into cache starting at cache[batch_offset].
-// batch_offset is in float-element units (not bytes).
+// 6b. KV Cache Write (float32 → float16 half-precision cache)
+// Converts and copies `length` floats from src into half-precision cache.
+// batch_offset is in half-element units.
 kernel void kv_cache_write(
     device const float* src          [[buffer(0)]],
-    device float*       cache        [[buffer(1)]],
+    device half*        cache        [[buffer(1)]],
     constant uint&      length       [[buffer(2)]],
-    constant uint&      batch_offset [[buffer(3)]],  // float element index
+    constant uint&      batch_offset [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= length) return;
-    cache[batch_offset + gid] = src[gid];
+    cache[batch_offset + gid] = (half)src[gid];
 }
 
-// 6c. Decode Attention with KV Cache (batch-aware)
-//
-// Grid: [NH, batch_size, 1]  — gid.x=head_idx, gid.y=batch_idx
-//
-// Buffer layouts (caller passes layer-base pointers):
-//   Q         : [batch, NH * HD]
-//   K_cache   : [batch * max_seq_len, NH, HD]
-//   V_cache   : [batch * max_seq_len, NH, HD]
-//   output    : [batch, NH * HD]
-//   scores_tmp: [batch, NH, max_seq_len]  scratch space
+// 6b2. KV Cache Write Batch: writes K and V for all batch streams in one dispatch per layer
+// Grid: [H, batch_size, 1] — gid.x=h, gid.y=b
+// dst layout: [L * batch * max_sl, H]  float16
+// src layout: [batch, H]  float32
+// layer_batch_base = layer * batch_size  (pre-computed by host)
+kernel void kv_cache_write_batch(
+    device const float* src_k           [[buffer(0)]],  // [batch, H] float32
+    device const float* src_v           [[buffer(1)]],  // [batch, H] float32
+    device half*        dst_k           [[buffer(2)]],
+    device half*        dst_v           [[buffer(3)]],
+    constant uint&      H               [[buffer(4)]],
+    constant uint&      max_sl          [[buffer(5)]],
+    constant uint&      kv_pos          [[buffer(6)]],
+    constant uint&      layer_batch_base [[buffer(7)]],  // layer * batch_size
+    uint2 gid [[thread_position_in_grid]]  // gid.x=h, gid.y=b
+) {
+    const uint h = gid.x;
+    const uint b = gid.y;
+    const uint dst_off = (layer_batch_base + b) * max_sl * H + kv_pos * H + h;
+    const uint src_off = b * H + h;
+    dst_k[dst_off] = (half)src_k[src_off];
+    dst_v[dst_off] = (half)src_v[src_off];
+}
+
+// 6c. Decode Attention with KV Cache
+// Grid: [NH*32, batch_size, 1]  — 32 lanes per (head, batch)
+// gid.x/32 = head_idx, lane = thread_index_in_simdgroup, gid.y = batch_idx
 kernel void transformer_attention_decode_cached(
     device const float* Q          [[buffer(0)]],    // [batch, NH * HD]
-    device const float* K_cache    [[buffer(1)]],    // [batch * max_seq_len, NH, HD]
-    device const float* V_cache    [[buffer(2)]],    // [batch * max_seq_len, NH, HD]
+    device const half*  K_cache    [[buffer(1)]],    // [batch * max_seq_len, NH*HD] fp16
+    device const half*  V_cache    [[buffer(2)]],    // [batch * max_seq_len, NH*HD] fp16
     device float*       output     [[buffer(3)]],    // [batch, NH * HD]
     device float*       scores_tmp [[buffer(4)]],    // [batch, NH, max_seq_len]
     constant uint&      num_heads  [[buffer(5)]],
@@ -264,89 +267,80 @@ kernel void transformer_attention_decode_cached(
     constant uint&      kv_len     [[buffer(7)]],
     constant uint&      max_seq_len [[buffer(8)]],
     constant float&     scale      [[buffer(9)]],
-    device const float* W_rel_r    [[buffer(10)]],   // [NH, HD, D_POS] tied rel PE proj
-    device const float* B_rel_r    [[buffer(11)]],   // [NH, total_len]  tied rel PE bias
-    constant uint&      d_pos      [[buffer(12)]],   // up to 64
-    constant uint&      total_len  [[buffer(13)]],   // = 64
-    uint2 gid [[thread_position_in_grid]]   // gid.x=head_idx, gid.y=batch_idx
+    device const float* W_rel_r    [[buffer(10)]],   // [NH, HD, D_POS]
+    device const float* B_rel_r    [[buffer(11)]],   // [NH, total_len]
+    constant uint&      d_pos      [[buffer(12)]],
+    constant uint&      total_len  [[buffer(13)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
 ) {
-    const uint h = gid.x;
+    const uint h = gid.x / 32;
     const uint b = gid.y;
     if (h >= num_heads) return;
-    const uint H = num_heads * head_dim;
 
-    // Q: batch b, head h
-    const uint q_base = b * H + h * head_dim;
-
-    // K/V cache: batch b starts at b * max_seq_len in the position dimension
+    const uint H          = num_heads * head_dim;
+    const uint q_base     = b * H + h * head_dim;
+    const uint out_base   = b * H + h * head_dim;
+    const uint score_base = (b * num_heads + h) * max_seq_len;
     const uint cache_batch_base = b * max_seq_len;
 
-    // scores scratch: [batch, NH, max_seq_len]
-    const uint score_base = (b * num_heads + h) * max_seq_len;
-
-    // Phase E2.2: pre-compute q_rel[d] = Q[h] @ W_rel_r[h, :, :] → [D_POS=32]
-    // Layout: W_rel_r[h * head_dim * d_pos + hd * d_pos + d]
-    thread float q_rel_vec[64];  // D_POS always <= 64
+    // Q·K^T + rel PE: compute q_rel inline per key (no fixed-size array; supports any d_pos)
     const uint w_rel_head_off = h * head_dim * d_pos;
-    for (uint d = 0; d < d_pos; d++) {
-        float s = 0.0f;
-        for (uint hd = 0; hd < head_dim; hd++)
-            s += Q[q_base + hd] * W_rel_r[w_rel_head_off + hd * d_pos + d];
-        q_rel_vec[d] = s;
-    }
-
-    // ---- 1. Q·K^T + relative PE  (with score clamp for numerical stability) ----
     float max_score = -1e9f;
     for (uint k = 0; k < kv_len; k++) {
-        uint k_base = (cache_batch_base + k) * H + h * head_dim;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++)
-            dot += Q[q_base + d] * K_cache[k_base + d];
-        dot *= scale;
-        // Phase N: true relative distance PE
-        //   dist = kv_len-1-k  (0 = self/latest, increases toward oldest)
+        const uint k_base = (cache_batch_base + k) * H + h * head_dim;
         const uint dist = kv_len - 1 - k;
-        dot += q_rel_vec[dist % d_pos] * scale + B_rel_r[h * total_len + dist] * 16.0f;
+        const uint dr   = dist % d_pos;
+
+        float q_rel_partial = 0.0f;
+        for (uint hd = lane; hd < head_dim; hd += 32)
+            q_rel_partial += Q[q_base + hd] * W_rel_r[w_rel_head_off + hd * d_pos + dr];
+        float q_rel_k = simd_sum(q_rel_partial);
+
+        float partial_dot = 0.0f;
+        for (uint d = lane; d < head_dim; d += 32)
+            partial_dot += Q[q_base + d] * (float)K_cache[k_base + d];
+        float dot = simd_sum(partial_dot) * scale;
+
+        dot += q_rel_k * scale + B_rel_r[h * total_len + dist] * 16.0f;
         dot = clamp(dot, -50.0f, 50.0f);
-        scores_tmp[score_base + k] = dot;
+        if (lane == 0) scores_tmp[score_base + k] = dot;
         if (dot > max_score) max_score = dot;
     }
 
-    // ---- 2. Softmax  (numerically stable: exp(score - max)) ----
-    float sum_exp = 0.0f;
-    for (uint k = 0; k < kv_len; k++) {
+    float partial_sum = 0.0f;
+    for (uint k = lane; k < kv_len; k += 32) {
         float e = exp(scores_tmp[score_base + k] - max_score);
         scores_tmp[score_base + k] = e;
-        sum_exp += e;
+        partial_sum += e;
     }
+    float sum_exp = simd_sum(partial_sum);
 
-    // ---- 3. Weighted sum with V_cache ----
-    const uint out_base = b * H + h * head_dim;
-    for (uint d = 0; d < head_dim; d++) {
+    for (uint d = lane; d < head_dim; d += 32) {
         float acc = 0.0f;
         for (uint k = 0; k < kv_len; k++) {
-            uint v_base = (cache_batch_base + k) * H + h * head_dim;
-            acc += (scores_tmp[score_base + k] / (sum_exp + 1e-9f)) * V_cache[v_base + d];
+            const uint v_base = (cache_batch_base + k) * H + h * head_dim;
+            acc += (scores_tmp[score_base + k] / (sum_exp + 1e-9f)) * (float)V_cache[v_base + d];
         }
         // Guard against NaN in attention output (e.g. when V_cache contains garbage)
         output[out_base + d] = isnan(acc) ? 0.0f : acc;
     }
 }
 
-// Transformer-XL memory shift
+// Transformer-XL memory shift (half-precision KV cache)
 //
 // Copies the "current" segment [memory_len .. total_len-1] into the "memory"
 // segment [0 .. memory_len-1] for both K and V caches across all (layer, batch)
 // pairs.  Called once every time the current segment fills up (i.e. after
 // processing total_len tokens since the last shift / session start).
 //
-// Buffer layout: [L * batch_size, total_len, H]  (flat float32 array)
+// Buffer layout: [L * batch_size, total_len, H]  (flat float16 array)
 //   L * batch_size =: num_lb
 //
 // Grid: [num_lb * memory_len * H, 1, 1]
 kernel void kv_memory_shift(
-    device float*       kv_k       [[buffer(0)]],
-    device float*       kv_v       [[buffer(1)]],
+    device half*        kv_k       [[buffer(0)]],
+    device half*        kv_v       [[buffer(1)]],
     constant uint&      num_lb     [[buffer(2)]],  // num_layers * batch_size
     constant uint&      total_len  [[buffer(3)]],  // memory_len + current_len
     constant uint&      memory_len [[buffer(4)]],  // tokens kept as memory

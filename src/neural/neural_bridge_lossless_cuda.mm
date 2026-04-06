@@ -29,6 +29,13 @@
 #endif
 
 float g_lr_override = 0.0f;  // 0 = use default 1e-4; set via --lr CLI flag
+int   g_vocab_size_override = 0;  // 0 = use default 256; set to 256+n_words for preprocessing
+NNCPProfileConfig g_nncp_profile = {256, 4, 512, 8, 32, 16, 32}; // default profile
+
+// D_POS = max(MEM_LEN+SEG_LEN, MEM_LEN*2); equals 64 for default profile (16/32/32)
+#define NNCP_D_POS() ((size_t)((g_nncp_profile.mem_len >= g_nncp_profile.seg_len) \
+                               ? g_nncp_profile.mem_len * 2 \
+                               : g_nncp_profile.mem_len + g_nncp_profile.seg_len))
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,6 +127,7 @@ typedef struct MetalTransformerModel {
     id<MTLBuffer> bias_out;   /* [vocab_size] */
     id<MTLBuffer> rel_r;      /* [NH * HD * D_POS] = [8*32*64] rel PE proj  */
     id<MTLBuffer> b_rel_r;    /* [NH * total_len]  = [8*64]    rel PE bias  */
+    id<MTLBuffer> ln_final;   /* [2 * hidden_size]: gamma_f, beta_f for LN_FINAL */
 
     // Computation buffers
     id<MTLBuffer> context_buffer;        // Input context [context_length]
@@ -1083,6 +1091,7 @@ static float* g_session_init_bias_ffn2 = NULL;  /* [L * H]          */
 static float* g_session_init_bias_out  = NULL;  /* [V]              */
 static float* g_session_init_rel_r     = NULL;  /* [NH * HD * D_POS] */
 static float* g_session_init_b_rel_r   = NULL;  /* [NH * total_len]  */
+static float* g_session_init_ln_final  = NULL;  /* [2 * H]           */
 static bool   g_session_weights_ready  = false;
 
 /* Snapshot the model's current weights into CPU buffers (called once). */
@@ -1106,22 +1115,25 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     SNAPSHOT(g_session_init_attn_k,   model->attention_weights_k,     L * H * H);
     SNAPSHOT(g_session_init_attn_v,   model->attention_weights_v,     L * H * H);
     SNAPSHOT(g_session_init_attn_out, model->attention_output_weights, L * H * H);
-    SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS);
+    SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS * 2);
     SNAPSHOT(g_session_init_ffn2,     model->ffn_weights_2,           L * FFS * H);
     SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 4 * H);
     SNAPSHOT(g_session_init_out_proj, model->output_projection,       H * V);
     SNAPSHOT(g_session_init_bias_k,    model->bias_k,    L * H);
     SNAPSHOT(g_session_init_bias_v,    model->bias_v,    L * H);
     SNAPSHOT(g_session_init_bias_o,    model->bias_o,    L * H);
-    SNAPSHOT(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS);
+    SNAPSHOT(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * 2);
     SNAPSHOT(g_session_init_bias_ffn2, model->bias_ffn2, L * H);
     SNAPSHOT(g_session_init_bias_out,  model->bias_out,  V);
     {
-        const size_t NH_ = model->num_attention_heads;     /* 8  */
-        const size_t HD_ = model->hidden_size / NH_;       /* 32 */
-        SNAPSHOT(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 64); /* [NH,HD,D_POS] */
-        SNAPSHOT(g_session_init_b_rel_r, model->b_rel_r, NH_ * 64);       /* [NH,total_len]*/
+        const size_t NH_ = model->num_attention_heads;
+        const size_t HD_ = model->hidden_size / NH_;
+        const size_t DP_ = NNCP_D_POS();
+        SNAPSHOT(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * DP_); /* [NH,HD,D_POS] */
+        SNAPSHOT(g_session_init_b_rel_r, model->b_rel_r, NH_ * DP_);       /* [NH,D_POS] */
     }
+    if (model->ln_final)
+        SNAPSHOT(g_session_init_ln_final, model->ln_final, 2 * H);
 
 #undef SNAPSHOT
 
@@ -1146,22 +1158,25 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     RESTORE(g_session_init_attn_k,   model->attention_weights_k,      L * H * H);
     RESTORE(g_session_init_attn_v,   model->attention_weights_v,      L * H * H);
     RESTORE(g_session_init_attn_out, model->attention_output_weights,  L * H * H);
-    RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS);
+    RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS * 2);
     RESTORE(g_session_init_ffn2,     model->ffn_weights_2,            L * FFS * H);
     RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 4 * H);
     RESTORE(g_session_init_out_proj, model->output_projection,        H * V);
     RESTORE(g_session_init_bias_k,    model->bias_k,    L * H);
     RESTORE(g_session_init_bias_v,    model->bias_v,    L * H);
     RESTORE(g_session_init_bias_o,    model->bias_o,    L * H);
-    RESTORE(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS);
+    RESTORE(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * 2);
     RESTORE(g_session_init_bias_ffn2, model->bias_ffn2, L * H);
     RESTORE(g_session_init_bias_out,  model->bias_out,  V);
     {
         const size_t NH_ = model->num_attention_heads;
         const size_t HD_ = model->hidden_size / NH_;
-        if (g_session_init_rel_r)   RESTORE(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * 64);
-        if (g_session_init_b_rel_r) RESTORE(g_session_init_b_rel_r, model->b_rel_r, NH_ * 64);
+        const size_t DP_ = NNCP_D_POS();
+        if (g_session_init_rel_r)   RESTORE(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * DP_);
+        if (g_session_init_b_rel_r) RESTORE(g_session_init_b_rel_r, model->b_rel_r, NH_ * DP_);
     }
+    if (g_session_init_ln_final && model->ln_final)
+        RESTORE(g_session_init_ln_final, model->ln_final, 2 * H);
 
 #undef RESTORE
 
@@ -1205,15 +1220,17 @@ static MPSTransformerContext* get_shared_mps_ctx() {
                 model->bias_ffn2,
                 model->bias_out,
                 model->rel_r,
-                model->b_rel_r);
+                model->b_rel_r,
+                model->ln_final);
         }
     }
     return g_mps_ctx;
 }
 
-#define NUM_STREAMS  16      // batch_size (original NNCP default)
-#define SEG_LEN      32      // seg_len (original default=32)
-#define MEM_LEN      32      // mem_len (original default=32)
+// Profile-driven: set g_nncp_profile before compress/decompress
+#define NUM_STREAMS  (g_nncp_profile.num_streams)
+#define SEG_LEN      (g_nncp_profile.seg_len)
+#define MEM_LEN      (g_nncp_profile.mem_len)
 #define BLOCK_LEN    500000  // lookahead block size (original default)
 
 static mach_timebase_info_data_t g_tb = {};
@@ -1236,13 +1253,16 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     const size_t stride = (input_size + NUM_STREAMS - 1) / NUM_STREAMS;
 
     // ---- Arithmetic encoders ----
-    PutBitState encoders[NUM_STREAMS];
-    uint8_t* stream_buffers[NUM_STREAMS];
+    const int ns = NUM_STREAMS;  // capture once (runtime value)
+    PutBitState* encoders = (PutBitState*)malloc((size_t)ns * sizeof(PutBitState));
+    uint8_t** stream_buffers = (uint8_t**)malloc((size_t)ns * sizeof(uint8_t*));
+    if (!encoders || !stream_buffers) { free(encoders); free(stream_buffers); return 0; }
     const size_t est_capacity = stride * 2 + 4096;
-    for (int i = 0; i < NUM_STREAMS; i++) {
+    for (int i = 0; i < ns; i++) {
         stream_buffers[i] = (uint8_t*)malloc(est_capacity);
         if (!stream_buffers[i]) {
             for (int j = 0; j < i; j++) free(stream_buffers[j]);
+            free(stream_buffers); free(encoders);
             return 0;
         }
         put_bit_init(&encoders[i], stream_buffers[i], est_capacity);
@@ -1253,7 +1273,8 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- MPS context ----
     MPSTransformerContext* mps_ctx = get_shared_mps_ctx();
     if (!mps_ctx) {
-        for (int i = 0; i < NUM_STREAMS; i++) free(stream_buffers[i]);
+        for (int i = 0; i < ns; i++) free(stream_buffers[i]);
+        free(stream_buffers); free(encoders);
         return 0;
     }
     mps_transformer_reset_kv_cache(mps_ctx);
@@ -1280,7 +1301,8 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     int32_t* seg_targets = (int32_t*)malloc((size_t)NUM_STREAMS * SEG_LEN * sizeof(int32_t));
     if (!seg_logits || !probs || !seg_tokens || !seg_targets) {
         free(seg_logits); free(probs); free(seg_tokens); free(seg_targets);
-        for (int i = 0; i < NUM_STREAMS; i++) free(stream_buffers[i]);
+        for (int i = 0; i < ns; i++) free(stream_buffers[i]);
+        free(stream_buffers); free(encoders);
         return 0;
     }
 
@@ -1407,16 +1429,17 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
 
     // ---- Output format (self-describing) ----
     // [uint32: num_streams][uint32: original_size][uint32 × num_streams: per-stream bytes][stream 0]...
-    *(uint32_t*)(output_data + 0)              = (uint32_t)NUM_STREAMS;
+    *(uint32_t*)(output_data + 0)              = (uint32_t)ns;
     *(uint32_t*)(output_data + sizeof(uint32_t)) = (uint32_t)input_size;
     uint32_t* size_table = (uint32_t*)(output_data + 2 * sizeof(uint32_t));
-    size_t current_output_offset = 2 * sizeof(uint32_t) + sizeof(uint32_t) * NUM_STREAMS;
+    size_t current_output_offset = 2 * sizeof(uint32_t) + sizeof(uint32_t) * (size_t)ns;
 
-    for (int s = 0; s < NUM_STREAMS; s++) {
+    for (int s = 0; s < ns; s++) {
         int64_t s_size = put_bit_flush(&encoders[s]);
         if (current_output_offset + (size_t)s_size > output_capacity) {
             printf("Error: Output buffer too small\n");
-            for (int i = s; i < NUM_STREAMS; i++) free(stream_buffers[i]);
+            for (int i = s; i < ns; i++) free(stream_buffers[i]);
+            free(stream_buffers); free(encoders);
             return 0;
         }
         size_table[s] = (uint32_t)s_size;
@@ -1424,6 +1447,8 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         current_output_offset += (size_t)s_size;
         free(stream_buffers[s]);
     }
+    free(stream_buffers);
+    free(encoders);
 
     printf("\rcompress %zu -> %zu bytes (%.1f%%)\n", input_size, current_output_offset,
            (double)current_output_offset * 100.0 / (double)input_size);
@@ -1705,6 +1730,315 @@ done:
     return total_decoded;
 }
 
+/* -------------------------------------------------------------------------
+ * Symbol-level compress/decompress (preprocessing / vocab > 256 mode)
+ * These mirror neural_bridge_cuda_lossless_compress/decompress but operate
+ * on uint16_t token arrays instead of raw uint8_t bytes.
+ * ---------------------------------------------------------------------- */
+
+size_t neural_bridge_compress_symbols(
+    const uint16_t *tokens, size_t n_tokens,
+    uint8_t *output_data, size_t output_cap,
+    int vocab_size, size_t total_input_bytes)
+{
+    if (!tokens || !output_data || n_tokens == 0) return 0;
+
+    reset_model_to_session_weights(get_shared_transformer_model());
+
+    const size_t stride = (n_tokens + NUM_STREAMS - 1) / NUM_STREAMS;
+
+    PutBitState encoders[NUM_STREAMS];
+    uint8_t *stream_bufs[NUM_STREAMS];
+    const size_t est_cap = stride * 2 * sizeof(uint16_t) + 4096;
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        stream_bufs[i] = (uint8_t *)malloc(est_cap);
+        if (!stream_bufs[i]) {
+            for (int j = 0; j < i; j++) free(stream_bufs[j]);
+            return 0;
+        }
+        put_bit_init(&encoders[i], stream_bufs[i], est_cap);
+    }
+
+    MPSTransformerContext *mps_ctx = get_shared_mps_ctx();
+    if (!mps_ctx) {
+        for (int i = 0; i < NUM_STREAMS; i++) free(stream_bufs[i]);
+        return 0;
+    }
+    mps_transformer_reset_kv_cache(mps_ctx);
+
+    if (!g_online_trainer) {
+        g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
+                                                  mps_ctx,
+                                                  (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
+                                                  total_input_bytes);
+    }
+    if (g_online_trainer) online_trainer_reset_session(g_online_trainer, false);
+
+    if (g_tb.denom == 0) mach_timebase_info(&g_tb);
+
+    float   *seg_logits  = (float *)   malloc((size_t)NUM_STREAMS * SEG_LEN * vocab_size * sizeof(float));
+    float   *probs       = (float *)   malloc((size_t)vocab_size * sizeof(float));
+    int32_t *seg_tokens  = (int32_t *) malloc((size_t)NUM_STREAMS * SEG_LEN * sizeof(int32_t));
+    int32_t *seg_targets = (int32_t *) malloc((size_t)NUM_STREAMS * SEG_LEN * sizeof(int32_t));
+    if (!seg_logits || !probs || !seg_tokens || !seg_targets) {
+        free(seg_logits); free(probs); free(seg_tokens); free(seg_targets);
+        for (int i = 0; i < NUM_STREAMS; i++) free(stream_bufs[i]);
+        return 0;
+    }
+
+    const size_t total_blocks = (stride + BLOCK_LEN - 1) / BLOCK_LEN;
+    size_t file_pos = 0;
+
+    while (file_pos < stride) {
+        const size_t block_tokens = ((stride - file_pos) < (size_t)BLOCK_LEN)
+                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        mps_transformer_reset_kv_cache(mps_ctx);
+
+        size_t block_idx = 0;
+        while (block_idx < block_tokens) {
+            memset(seg_tokens, 0, (size_t)NUM_STREAMS * SEG_LEN * sizeof(int32_t));
+            for (int s = 0; s < NUM_STREAMS; s++) {
+                for (int t = 0; t < SEG_LEN; t++) {
+                    const size_t abs_pos  = file_pos + block_idx + (size_t)t;
+                    const size_t data_off = (size_t)s * stride + abs_pos;
+                    if (abs_pos > 0 && data_off > 0 && (data_off - 1) < n_tokens)
+                        seg_tokens[s * SEG_LEN + t] = (int32_t)tokens[data_off - 1];
+                }
+            }
+            if (g_online_trainer) online_trainer_latch_kv_memory(g_online_trainer);
+
+            mps_transformer_execute_segment(mps_ctx, seg_tokens, NUM_STREAMS, SEG_LEN, seg_logits);
+
+            for (int t = 0; t < SEG_LEN; t++) {
+                const size_t abs_pos = file_pos + block_idx + (size_t)t;
+                if (abs_pos >= file_pos + block_tokens) break;
+                for (int s = 0; s < NUM_STREAMS; s++) {
+                    const size_t data_off = (size_t)s * stride + abs_pos;
+                    if (data_off >= n_tokens) continue;
+
+                    float *raw = seg_logits + ((size_t)(s * SEG_LEN + t)) * vocab_size;
+                    bool has_nan = false;
+                    for (int k = 0; k < vocab_size && !has_nan; k++)
+                        if (!isfinite(raw[k])) has_nan = true;
+                    if (has_nan) {
+                        const float unif = 1.0f / (float)vocab_size;
+                        for (int k = 0; k < vocab_size; k++) probs[k] = unif;
+                    } else {
+                        float mx = raw[0];
+                        for (int k = 1; k < vocab_size; k++) if (raw[k] > mx) mx = raw[k];
+                        float sum = 0.0f;
+                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(raw[k] - mx); sum += probs[k]; }
+                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                    }
+
+                    const uint16_t tok = tokens[data_off];
+                    write_sym(&encoders[s], probs, vocab_size, (int)tok);
+                    if (g_online_trainer)
+                        seg_targets[s * SEG_LEN + t] = (int32_t)tok;
+                }
+            }
+
+            if (g_online_trainer && !getenv("NNCP_NO_TRAIN")) {
+                online_trainer_train_segment_batch(g_online_trainer,
+                    seg_tokens, seg_targets, NUM_STREAMS, SEG_LEN);
+            }
+
+            block_idx += SEG_LEN;
+
+            double pct = (double)(file_pos + block_idx) / (double)stride * 100.0;
+            if (pct > 100.0) pct = 100.0;
+            printf("\rcompress %.1f%%", pct);
+            fflush(stdout);
+        }
+        file_pos += block_tokens;
+    }
+    (void)total_blocks;
+
+    free(seg_logits); free(probs); free(seg_tokens); free(seg_targets);
+
+    *(uint32_t *)(output_data + 0)              = (uint32_t)NUM_STREAMS;
+    *(uint32_t *)(output_data + sizeof(uint32_t)) = (uint32_t)n_tokens;
+    uint32_t *size_table = (uint32_t *)(output_data + 2 * sizeof(uint32_t));
+    size_t cur_out = 2 * sizeof(uint32_t) + sizeof(uint32_t) * NUM_STREAMS;
+
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        int64_t s_size = put_bit_flush(&encoders[s]);
+        if (cur_out + (size_t)s_size > output_cap) {
+            printf("Error: output buffer too small\n");
+            for (int i = s; i < NUM_STREAMS; i++) free(stream_bufs[i]);
+            return 0;
+        }
+        size_table[s] = (uint32_t)s_size;
+        memcpy(output_data + cur_out, stream_bufs[s], (size_t)s_size);
+        cur_out += (size_t)s_size;
+        free(stream_bufs[s]);
+    }
+
+    printf("\rcompress %zu tokens -> %zu bytes (%.1f%%)\n",
+           n_tokens, cur_out, (double)cur_out / (double)n_tokens * 50.0);
+    return cur_out;
+}
+
+size_t neural_bridge_decompress_symbols(
+    const uint8_t *input_data, size_t input_size,
+    uint16_t *tokens_out, size_t max_tokens,
+    int vocab_size)
+{
+    if (!input_data || !tokens_out || input_size == 0) return 0;
+
+    reset_model_to_session_weights(get_shared_transformer_model());
+
+    if (input_size < 2 * sizeof(uint32_t)) return 0;
+    uint32_t file_num_streams  = *(const uint32_t *)(input_data + 0);
+    uint32_t embedded_n_tokens = *(const uint32_t *)(input_data + sizeof(uint32_t));
+    if (file_num_streams == 0 || file_num_streams > 1024) return 0;
+    if (embedded_n_tokens == 0 || embedded_n_tokens > (uint32_t)max_tokens) return 0;
+
+    size_t n_tokens = embedded_n_tokens;
+    size_t header_bytes = 2 * sizeof(uint32_t) + sizeof(uint32_t) * file_num_streams;
+    if (input_size < header_bytes) return 0;
+    const uint32_t *size_table = (const uint32_t *)(input_data + 2 * sizeof(uint32_t));
+    size_t cur_in = header_bytes;
+
+    GetBitState *decoders      = (GetBitState *)malloc(file_num_streams * sizeof(GetBitState));
+    size_t *stream_limits      = (size_t *)malloc(file_num_streams * sizeof(size_t));
+    size_t *decoded_counts     = (size_t *)calloc(file_num_streams, sizeof(size_t));
+    if (!decoders || !stream_limits || !decoded_counts) {
+        free(decoders); free(stream_limits); free(decoded_counts); return 0;
+    }
+
+    const size_t stride = (n_tokens + file_num_streams - 1) / file_num_streams;
+    for (uint32_t i = 0; i < file_num_streams; i++) {
+        get_bit_init(&decoders[i], (uint8_t *)(input_data + cur_in), size_table[i]);
+        cur_in += size_table[i];
+        const size_t off = (size_t)i * stride;
+        stream_limits[i] = (off >= n_tokens) ? 0
+                         : ((off + stride > n_tokens) ? n_tokens - off : stride);
+    }
+
+    MPSTransformerContext *mps_ctx = get_shared_mps_ctx();
+    if (!mps_ctx) { free(decoders); free(stream_limits); free(decoded_counts); return 0; }
+
+    if (!g_online_trainer) {
+        g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
+                                                  mps_ctx,
+                                                  (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
+                                                  n_tokens);
+    }
+    if (g_online_trainer) online_trainer_reset_session(g_online_trainer, false);
+    mps_transformer_reset_kv_cache(mps_ctx);
+
+    /* Autoregressive decoding: one forward pass per TOKEN POSITION (seq_len=1).
+     * Mirrors neural_bridge_cuda_lossless_decompress exactly, using uint16_t output. */
+    float   *seg_logits      = (float *)  malloc((size_t)file_num_streams * vocab_size * sizeof(float));
+    float   *probs           = (float *)  malloc((size_t)vocab_size * sizeof(float));
+    int32_t *one_tok         = (int32_t *)calloc((size_t)file_num_streams, sizeof(int32_t));
+    int32_t *last_decoded    = (int32_t *)calloc((size_t)file_num_streams, sizeof(int32_t));
+    int32_t *dec_seg_inputs  = (int32_t *)calloc((size_t)file_num_streams * SEG_LEN, sizeof(int32_t));
+    int32_t *dec_seg_targets = (int32_t *)calloc((size_t)file_num_streams * SEG_LEN, sizeof(int32_t));
+    if (!seg_logits || !probs || !one_tok || !last_decoded ||
+        !dec_seg_inputs || !dec_seg_targets) {
+        free(seg_logits); free(probs); free(one_tok); free(last_decoded);
+        free(dec_seg_inputs); free(dec_seg_targets);
+        free(decoders); free(stream_limits); free(decoded_counts); return 0;
+    }
+
+    size_t total_decoded = 0;
+    size_t file_pos      = 0;
+
+    while (file_pos < stride) {
+        const size_t block_tokens = ((stride - file_pos) < (size_t)BLOCK_LEN)
+                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        mps_transformer_reset_kv_cache(mps_ctx);
+
+        size_t block_idx = 0;
+        while (block_idx < block_tokens) {
+            if (g_online_trainer) online_trainer_latch_kv_memory(g_online_trainer);
+
+            /* Token-level loop within segment (autoregressive) */
+            for (int t = 0; t < SEG_LEN; t++) {
+                const size_t abs_pos = file_pos + block_idx + (size_t)t;
+                if (abs_pos >= file_pos + block_tokens) break;
+
+                bool seg_active = false;
+                for (uint32_t s = 0; s < file_num_streams; s++)
+                    if (decoded_counts[s] < stream_limits[s]) { seg_active = true; break; }
+                if (!seg_active) goto sym_done;
+
+                /* Input: last decoded token per stream (or BOS=0 at stream start) */
+                for (uint32_t s = 0; s < file_num_streams; s++) {
+                    const size_t out_off = (size_t)s * stride + abs_pos;
+                    one_tok[s] = (abs_pos > 0 && out_off > (size_t)s * stride)
+                                 ? last_decoded[s] : 0;
+                }
+
+                /* seq_len=1 forward pass */
+                mps_transformer_execute_segment(mps_ctx, one_tok,
+                                                (int)file_num_streams, 1, seg_logits);
+
+                for (uint32_t s = 0; s < file_num_streams; s++) {
+                    if (g_online_trainer && t < SEG_LEN)
+                        dec_seg_inputs[s * SEG_LEN + t] = one_tok[s];
+
+                    if (decoded_counts[s] >= stream_limits[s]) continue;
+
+                    const size_t out_off = (size_t)s * stride + abs_pos;
+                    if (out_off >= n_tokens) continue;
+
+                    float *raw = seg_logits + (size_t)s * vocab_size;
+                    bool has_nan = false;
+                    for (int k = 0; k < vocab_size && !has_nan; k++)
+                        if (!isfinite(raw[k])) has_nan = true;
+                    if (has_nan) {
+                        const float unif = 1.0f / (float)vocab_size;
+                        for (int k = 0; k < vocab_size; k++) probs[k] = unif;
+                    } else {
+                        float mx = raw[0];
+                        for (int k = 1; k < vocab_size; k++) if (raw[k] > mx) mx = raw[k];
+                        float sum = 0.0f;
+                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(raw[k] - mx); sum += probs[k]; }
+                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                    }
+
+                    int sym = read_sym(&decoders[s], probs, vocab_size);
+                    if (sym < 0) { decoded_counts[s] = stream_limits[s]; continue; }
+                    if (sym >= vocab_size) sym = 0;
+
+                    tokens_out[out_off] = (uint16_t)sym;
+                    decoded_counts[s]++;
+                    total_decoded++;
+
+                    if (g_online_trainer && t < SEG_LEN)
+                        dec_seg_targets[s * SEG_LEN + t] = (int32_t)sym;
+
+                    last_decoded[s] = (int32_t)sym;
+                }
+            }
+
+            /* Segment-level training (mirrors compress) */
+            if (g_online_trainer && !getenv("NNCP_NO_TRAIN"))
+                online_trainer_train_segment_batch(g_online_trainer,
+                    dec_seg_inputs, dec_seg_targets, (int)file_num_streams, SEG_LEN);
+
+            block_idx += SEG_LEN;
+
+            double pct = (double)(file_pos + block_idx) / (double)stride * 100.0;
+            if (pct > 100.0) pct = 100.0;
+            fprintf(stderr, "\rdecompress %.1f%%", pct);
+            fflush(stderr);
+        }
+        file_pos += block_tokens;
+    }
+
+sym_done:
+    free(seg_logits); free(probs); free(one_tok); free(last_decoded);
+    free(dec_seg_inputs); free(dec_seg_targets);
+    free(decoders); free(stream_limits); free(decoded_counts);
+
+    fprintf(stderr, "\rdecompress %zu tokens\n", total_decoded);
+    return total_decoded;
+}
+
 // Metal Transformer Model Implementation
 
 // Helper function to create Metal compute pipeline state
@@ -1774,10 +2108,10 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
         (float*)model->attention_output_weights.contents,
         (size_t)L * H * H, INIT_SCALE, 46u);
 
-    // FFN weights (seeds 47-48)
+    // FFN weights (seeds 47-48); ffn_weights_1 is 2x for GeGLU (value + gate)
     nn_weights_init_uniform(
         (float*)model->ffn_weights_1.contents,
-        (size_t)L * H * FFS, INIT_SCALE, 47u);
+        (size_t)L * H * FFS * 2, INIT_SCALE, 47u);
     const float ff2_scale = INIT_SCALE * sqrtf((float)H / (float)FFS);  // ≈ 0.0442
     nn_weights_init_uniform(
         (float*)model->ffn_weights_2.contents,
@@ -1787,6 +2121,12 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
     nn_weights_init_layer_norm(
         (float*)model->layer_norm_weights.contents, H, L);
 
+    // LN_FINAL: gamma=1, beta=0
+    if (model->ln_final) {
+        float* p = (float*)[model->ln_final contents];
+        for (size_t i = 0; i < H; i++) { p[i] = 1.0f; p[H + i] = 0.0f; }
+    }
+
     // Output projection (seed 49)
     nn_weights_init_uniform(
         (float*)model->output_projection.contents,
@@ -1794,12 +2134,13 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
 
     // Relative PE: w_rel_r ~ U(±0.0625) seed 50; b_rel_r = 0
     {
-        const uint32_t NH_ = model->num_attention_heads; /* 8  */
-        const uint32_t HD_ = H / NH_;                   /* 32 */
+        const uint32_t NH_ = model->num_attention_heads;
+        const uint32_t HD_ = H / NH_;
+        const size_t   DP_ = NNCP_D_POS();
         nn_weights_init_uniform(
             (float*)model->rel_r.contents,
-            (size_t)NH_ * HD_ * 64, INIT_SCALE, 50u);   /* [NH, HD, D_POS=64] */
-        memset([model->b_rel_r contents], 0, (size_t)NH_ * 64 * sizeof(float)); /* [NH, total_len=64] */
+            (size_t)NH_ * HD_ * DP_, INIT_SCALE, 50u);  /* [NH, HD, D_POS] */
+        memset([model->b_rel_r contents], 0, (size_t)NH_ * DP_ * sizeof(float)); /* [NH, D_POS] */
     }
 
 }
@@ -1818,16 +2159,16 @@ static MetalTransformerModel* create_transformer_model(void) {
         return NULL;
     }
     
-    // Initialize model parameters (CUDA-compatible configuration)
+    // Initialize model parameters from runtime profile
     model->device = device;
     model->command_queue = [device newCommandQueue];
-    model->context_length = 1024 * 64; // Max context for batched streams (1024 streams * 64 seq)
-    model->vocab_size = 256;         // Byte vocabulary
-    model->hidden_size          = 256;
-    model->num_attention_heads  = 8;
-    model->num_layers           = 4;
-    model->feed_forward_size    = 512;
-    model->max_sequence_length = MEM_LEN;
+    model->context_length = 1024 * 64;
+    model->vocab_size           = (g_vocab_size_override > 0) ? (uint32_t)g_vocab_size_override : 256;
+    model->hidden_size          = (uint32_t)g_nncp_profile.h;
+    model->num_attention_heads  = (uint32_t)g_nncp_profile.nh;
+    model->num_layers           = (uint32_t)g_nncp_profile.l;
+    model->feed_forward_size    = (uint32_t)g_nncp_profile.f;
+    model->max_sequence_length  = (uint32_t)g_nncp_profile.mem_len;
     
     // Allocate weight buffers
     model->embedding_weights = [device newBufferWithLength:model->vocab_size * model->hidden_size * sizeof(float)
@@ -1842,8 +2183,8 @@ static MetalTransformerModel* create_transformer_model(void) {
                                                      options:MTLResourceStorageModeShared];
     model->attention_output_weights = [device newBufferWithLength:model->num_layers * model->hidden_size * model->hidden_size * sizeof(float)
                                                           options:MTLResourceStorageModeShared];
-    // GELU FFN projects hidden → feed_forward_size (no gate split)
-    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * sizeof(float)
+    // GeGLU FFN: FFN1 projects hidden → 2*feed_forward_size (first half=value, second half=gate)
+    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * 2 * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
     model->ffn_weights_2 = [device newBufferWithLength:model->num_layers * model->feed_forward_size * model->hidden_size * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
@@ -1859,19 +2200,25 @@ static MetalTransformerModel* create_transformer_model(void) {
         model->bias_k    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_v    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_o    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
-        model->bias_ffn1 = [device newBufferWithLength:L * F * sizeof(float) options:opts];
+        model->bias_ffn1 = [device newBufferWithLength:L * 2 * F * sizeof(float) options:opts];
         model->bias_ffn2 = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_out  = [device newBufferWithLength:V     * sizeof(float) options:opts];
-        const size_t NH_ = model->num_attention_heads; /* 8  */
-        const size_t HD_ = H / NH_;                    /* 32 */
-        model->rel_r   = [device newBufferWithLength:NH_ * HD_ * 64 * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
-        model->b_rel_r = [device newBufferWithLength:NH_ * 64        * sizeof(float) options:opts]; /* [NH,total_len] */
-        if (model->rel_r)   memset([model->rel_r   contents], 0, NH_ * HD_ * 64 * sizeof(float));
-        if (model->b_rel_r) memset([model->b_rel_r contents], 0, NH_ * 64        * sizeof(float));
+        const size_t NH_ = model->num_attention_heads;
+        const size_t HD_ = H / NH_;
+        const size_t DP_ = NNCP_D_POS();  /* MEM_LEN*2 or MEM_LEN+SEG_LEN, =64 for default */
+        model->rel_r   = [device newBufferWithLength:NH_ * HD_ * DP_ * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
+        model->b_rel_r = [device newBufferWithLength:NH_ * DP_       * sizeof(float) options:opts]; /* [NH,D_POS] */
+        if (model->rel_r)   memset([model->rel_r   contents], 0, NH_ * HD_ * DP_ * sizeof(float));
+        if (model->b_rel_r) memset([model->b_rel_r contents], 0, NH_ * DP_       * sizeof(float));
+        model->ln_final = [device newBufferWithLength:2 * H * sizeof(float) options:opts]; /* [2,H] */
+        if (model->ln_final) {
+            float* p = (float*)[model->ln_final contents];
+            for (size_t i = 0; i < H; i++) { p[i] = 1.0f; p[H + i] = 0.0f; } /* gamma=1, beta=0 */
+        }
         if (model->bias_k)    memset([model->bias_k    contents], 0, L * H * sizeof(float));
         if (model->bias_v)    memset([model->bias_v    contents], 0, L * H * sizeof(float));
         if (model->bias_o)    memset([model->bias_o    contents], 0, L * H * sizeof(float));
-        if (model->bias_ffn1) memset([model->bias_ffn1 contents], 0, L * F * sizeof(float));
+        if (model->bias_ffn1) memset([model->bias_ffn1 contents], 0, L * 2 * F * sizeof(float));
         if (model->bias_ffn2) memset([model->bias_ffn2 contents], 0, L * H * sizeof(float));
         if (model->bias_out)  memset([model->bias_out  contents], 0, V     * sizeof(float));
     }
@@ -1901,7 +2248,7 @@ static MetalTransformerModel* create_transformer_model(void) {
         !model->layer_norm_weights || !model->output_projection ||
         !model->bias_k || !model->bias_v || !model->bias_o ||
         !model->bias_ffn1 || !model->bias_ffn2 || !model->bias_out ||
-        !model->rel_r || !model->b_rel_r ||
+        !model->rel_r || !model->b_rel_r || !model->ln_final ||
         !model->context_buffer || !model->embedded_buffer || !model->attention_buffer ||
         !model->ffn_buffer || !model->logits_buffer ||
         !model->embedding_pipeline || !model->attention_pipeline || !model->ffn_pipeline || !model->output_pipeline) {

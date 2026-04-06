@@ -286,6 +286,68 @@ size_t neural_bridge_lossless_decompress(
 /** Global LR override set by --lr CLI flag. 0.0 = use default (1e-4). */
 extern float g_lr_override;
 
+/**
+ * @brief Global vocab-size override for preprocessing mode.
+ * Set to 256+n_words BEFORE the first call to compress/decompress.
+ * 0 = use default (256).
+ */
+extern int g_vocab_size_override;
+
+/**
+ * @brief Runtime model profile: all parameters must be set BEFORE the first
+ *        call to compress/decompress (i.e., before model/graph creation).
+ *        Default values match the original NNCP "default" profile.
+ */
+typedef struct {
+    int h;           /* hidden_size           (default: 256)  */
+    int l;           /* num_layers            (default:   4)  */
+    int f;           /* feed_forward_size     (default: 512)  */
+    int nh;          /* num_attention_heads   (default:   8)  */
+    int mem_len;     /* MEM_LEN / kv_memory_len (default: 32) */
+    int num_streams; /* NUM_STREAMS           (default:  16)  */
+    int seg_len;     /* SEG_LEN               (default:  32)  */
+} NNCPProfileConfig;
+
+extern NNCPProfileConfig g_nncp_profile;
+
+/**
+ * @brief Compress uint16_t token stream (preprocessing mode).
+ *
+ * tokens      : symbol stream (values 0..vocab_size-1)
+ * n_tokens    : number of tokens
+ * output_data : caller-allocated output buffer
+ * output_cap  : capacity of output_data
+ * vocab_size  : effective vocabulary size (must match model creation)
+ * total_input_bytes : original raw file size (for LR schedule)
+ *
+ * Returns compressed byte count, or 0 on error.
+ */
+size_t neural_bridge_compress_symbols(
+    const uint16_t *tokens,
+    size_t          n_tokens,
+    uint8_t        *output_data,
+    size_t          output_cap,
+    int             vocab_size,
+    size_t          total_input_bytes);
+
+/**
+ * @brief Decompress to uint16_t token stream (preprocessing mode).
+ *
+ * input_data  : compressed bytes
+ * input_size  : size of input_data
+ * tokens_out  : caller-allocated uint16_t buffer (capacity = max_tokens)
+ * max_tokens  : capacity of tokens_out in symbols
+ * vocab_size  : effective vocabulary size (must match compression)
+ *
+ * Returns number of tokens written, or 0 on error.
+ */
+size_t neural_bridge_decompress_symbols(
+    const uint8_t  *input_data,
+    size_t          input_size,
+    uint16_t       *tokens_out,
+    size_t          max_tokens,
+    int             vocab_size);
+
 #ifdef __cplusplus
 }
 #endif
