@@ -196,6 +196,7 @@ static void apply_profile(int profile_id) {
         g_nncp_profile.mem_len     = 256;
         g_nncp_profile.num_streams = 32;
         g_nncp_profile.seg_len     = 64;
+        g_nncp_profile.d_pos       = 320;
     } else {
         g_nncp_profile.h           = 256;
         g_nncp_profile.l           = 4;
@@ -204,6 +205,7 @@ static void apply_profile(int profile_id) {
         g_nncp_profile.mem_len     = 32;
         g_nncp_profile.num_streams = 16;
         g_nncp_profile.seg_len     = 32;
+        g_nncp_profile.d_pos       = 64;  // max(mem_len*2, mem_len+seg_len) = 64
     }
 }
 

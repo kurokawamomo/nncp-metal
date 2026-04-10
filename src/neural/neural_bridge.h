@@ -303,9 +303,10 @@ typedef struct {
     int l;           /* num_layers            (default:   4)  */
     int f;           /* feed_forward_size     (default: 512)  */
     int nh;          /* num_attention_heads   (default:   8)  */
-    int mem_len;     /* MEM_LEN / kv_memory_len (default: 32) */
+    int mem_len;     /* MEM_LEN / kv_memory_len (default: 32)  */
     int num_streams; /* NUM_STREAMS           (default:  16)  */
     int seg_len;     /* SEG_LEN               (default:  32)  */
+    int d_pos;       /* rel-PE dim for W_rel_r (default: 32, enwik8: 320) */
 } NNCPProfileConfig;
 
 extern NNCPProfileConfig g_nncp_profile;

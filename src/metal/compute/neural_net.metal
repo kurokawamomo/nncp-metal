@@ -215,6 +215,17 @@ kernel void transformer_geglu(
     output[gid.y * inter_dim + gid.x] = gelu(val) * gate;
 }
 
+// 5b. GELU (standard, no gate): element-wise in-place
+// Used for default profile (Post-LN + GELU, no gate split)
+kernel void transformer_gelu(
+    device float* data [[buffer(0)]],
+    constant uint& n   [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    data[gid] = gelu(data[gid]);
+}
+
 // 6b. KV Cache Write (float32 → float16 half-precision cache)
 // Converts and copies `length` floats from src into half-precision cache.
 // batch_offset is in half-element units.
@@ -269,8 +280,9 @@ kernel void transformer_attention_decode_cached(
     constant float&     scale      [[buffer(9)]],
     device const float* W_rel_r    [[buffer(10)]],   // [NH, HD, D_POS]
     device const float* B_rel_r    [[buffer(11)]],   // [NH, total_len]
-    constant uint&      d_pos      [[buffer(12)]],
-    constant uint&      total_len  [[buffer(13)]],
+    constant uint&      d_pos          [[buffer(12)]],
+    constant uint&      total_len      [[buffer(13)]],
+    constant float&     b_rel_r_scale  [[buffer(14)]],
     uint2 gid  [[thread_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]
 ) {
@@ -302,7 +314,7 @@ kernel void transformer_attention_decode_cached(
             partial_dot += Q[q_base + d] * (float)K_cache[k_base + d];
         float dot = simd_sum(partial_dot) * scale;
 
-        dot += q_rel_k * scale + B_rel_r[h * total_len + dist] * 16.0f;
+        dot += q_rel_k * scale + B_rel_r[h * total_len + dist] * b_rel_r_scale;
         dot = clamp(dot, -50.0f, 50.0f);
         if (lane == 0) scores_tmp[score_base + k] = dot;
         if (dot > max_score) max_score = dot;
@@ -385,12 +397,14 @@ kernel void rmsprop_update(
     constant float&     beta2  [[buffer(4)]],
     constant float&     eps    [[buffer(5)]],
     constant float&     bc     [[buffer(6)]],
+    constant float&     wd     [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     float g  = grad[gid];
     float vi = beta2 * v[gid] + (1.0f - beta2) * g * g;
     v[gid]   = vi;
-    weight[gid] -= lr * g / (sqrt(vi * bc) + eps);
+    float w  = weight[gid] * (1.0f - lr * wd);
+    weight[gid] = w - lr * g / (sqrt(vi * bc) + eps);
 }
 
 // 6. Element-wise Add (Residual Connection)

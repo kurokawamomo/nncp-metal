@@ -12,6 +12,7 @@
 #import "mps_transformer_graph.h"
 #import <Foundation/Foundation.h>
 #include <vector>
+#include "neural_bridge.h"  // g_nncp_profile for d_pos and embed_scale
 
 // ---------------------------------------------------------------------------
 // Context
@@ -45,8 +46,9 @@ struct MPSTransformerContext {
     id<MTLBuffer> w_b_ffn1;  // [L, F]
     id<MTLBuffer> w_b_ffn2;  // [L, H]
     id<MTLBuffer> w_b_out;   // [V]
-    id<MTLBuffer> w_rel_r;   /* [NH, HD, D_POS] tied rel PE */
-    id<MTLBuffer> b_rel_r;   /* [NH, total_len] tied rel PE bias */
+    id<MTLBuffer> w_rel_r;     /* default=[NH,HD,D_POS] tied / enwik8=nil (per-layer を使用) */
+    id<MTLBuffer> w_rel_r_all; /* enwik8 only: [L, NH, HD, D_POS] per-layer w_r */
+    id<MTLBuffer> b_rel_r;     /* [NH, total_len] tied rel PE bias */
 
     NSMutableDictionary<NSString*, MPSGraphTensorData*>* weightCache;
     NSMutableDictionary<NSString*, MPSGraphExecutable*>* executableCache;
@@ -64,6 +66,7 @@ struct MPSTransformerContext {
     id<MTLComputePipelineState> ps_attn_score;
     id<MTLComputePipelineState> ps_attn_value;
     id<MTLComputePipelineState> ps_geglu;
+    id<MTLComputePipelineState> ps_gelu;     // element-wise GELU (default profile)
     id<MTLComputePipelineState> ps_element_add;
     id<MTLComputePipelineState> ps_element_scale;
 
@@ -119,6 +122,7 @@ struct MPSTransformerContext {
 
     // ---- MPSGraph batched decode (large profiles: L > 8) ----
     bool             mgd_ready;
+    bool             mgd_skipped;  // per-layer w_rel_r not supported → skip MGD permanently
     uint32_t         mgd_batch_size;
     MPSGraph*        mgd_graph;
     MPSGraphExecutable* mgd_exec;
@@ -144,6 +148,29 @@ struct MPSTransformerContext {
     // Per-layer KV cache view buffers (newBufferWithBytesNoCopy into kv_cache_k/v)
     NSMutableArray<id<MTLBuffer>>* mgd_kv_k_views;
     NSMutableArray<id<MTLBuffer>>* mgd_kv_v_views;
+
+    // ---- Segment Prefill Graph (causal forward for full [B, T] segment) ----
+    bool             spf_ready;
+    bool             spf_skipped;
+    uint32_t         spf_batch_size;    // B = n_streams
+    uint32_t         spf_seg_len;       // T = seg_len
+    MPSGraph*        spf_graph;
+    MPSGraphExecutable* spf_exec;
+    // Input placeholders
+    MPSGraphTensor*  spf_ph_tokens;     // [B*T] int32
+    MPSGraphTensor*  spf_ph_pos_start;  // [] int32 scalar
+    NSMutableArray<MPSGraphTensor*>* spf_ph_mem_k; // [L] each [B*MEM*H] fp16
+    NSMutableArray<MPSGraphTensor*>* spf_ph_mem_v;
+    NSMutableDictionary<NSString*, MPSGraphTensor*>* spf_weight_ph;
+    MPSGraphTensor*  spf_w_rel_r;       // [L,NH,HD,D_POS] or [NH,HD,D_POS]
+    MPSGraphTensor*  spf_b_rel_r;       // [NH, EXT]
+    // Outputs
+    MPSGraphTensor*  spf_out_logits;    // [B*T, V]
+    NSMutableArray<MPSGraphTensor*>* spf_out_new_k; // [L] each [B*T*H] fp16
+    NSMutableArray<MPSGraphTensor*>* spf_out_new_v;
+    // Scratch Metal buffers
+    id<MTLBuffer>    spf_token_mtl;     // [B*T] int32
+    id<MTLBuffer>    spf_pos_mtl;       // [] int32 scalar
 };
 
 // ---------------------------------------------------------------------------
@@ -227,7 +254,8 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
     cacheWeight(@"w_k",        ctx->w_attn_k,   @[@(L), @(H), @(H)]);
     cacheWeight(@"w_v",        ctx->w_attn_v,   @[@(L), @(H), @(H)]);
     cacheWeight(@"w_o",        ctx->w_attn_out, @[@(L), @(H), @(H)]);
-    cacheWeight(@"w_ffn1",     ctx->w_ffn_1,    @[@(L), @(H), @(2u*FFN)]);
+    const uint32_t ffn1_w_out = (g_nncp_profile.h == 1024) ? 2u * FFN : FFN;
+    cacheWeight(@"w_ffn1",     ctx->w_ffn_1,    @[@(L), @(H), @(ffn1_w_out)]);
     cacheWeight(@"w_ffn2",     ctx->w_ffn_2,    @[@(L), @(FFN), @(H)]);
     cacheWeight(@"w_ln",       ctx->w_ln,       @[@(L), @(4), @(H)]);
     cacheWeight(@"w_ln_final", ctx->w_ln_final, @[@(2), @(H)]);
@@ -235,7 +263,7 @@ bool mps_transformer_set_weights(MPSTransformerContext* ctx,
     cacheWeight(@"b_k",        ctx->w_b_k,      @[@(L), @(H)]);
     cacheWeight(@"b_v",        ctx->w_b_v,      @[@(L), @(H)]);
     cacheWeight(@"b_o",        ctx->w_b_o,      @[@(L), @(H)]);
-    cacheWeight(@"b_ffn1",     ctx->w_b_ffn1,   @[@(L), @(2u*FFN)]);
+    cacheWeight(@"b_ffn1",     ctx->w_b_ffn1,   @[@(L), @(ffn1_w_out)]);
     cacheWeight(@"b_ffn2",     ctx->w_b_ffn2,   @[@(L), @(H)]);
     cacheWeight(@"b_out",      ctx->w_b_out,    @[@(V)]);
 
@@ -286,10 +314,16 @@ bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,
     out->b_ffn1    = ctx->w_b_ffn1;
     out->b_ffn2    = ctx->w_b_ffn2;
     out->b_out     = ctx->w_b_out;
-    out->w_rel_r   = ctx->w_rel_r;
-    out->b_rel_r   = ctx->b_rel_r;
+    out->w_rel_r     = ctx->w_rel_r;
+    out->w_rel_r_all = ctx->w_rel_r_all;
+    out->b_rel_r     = ctx->b_rel_r;
+
     out->ln_final  = ctx->w_ln_final;
     return true;
+}
+
+void mps_transformer_set_relr_all(MPSTransformerContext* ctx, id<MTLBuffer> w_rel_r_all) {
+    if (ctx) ctx->w_rel_r_all = w_rel_r_all;
 }
 
 bool mps_transformer_get_kv_cache_buffers(MPSTransformerContext* ctx,
@@ -451,6 +485,7 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_attn_score          = makePSO(@"transformer_attention_score");
     ctx->ps_attn_value          = makePSO(@"transformer_attention_value");
     ctx->ps_geglu               = makePSO(@"transformer_geglu");
+    ctx->ps_gelu                = makePSO(@"transformer_gelu");
     ctx->ps_element_add         = makePSO(@"element_add");
     ctx->ps_element_scale       = makePSO(@"element_scale");
     ctx->ps_kv_cache_write       = makePSO(@"kv_cache_write");
@@ -459,7 +494,7 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_kv_memory_shift      = makePSO(@"kv_memory_shift");
 
     if (!ctx->ps_embedding   || !ctx->ps_layer_norm || !ctx->ps_linear              ||
-        !ctx->ps_attn_score  || !ctx->ps_attn_value || !ctx->ps_geglu               ||
+        !ctx->ps_attn_score  || !ctx->ps_attn_value || !ctx->ps_geglu || !ctx->ps_gelu ||
         !ctx->ps_element_add || !ctx->ps_element_scale || !ctx->ps_kv_cache_write   ||
         !ctx->ps_kv_cache_write_batch || !ctx->ps_attn_decode_cached ||
         !ctx->ps_kv_memory_shift) {
@@ -501,18 +536,19 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->dec_buf_attn_proj= newBuf(batch_size * H   * sizeof(float));
     ctx->dec_buf_x_mid    = newBuf(batch_size * H   * sizeof(float));
     ctx->dec_buf_ln2      = newBuf(batch_size * H   * sizeof(float));
-    ctx->dec_buf_ffn1     = newBuf(batch_size * 2u * FFN * sizeof(float));
+    const uint32_t ffn1_buf_out = (g_nncp_profile.h == 1024) ? 2u * FFN : FFN;
+    ctx->dec_buf_ffn1     = newBuf(batch_size * ffn1_buf_out * sizeof(float));
     ctx->dec_buf_geglu    = newBuf(batch_size * FFN * sizeof(float));
     ctx->dec_buf_ffn2     = newBuf(batch_size * H   * sizeof(float));
     ctx->dec_buf_logits   = newBuf(batch_size * V   * sizeof(float));
 
     // Zero bias buffers — broadcast across batch, not batch-dependent
     ctx->dec_zero_H    = newBuf(H       * sizeof(float));
-    ctx->dec_zero_FFN2 = newBuf(2u * FFN * sizeof(float));
-    ctx->dec_zero_V    = newBuf(V         * sizeof(float));
+    ctx->dec_zero_FFN2 = newBuf(ffn1_buf_out * sizeof(float));
+    ctx->dec_zero_V    = newBuf(V            * sizeof(float));
 
-    memset([ctx->dec_zero_H    contents], 0, H           * sizeof(float));
-    memset([ctx->dec_zero_FFN2 contents], 0, 2u * FFN    * sizeof(float));
+    memset([ctx->dec_zero_H    contents], 0, H              * sizeof(float));
+    memset([ctx->dec_zero_FFN2 contents], 0, ffn1_buf_out   * sizeof(float));
     memset([ctx->dec_zero_V    contents], 0, V       * sizeof(float));
 
     ctx->decode_pipeline_ready = true;
@@ -565,6 +601,8 @@ static inline uint16_t fp32_to_fp16_bits(float x) {
 
 static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
     if (!ctx || !ctx->kv_cache_valid) return;
+    // MGD graph uses shared w_rel_r; enwik8 per-layer w_rel_r_all is not supported
+    if (ctx->w_rel_r_all && !ctx->w_rel_r) { ctx->mgd_skipped = true; return; }
 
     const uint32_t H   = ctx->config.hidden_size;
     const uint32_t V   = ctx->config.vocab_size;
@@ -681,7 +719,7 @@ static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
     MPSGraphTensor* x = [graph gatherWithUpdatesTensor:w_embed_t
                                          indicesTensor:ph_tokens
                                                   axis:0 batchDimensions:0 name:nil];
-    x = [graph multiplicationWithPrimaryTensor:x secondaryTensor:C(16.0f) name:nil];
+    x = [graph multiplicationWithPrimaryTensor:x secondaryTensor:C(sqrtf((float)H)) name:nil];
 
     // ---- Shared broadcast shapes for KV insertion ----
     // pmask_3d: [1, TL, 1]  (broadcasts over [B, TL, H])
@@ -948,7 +986,14 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
         bdist[t] = d;
     }
 
-    // ---- Build execution feeds (tensor keys — required on macOS 15+) ----
+    // ---- Build execution feeds, run, and write back KV (all in one pool) ----
+    // @autoreleasepool is critical: MPSGraphExecutable runWithMTLCommandQueue creates
+    // many internally autoreleased Metal/MPSGraph objects per call. Without draining,
+    // they accumulate across the 64-token decode loop for enwik8 → memory leak.
+    __block bool exec_ok = false;
+    std::vector<float> kv_row((size_t)B * H);
+
+    @autoreleasepool {
     NSMutableDictionary* rfeeds = [NSMutableDictionary dictionary];
 
     auto makeTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape, MPSDataType dt) {
@@ -987,13 +1032,12 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
                    inputsArray:inputsArray
                   resultsArray:nil
            executionDescriptor:nil];
-    if (!outputs) return false;
+    if (!outputs) { return false; }
 
     // ---- Read logits (index 0) ----
     [(MPSGraphTensorData*)outputs[0] .mpsndarray readBytes:output_data strideBytes:NULL];
 
     // ---- KV writeback: fp32 → fp16 at kv_pos (per-layer) ----
-    std::vector<float> kv_row((size_t)B * H);
     uint16_t* kv_k_base = (uint16_t*)[ctx->kv_cache_k contents];
     uint16_t* kv_v_base = (uint16_t*)[ctx->kv_cache_v contents];
     for (uint32_t l = 0; l < L; l++) {
@@ -1011,6 +1055,10 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
             for (uint32_t h = 0; h < H; h++) dst[h] = fp32_to_fp16_bits(src[h]);
         }
     }
+    exec_ok = true;
+    } // @autoreleasepool: releases rfeeds, inputsArray, outputs, all MPSGraphTensorData
+
+    if (!exec_ok) return false;
 
     // ---- Advance KV position (Transformer-XL shift if full) ----
     if (ctx->kv_cache_pos + 1 >= (NSUInteger)ctx->kv_total_len) {
@@ -1057,7 +1105,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     }
 
     // Route large profiles (L > 8, e.g. enwik8) to MPSGraph batched decode.
-    if (ctx->config.num_layers > 8) {
+    if (ctx->config.num_layers > 8 && !ctx->mgd_skipped) {
         if (!ctx->mgd_ready)
             build_mgd_graph(ctx, batch_size);
         if (ctx->mgd_ready)
@@ -1102,10 +1150,10 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // Embedding scale ×16 (= sqrt(d_model=256) per original NNCP)
+    // Embedding scale ×sqrt(d_model) per original NNCP
     {
         uint32_t embed_size = batch_size * H;
-        float embed_scale = 16.0f;
+        float embed_scale = sqrtf((float)H);
         [enc setComputePipelineState:ctx->ps_element_scale];
         [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:0];
         [enc setBytes:&embed_scale length:sizeof(float) atIndex:1];
@@ -1122,14 +1170,17 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     // ------------------------------------------------------------------
     // Transformer layers
     // ------------------------------------------------------------------
+    const bool use_post_ln = (g_nncp_profile.h != 1024);  // default: Post-LN; enwik8: Pre-LN
+    const uint32_t ffn1_dec_out = (g_nncp_profile.h == 1024) ? 2u * FFN : FFN;
+
     for (uint32_t layer = 0; layer < L; layer++) {
 
-        const NSUInteger off_HH    = (NSUInteger)layer * H   * H   * sizeof(float);
-        const NSUInteger off_FFN1  = (NSUInteger)layer * H   * (2u*FFN) * sizeof(float);
-        const NSUInteger off_FFN2  = (NSUInteger)layer * FFN * H        * sizeof(float);
-        const NSUInteger off_LN    = (NSUInteger)layer * 4   * H        * sizeof(float);
-        const NSUInteger off_bias_H   = (NSUInteger)layer * H           * sizeof(float);
-        const NSUInteger off_bias_FFN = (NSUInteger)layer * (2u*FFN)    * sizeof(float);
+        const NSUInteger off_HH    = (NSUInteger)layer * H   * H          * sizeof(float);
+        const NSUInteger off_FFN1  = (NSUInteger)layer * H   * ffn1_dec_out * sizeof(float);
+        const NSUInteger off_FFN2  = (NSUInteger)layer * FFN * H          * sizeof(float);
+        const NSUInteger off_LN    = (NSUInteger)layer * 4   * H          * sizeof(float);
+        const NSUInteger off_bias_H   = (NSUInteger)layer * H             * sizeof(float);
+        const NSUInteger off_bias_FFN = (NSUInteger)layer * ffn1_dec_out  * sizeof(float);
 
         // Use bias buffers if set, else fall back to zero buffers (no b_q: query_bias=0)
         id<MTLBuffer> bk_buf   = ctx->w_b_k    ?: ctx->dec_zero_H;
@@ -1143,24 +1194,26 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         NSUInteger bffn1_off = ctx->w_b_ffn1 ? off_bias_FFN : 0;
         NSUInteger bffn2_off = ctx->w_b_ffn2 ? off_bias_H   : 0;
 
-        // Pre-LN 1: LN(x_buf) → dec_buf_ln1  (before Q/K/V)
-        [enc setComputePipelineState:ctx->ps_layer_norm];
-        [enc setBuffer:x_buf              offset:0                        atIndex:0];
-        [enc setBuffer:ctx->dec_buf_ln1   offset:0                        atIndex:1];
-        [enc setBuffer:ctx->w_ln          offset:off_LN                   atIndex:2];
-        [enc setBuffer:ctx->w_ln          offset:off_LN + H*sizeof(float) atIndex:3];
-        [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&eps length:sizeof(float)    atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+        // Pre-LN 1 (enwik8 only): LN(x_buf) → dec_buf_ln1  (before Q/K/V)
+        if (!use_post_ln) {
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:x_buf              offset:0                        atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln1   offset:0                        atIndex:1];
+            [enc setBuffer:ctx->w_ln          offset:off_LN                   atIndex:2];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + H*sizeof(float) atIndex:3];
+            [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float)    atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        id<MTLBuffer> qkv_src = use_post_ln ? x_buf : ctx->dec_buf_ln1;
 
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Q, K, V projections from dec_buf_ln1 (Pre-LN): grid = [H*32, batch_size, 1] ----
+        // ---- Q, K, V projections: grid = [H*32, batch_size, 1] ----
         [enc setComputePipelineState:ctx->ps_linear];
 
         // Q (no bias: query_bias=0 per original NNCP default)
-        [enc setBuffer:ctx->dec_buf_ln1  offset:0      atIndex:0];
+        [enc setBuffer:qkv_src           offset:0      atIndex:0];
         [enc setBuffer:ctx->w_attn_q     offset:off_HH atIndex:1];
         [enc setBuffer:ctx->dec_zero_H   offset:0      atIndex:2];
         [enc setBuffer:ctx->dec_buf_q    offset:0      atIndex:3];
@@ -1170,7 +1223,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
             threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
 
         // K
-        [enc setBuffer:ctx->dec_buf_ln1 offset:0      atIndex:0];
+        [enc setBuffer:qkv_src          offset:0      atIndex:0];
         [enc setBuffer:ctx->w_attn_k    offset:off_HH atIndex:1];
         [enc setBuffer:bk_buf           offset:bk_off atIndex:2];
         [enc setBuffer:ctx->dec_buf_k   offset:0      atIndex:3];
@@ -1180,7 +1233,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
             threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
 
         // V
-        [enc setBuffer:ctx->dec_buf_ln1 offset:0      atIndex:0];
+        [enc setBuffer:qkv_src          offset:0      atIndex:0];
         [enc setBuffer:ctx->w_attn_v    offset:off_HH atIndex:1];
         [enc setBuffer:bv_buf           offset:bv_off atIndex:2];
         [enc setBuffer:ctx->dec_buf_v   offset:0      atIndex:3];
@@ -1220,9 +1273,11 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         const NSUInteger kv_layer_off =
             (NSUInteger)layer * batch_size * max_sl * H * sizeof(uint16_t);
 
-        // Phase E2.2: relative PE constants (D_POS=total_len=64)
-        uint32_t d_pos_val    = max_sl;  // D_POS = total_len = 64
-        uint32_t total_len_v  = max_sl;  // kv_total_len = 64
+        // Phase E2.2: relative PE constants
+        // d_pos: W_rel_r cycling period (from profile: 32 default, 320 enwik8)
+        // total_len: B_rel_r stride = mem+seg = ext_len
+        uint32_t d_pos_val   = (uint32_t)g_nncp_profile.d_pos;
+        uint32_t total_len_v = (uint32_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len);
 
         [enc setComputePipelineState:ctx->ps_attn_decode_cached];
         [enc setBuffer:ctx->dec_buf_q             offset:0            atIndex:0];
@@ -1235,11 +1290,21 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         [enc setBytes:&kv_len    length:sizeof(uint32_t) atIndex:7];
         [enc setBytes:&max_sl    length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&attn_scale length:sizeof(float)   atIndex:9];
-        // tied w_r/b_r: all layers use the same buffer (offset 0)
-        [enc setBuffer:ctx->w_rel_r offset:0 atIndex:10];
+        // per-layer (enwik8) or tied (default) w_r
+        if (g_nncp_profile.h == 1024 && ctx->w_rel_r_all) {
+            uint32_t NH_ = ctx->config.num_heads;
+            uint32_t HD_ = ctx->config.hidden_size / NH_;
+            uint32_t DP_ = (uint32_t)g_nncp_profile.d_pos;
+            NSUInteger wrel_layer_off = (NSUInteger)layer * NH_ * HD_ * DP_ * sizeof(float);
+            [enc setBuffer:ctx->w_rel_r_all offset:wrel_layer_off atIndex:10];
+        } else {
+            [enc setBuffer:ctx->w_rel_r offset:0 atIndex:10];
+        }
         [enc setBuffer:ctx->b_rel_r offset:0 atIndex:11];
-        [enc setBytes:&d_pos_val   length:sizeof(uint32_t) atIndex:12];
-        [enc setBytes:&total_len_v length:sizeof(uint32_t) atIndex:13];
+        float b_rel_r_scale = sqrtf((float)H);
+        [enc setBytes:&d_pos_val      length:sizeof(uint32_t) atIndex:12];
+        [enc setBytes:&total_len_v    length:sizeof(uint32_t) atIndex:13];
+        [enc setBytes:&b_rel_r_scale  length:sizeof(float)    atIndex:14];
         [enc dispatchThreads:MTLSizeMake(NH * 32u, batch_size, 1)
             threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
 
@@ -1258,7 +1323,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Residual #1: dec_buf_x_mid = x_buf + attn_proj   grid = [batch*H] ----
+        // ---- Residual #1: x_buf + attn_proj → dec_buf_x_mid   grid = [batch*H] ----
         uint32_t total_H = batch_size * H;
         [enc setComputePipelineState:ctx->ps_element_add];
         [enc setBuffer:x_buf                  offset:0 atIndex:0];
@@ -1266,49 +1331,76 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         [enc setBuffer:ctx->dec_buf_x_mid     offset:0 atIndex:2];
         [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
-
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // Pre-LN 2: LN(dec_buf_x_mid) → dec_buf_ln2  (before FFN)
-        [enc setComputePipelineState:ctx->ps_layer_norm];
-        [enc setBuffer:ctx->dec_buf_x_mid offset:0                            atIndex:0];
-        [enc setBuffer:ctx->dec_buf_ln2   offset:0                            atIndex:1];
-        [enc setBuffer:ctx->w_ln          offset:off_LN + 2*H*sizeof(float)  atIndex:2];
-        [enc setBuffer:ctx->w_ln          offset:off_LN + 3*H*sizeof(float)  atIndex:3];
-        [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&eps length:sizeof(float)    atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+        // Post-LN 1 (default): LN(dec_buf_x_mid) → dec_buf_ln1
+        // Pre-LN 2 (enwik8):   LN(dec_buf_x_mid) → dec_buf_ln2
+        if (use_post_ln) {
+            // Post-LN 1: uses γ1,β1 (offsets 0 and H)
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0                        atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln1   offset:0                        atIndex:1];
+            [enc setBuffer:ctx->w_ln          offset:off_LN                   atIndex:2];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + H*sizeof(float) atIndex:3];
+            [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float)    atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            // Pre-LN 2 (enwik8): uses γ2,β2 (offsets 2H and 3H)
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0                           atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln2   offset:0                           atIndex:1];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + 2*H*sizeof(float) atIndex:2];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + 3*H*sizeof(float) atIndex:3];
+            [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float)    atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        // FFN reads from dec_buf_ln1 (Post-LN, default) or dec_buf_ln2 (Pre-LN, enwik8)
+        id<MTLBuffer> ffn_src = use_post_ln ? ctx->dec_buf_ln1 : ctx->dec_buf_ln2;
 
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- FFN1: [batch, H] → [batch, 2*FFN]   grid = [2*FFN*32, batch_size, 1] ----
-        const uint32_t FFN2 = 2u * FFN;
+        // ---- FFN1: [batch, H] → [batch, ffn1_dec_out] ----
         [enc setComputePipelineState:ctx->ps_linear];
-        [enc setBuffer:ctx->dec_buf_ln2  offset:0         atIndex:0];
+        [enc setBuffer:ffn_src           offset:0         atIndex:0];
         [enc setBuffer:ctx->w_ffn_1      offset:off_FFN1  atIndex:1];
         [enc setBuffer:bffn1_buf         offset:bffn1_off atIndex:2];
         [enc setBuffer:ctx->dec_buf_ffn1 offset:0         atIndex:3];
-        [enc setBytes:&H    length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&FFN2 length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(FFN2 * 32u, batch_size, 1)
+        [enc setBytes:&H             length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&ffn1_dec_out  length:sizeof(uint32_t) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(ffn1_dec_out * 32u, batch_size, 1)
             threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
-
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- GeGLU: [batch, 2*FFN] → [batch, FFN]   grid = [FFN, batch_size, 1] ----
-        [enc setComputePipelineState:ctx->ps_geglu];
-        [enc setBuffer:ctx->dec_buf_ffn1  offset:0 atIndex:0];  // input: [batch, 2*FFN]
-        [enc setBuffer:ctx->dec_buf_geglu offset:0 atIndex:1];  // output: [batch, FFN]
-        [enc setBytes:&FFN length:sizeof(uint32_t) atIndex:2];  // inter_dim = FFN (output half)
-        [enc dispatchThreads:MTLSizeMake(FFN, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(MIN(FFN, 64u), MIN(batch_size, 8u), 1)];
+        // Activation: GeGLU (enwik8) → dec_buf_geglu, or GELU in-place (default)
+        id<MTLBuffer> ffn_act_out;
+        if (!use_post_ln) {
+            // ---- GeGLU: [batch, 2*FFN] → [batch, FFN] ----
+            [enc setComputePipelineState:ctx->ps_geglu];
+            [enc setBuffer:ctx->dec_buf_ffn1  offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_geglu offset:0 atIndex:1];
+            [enc setBytes:&FFN length:sizeof(uint32_t) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(FFN, batch_size, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(FFN, 64u), MIN(batch_size, 8u), 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ffn_act_out = ctx->dec_buf_geglu;
+        } else {
+            // ---- GELU in-place on dec_buf_ffn1: [batch, FFN] ----
+            uint32_t n_gelu = batch_size * FFN;
+            [enc setComputePipelineState:ctx->ps_gelu];
+            [enc setBuffer:ctx->dec_buf_ffn1 offset:0 atIndex:0];
+            [enc setBytes:&n_gelu length:sizeof(uint32_t) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_gelu, 1, 1) threadsPerThreadgroup:tg1D(n_gelu)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ffn_act_out = ctx->dec_buf_ffn1;
+        }
 
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- FFN2: [batch, FFN] → [batch, H]   grid = [H*32, batch_size, 1] ----
+        // ---- FFN2: [batch, FFN] → [batch, H] ----
         [enc setComputePipelineState:ctx->ps_linear];
-        [enc setBuffer:ctx->dec_buf_geglu offset:0         atIndex:0];
+        [enc setBuffer:ffn_act_out        offset:0         atIndex:0];
         [enc setBuffer:ctx->w_ffn_2       offset:off_FFN2  atIndex:1];
         [enc setBuffer:bffn2_buf          offset:bffn2_off atIndex:2];
         [enc setBuffer:ctx->dec_buf_ffn2  offset:0         atIndex:3];
@@ -1316,24 +1408,44 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         [enc setBytes:&H   length:sizeof(uint32_t) atIndex:5];
         [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
             threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
-
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Residual #2 (Pre-LN): dec_buf_embed = dec_buf_x_mid + ffn2_out  grid = [batch*H] ----
-        [enc setComputePipelineState:ctx->ps_element_add];
-        [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
-        [enc setBuffer:ctx->dec_buf_ffn2  offset:0 atIndex:1];
-        [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:2];
-        [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+        if (use_post_ln) {
+            // Post-LN 2 (default): (dec_buf_ln1 + ffn2) → dec_buf_x_mid, then LN → dec_buf_embed
+            [enc setComputePipelineState:ctx->ps_element_add];
+            [enc setBuffer:ctx->dec_buf_ln1   offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ffn2  offset:0 atIndex:1];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:2];
+            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0                            atIndex:0];
+            [enc setBuffer:ctx->dec_buf_embed offset:0                            atIndex:1];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + 2*H*sizeof(float)  atIndex:2];
+            [enc setBuffer:ctx->w_ln          offset:off_LN + 3*H*sizeof(float)  atIndex:3];
+            [enc setBytes:&H   length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float)    atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            // Pre-LN residual #2 (enwik8): dec_buf_x_mid + ffn2 → dec_buf_embed
+            [enc setComputePipelineState:ctx->ps_element_add];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ffn2  offset:0 atIndex:1];
+            [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:2];
+            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
 
         x_buf = ctx->dec_buf_embed;
     }
 
-    // ---- LN_FINAL: dec_buf_embed → dec_buf_ln1  (reuse ln1 buffer) ----
-    if (ctx->w_ln_final) {
+    // ---- LN_FINAL: enwik8 (Pre-LN) only ----
+    if (g_nncp_profile.h == 1024 && ctx->w_ln_final) {
         [enc setComputePipelineState:ctx->ps_layer_norm];
         [enc setBuffer:ctx->dec_buf_embed offset:0                    atIndex:0];
         [enc setBuffer:ctx->dec_buf_ln1   offset:0                    atIndex:1];
@@ -1484,7 +1596,7 @@ bool mps_transformer_execute(MPSTransformerContext* ctx,
                                              indicesTensor:input_ids
                                                       axis:0 batchDimensions:0 name:nil];
         x = [graph multiplicationWithPrimaryTensor:x
-                                   secondaryTensor:[graph constantWithScalar:16.0 dataType:MPSDataTypeFloat32]
+                                   secondaryTensor:[graph constantWithScalar:sqrtf((float)H) dataType:MPSDataTypeFloat32]
                                               name:nil];
         MPSGraphTensor* pos_slice = [graph sliceTensor:w_pos_t dimension:0 start:0 length:seq_len name:nil];
         x = [graph additionWithPrimaryTensor:x secondaryTensor:pos_slice name:nil];
@@ -1700,6 +1812,536 @@ void mps_transformer_memory_shift(MPSTransformerContext* ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Segment Prefill Graph — causal forward pass for [B, T] segment at once
+// ---------------------------------------------------------------------------
+
+static void build_segment_prefill_graph(MPSTransformerContext* ctx, uint32_t B, uint32_t T) {
+    if (!ctx || ctx->spf_ready || ctx->spf_skipped) return;
+    if (!ctx->kv_cache_valid) return;
+
+    const uint32_t H    = ctx->config.hidden_size;
+    const uint32_t V    = ctx->config.vocab_size;
+    const uint32_t L    = ctx->config.num_layers;
+    const uint32_t NH   = ctx->config.num_heads;
+    const uint32_t HD   = ctx->config.head_dim;
+    const uint32_t FFN  = ctx->config.ffn_size;
+    const uint32_t MEM  = ctx->kv_memory_len;
+    const uint32_t EXT  = MEM + T;
+    const uint32_t DPOS = (uint32_t)g_nncp_profile.d_pos;
+    const uint32_t BT   = B * T;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const uint32_t ffn1_out = is_enwik8 ? 2u * FFN : FFN;
+
+    MPSGraph* graph = [[MPSGraph alloc] init];
+    ctx->spf_graph = graph;
+
+    auto C = [&](float v) { return [graph constantWithScalar:v dataType:MPSDataTypeFloat32]; };
+
+    // ---- Input placeholders ----
+    ctx->spf_ph_tokens    = [graph placeholderWithShape:@[@(BT)]  dataType:MPSDataTypeInt32   name:@"spf_tok"];
+    ctx->spf_ph_pos_start = [graph placeholderWithShape:@[@1]     dataType:MPSDataTypeInt32   name:@"spf_pos"];
+
+    ctx->spf_ph_mem_k = [NSMutableArray arrayWithCapacity:L];
+    ctx->spf_ph_mem_v = [NSMutableArray arrayWithCapacity:L];
+    for (uint32_t l = 0; l < L; l++) {
+        [ctx->spf_ph_mem_k addObject:
+            [graph placeholderWithShape:@[@(B), @(MEM), @(H)] dataType:MPSDataTypeFloat32
+                                  name:[NSString stringWithFormat:@"spf_mk%u", l]]];
+        [ctx->spf_ph_mem_v addObject:
+            [graph placeholderWithShape:@[@(B), @(MEM), @(H)] dataType:MPSDataTypeFloat32
+                                  name:[NSString stringWithFormat:@"spf_mv%u", l]]];
+    }
+
+    // ---- Weight placeholders (same keys as weightCache) ----
+    ctx->spf_weight_ph = [NSMutableDictionary dictionary];
+    auto wPH = [&](NSString* name, NSArray<NSNumber*>* shape) -> MPSGraphTensor* {
+        MPSGraphTensor* ph = [graph placeholderWithShape:shape dataType:MPSDataTypeFloat32 name:name];
+        ctx->spf_weight_ph[name] = ph;
+        return ph;
+    };
+    MPSGraphTensor* w_embed_t    = wPH(@"w_embed",    @[@(V), @(H)]);
+    MPSGraphTensor* w_pos_t      = wPH(@"w_pos",      @[@(ctx->config.max_seq_len), @(H)]);
+    MPSGraphTensor* w_q_all      = wPH(@"w_q",        @[@(L), @(H), @(H)]);
+    MPSGraphTensor* w_k_all      = wPH(@"w_k",        @[@(L), @(H), @(H)]);
+    MPSGraphTensor* w_v_all      = wPH(@"w_v",        @[@(L), @(H), @(H)]);
+    MPSGraphTensor* w_o_all      = wPH(@"w_o",        @[@(L), @(H), @(H)]);
+    MPSGraphTensor* w_ffn1_all   = wPH(@"w_ffn1",     @[@(L), @(H), @(ffn1_out)]);
+    MPSGraphTensor* w_ffn2_all   = wPH(@"w_ffn2",     @[@(L), @(FFN), @(H)]);
+    MPSGraphTensor* w_ln_all     = wPH(@"w_ln",       @[@(L), @(4), @(H)]);
+    MPSGraphTensor* w_ln_final_t = wPH(@"w_ln_final", @[@(2), @(H)]);
+    MPSGraphTensor* w_out_t      = wPH(@"w_out",      @[@(H), @(V)]);
+    MPSGraphTensor* b_k_all      = wPH(@"b_k",        @[@(L), @(H)]);
+    MPSGraphTensor* b_v_all      = wPH(@"b_v",        @[@(L), @(H)]);
+    MPSGraphTensor* b_o_all      = wPH(@"b_o",        @[@(L), @(H)]);
+    MPSGraphTensor* b_ffn1_all   = wPH(@"b_ffn1",     @[@(L), @(ffn1_out)]);
+    MPSGraphTensor* b_ffn2_all   = wPH(@"b_ffn2",     @[@(L), @(H)]);
+    MPSGraphTensor* b_out_t      = wPH(@"b_out",      @[@(V)]);
+
+    // Relative PE placeholders
+    if (is_enwik8) {
+        ctx->spf_w_rel_r = [graph placeholderWithShape:@[@(L), @(NH), @(HD), @(DPOS)]
+                                              dataType:MPSDataTypeFloat32 name:@"spf_wrelr"];
+    } else {
+        ctx->spf_w_rel_r = wPH(@"w_rel_r", @[@(NH), @(HD), @(DPOS)]);
+    }
+    ctx->spf_b_rel_r = [graph placeholderWithShape:@[@(NH), @(EXT)]
+                                          dataType:MPSDataTypeFloat32 name:@"spf_brelr"];
+
+    // ---- Constants ----
+    float attn_scale = 1.0f / sqrtf((float)HD);
+    float embed_scale = sqrtf((float)H);
+
+    // Causal mask [T, EXT]: memory always visible, current causal
+    std::vector<float> mask_data((size_t)T * EXT, 0.0f);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t k = MEM; k < EXT; k++)
+            if (k - MEM > t) mask_data[t * EXT + k] = -1e9f;
+    MPSGraphTensor* causal_mask = [graph constantWithData:
+        [NSData dataWithBytes:mask_data.data() length:mask_data.size() * sizeof(float)]
+        shape:@[@(T), @(EXT)] dataType:MPSDataTypeFloat32];
+
+    // Relative PE distance tables [T, EXT]
+    std::vector<int32_t> q_dist_data((size_t)T * EXT), b_dist_data((size_t)T * EXT);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t k = 0; k < EXT; k++) {
+            int d = (int)MEM + (int)t - (int)k;
+            q_dist_data[t * EXT + k] = ((d % (int)DPOS) + (int)DPOS) % (int)DPOS;
+            b_dist_data[t * EXT + k] = d < 0 ? 0 : (d >= (int)EXT ? (int)EXT - 1 : d);
+        }
+
+    // ---- Embedding ----
+    MPSGraphTensor* x = [graph gatherWithUpdatesTensor:w_embed_t indicesTensor:ctx->spf_ph_tokens
+                                                  axis:0 batchDimensions:0 name:nil]; // [BT, H]
+    x = [graph multiplicationWithPrimaryTensor:x secondaryTensor:C(embed_scale) name:nil];
+
+    // Position embeddings: gather T positions starting at pos_start, broadcast over B
+    MPSGraphTensor* pos_range = [graph constantWithData:
+        [NSData dataWithBytes:({
+            std::vector<int32_t> r(T); for (uint32_t i = 0; i < T; i++) r[i] = (int32_t)i;
+            r.data();
+        }) length:T * sizeof(int32_t)]
+        shape:@[@(T)] dataType:MPSDataTypeInt32];
+    MPSGraphTensor* pos_idx = [graph additionWithPrimaryTensor:pos_range
+        secondaryTensor:[graph reshapeTensor:ctx->spf_ph_pos_start withShape:@[@1] name:nil] name:nil]; // [T]
+    MPSGraphTensor* pos_emb = [graph gatherWithUpdatesTensor:w_pos_t indicesTensor:pos_idx
+                                                        axis:0 batchDimensions:0 name:nil]; // [T, H]
+    // Tile [T, H] → [BT, H]: reshape [1, T, H] → broadcast with [B, T, H]
+    pos_emb = [graph reshapeTensor:pos_emb withShape:@[@1, @(T), @(H)] name:nil];
+    MPSGraphTensor* x_3d = [graph reshapeTensor:x withShape:@[@(B), @(T), @(H)] name:nil];
+    x_3d = [graph additionWithPrimaryTensor:x_3d secondaryTensor:pos_emb name:nil]; // broadcast B
+
+    // ---- Output arrays ----
+    ctx->spf_out_new_k = [NSMutableArray arrayWithCapacity:L];
+    ctx->spf_out_new_v = [NSMutableArray arrayWithCapacity:L];
+
+    // Slice helpers
+    auto sliceL = [&](MPSGraphTensor* t, uint32_t i, NSArray<NSNumber*>* shape) -> MPSGraphTensor* {
+        return [graph reshapeTensor:[graph sliceTensor:t dimension:0 start:i length:1 name:nil]
+                          withShape:shape name:nil];
+    };
+
+    // ---- Transformer layers ----
+    for (uint32_t l = 0; l < L; l++) {
+        MPSGraphTensor* residual = x_3d; // [B, T, H]
+
+        // Slice per-layer weights
+        MPSGraphTensor* w_q = sliceL(w_q_all, l, @[@(H), @(H)]);
+        MPSGraphTensor* w_k = sliceL(w_k_all, l, @[@(H), @(H)]);
+        MPSGraphTensor* w_v = sliceL(w_v_all, l, @[@(H), @(H)]);
+        MPSGraphTensor* w_o = sliceL(w_o_all, l, @[@(H), @(H)]);
+        MPSGraphTensor* bk = sliceL(b_k_all, l, @[@(H)]);
+        MPSGraphTensor* bv = sliceL(b_v_all, l, @[@(H)]);
+        MPSGraphTensor* bo = sliceL(b_o_all, l, @[@(H)]);
+
+        MPSGraphTensor* ln_l = sliceL(w_ln_all, l, @[@(4), @(H)]);
+        MPSGraphTensor* g1 = [graph reshapeTensor:[graph sliceTensor:ln_l dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
+        MPSGraphTensor* b1 = [graph reshapeTensor:[graph sliceTensor:ln_l dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
+        MPSGraphTensor* g2 = [graph reshapeTensor:[graph sliceTensor:ln_l dimension:0 start:2 length:1 name:nil] withShape:@[@(H)] name:nil];
+        MPSGraphTensor* b2 = [graph reshapeTensor:[graph sliceTensor:ln_l dimension:0 start:3 length:1 name:nil] withShape:@[@(H)] name:nil];
+
+        // Pre-LN 1
+        MPSGraphTensor* x_flat = [graph reshapeTensor:x_3d withShape:@[@(BT), @(H)] name:nil];
+        MPSGraphTensor* x_ln = is_enwik8 ? layer_norm(graph, x_flat, g1, b1)
+                                         : layer_norm(graph, x_flat, g1, b1); // both use same LN for now
+
+        // QKV projections: [BT, H] @ [H, H] + bias
+        MPSGraphTensor* Q = [graph matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_q name:nil];
+        MPSGraphTensor* K = [graph additionWithPrimaryTensor:
+            [graph matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_k name:nil]
+            secondaryTensor:bk name:nil];
+        MPSGraphTensor* V = [graph additionWithPrimaryTensor:
+            [graph matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_v name:nil]
+            secondaryTensor:bv name:nil];
+
+        // Save K/V for cache update (fp32 → fp16 not needed here, keep fp32)
+        [ctx->spf_out_new_k addObject:[graph reshapeTensor:K withShape:@[@(B), @(T), @(H)] name:nil]];
+        [ctx->spf_out_new_v addObject:[graph reshapeTensor:V withShape:@[@(B), @(T), @(H)] name:nil]];
+
+        // Multi-head reshape: [BT, H] → [B, T, NH, HD] → [B, NH, T, HD]
+        auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
+            t = [graph reshapeTensor:t withShape:@[@(B), @(T), @(NH), @(HD)] name:nil];
+            return [graph transposeTensor:t dimension:1 withDimension:2 name:nil];
+        };
+        MPSGraphTensor* Q_mh = toMH(Q); // [B, NH, T, HD]
+        MPSGraphTensor* K_mh = toMH(K);
+        MPSGraphTensor* V_mh = toMH(V);
+
+        // Memory K/V: [B, MEM, H] → [B, NH, MEM, HD]
+        auto memToMH = [&](MPSGraphTensor* m) -> MPSGraphTensor* {
+            m = [graph reshapeTensor:m withShape:@[@(B), @(MEM), @(NH), @(HD)] name:nil];
+            return [graph transposeTensor:m dimension:1 withDimension:2 name:nil];
+        };
+        MPSGraphTensor* mem_k_mh = memToMH(ctx->spf_ph_mem_k[l]);
+        MPSGraphTensor* mem_v_mh = memToMH(ctx->spf_ph_mem_v[l]);
+
+        // Extended K/V: [B, NH, MEM+T, HD]
+        MPSGraphTensor* K_ext = [graph concatTensors:@[mem_k_mh, K_mh] dimension:2 name:nil];
+        MPSGraphTensor* V_ext = [graph concatTensors:@[mem_v_mh, V_mh] dimension:2 name:nil];
+
+        // Attention scores: [B, NH, T, HD] @ [B, NH, HD, EXT] → [B, NH, T, EXT]
+        MPSGraphTensor* scores = [graph matrixMultiplicationWithPrimaryTensor:Q_mh
+            secondaryTensor:[graph transposeTensor:K_ext dimension:2 withDimension:3 name:nil] name:nil];
+        scores = [graph multiplicationWithPrimaryTensor:scores secondaryTensor:C(attn_scale) name:nil];
+
+        // ---- Relative PE ----
+        // q_rel: Q_mh @ W_rel_r → [B, NH, T, D_POS] → gather with q_dist → [B, NH, T, EXT]
+        MPSGraphTensor* w_r_l;
+        if (is_enwik8) {
+            w_r_l = [graph reshapeTensor:
+                [graph sliceTensor:ctx->spf_w_rel_r dimension:0 start:l length:1 name:nil]
+                withShape:@[@(NH), @(HD), @(DPOS)] name:nil];
+        } else {
+            w_r_l = ctx->spf_w_rel_r; // [NH, HD, D_POS] shared
+        }
+        // w_r_4d: [1, NH, HD, D_POS]
+        MPSGraphTensor* w_r_4d = [graph reshapeTensor:w_r_l withShape:@[@1, @(NH), @(HD), @(DPOS)] name:nil];
+        // Q_mh: [B, NH, T, HD] @ [1, NH, HD, DPOS] → [B, NH, T, DPOS]
+        MPSGraphTensor* q_rel_raw = [graph matrixMultiplicationWithPrimaryTensor:Q_mh secondaryTensor:w_r_4d name:nil];
+
+        // Gather q_rel with oneHot+matmul (deterministic, same as training graph)
+        {
+            // q_rel_raw: [B, NH, T, DPOS] → reshape [B*NH, T, DPOS]
+            MPSGraphTensor* qr = [graph reshapeTensor:q_rel_raw withShape:@[@(B*NH), @(T), @(DPOS)] name:nil];
+            NSMutableArray<MPSGraphTensor*>* q_slices = [NSMutableArray array];
+            for (uint32_t ti = 0; ti < T; ti++) {
+                // Build permutation matrix P_t [DPOS, EXT]
+                std::vector<float> p((size_t)DPOS * EXT, 0.f);
+                for (uint32_t k = 0; k < EXT; k++)
+                    p[(size_t)q_dist_data[ti * EXT + k] * EXT + k] = 1.f;
+                MPSGraphTensor* Pt = [graph constantWithData:
+                    [NSData dataWithBytes:p.data() length:p.size() * sizeof(float)]
+                    shape:@[@(DPOS), @(EXT)] dataType:MPSDataTypeFloat32];
+                // Slice t: [B*NH, 1, DPOS] → [B*NH, DPOS]
+                MPSGraphTensor* qt = [graph reshapeTensor:
+                    [graph sliceTensor:qr dimension:1 start:ti length:1 name:nil]
+                    withShape:@[@(B*NH), @(DPOS)] name:nil];
+                // [B*NH, DPOS] @ [DPOS, EXT] → [B*NH, 1, EXT]
+                qt = [graph reshapeTensor:
+                    [graph matrixMultiplicationWithPrimaryTensor:qt secondaryTensor:Pt name:nil]
+                    withShape:@[@(B*NH), @1, @(EXT)] name:nil];
+                [q_slices addObject:qt];
+            }
+            MPSGraphTensor* q_rel = [graph concatTensors:q_slices dimension:1 name:nil]; // [B*NH, T, EXT]
+            q_rel = [graph reshapeTensor:q_rel withShape:@[@(B), @(NH), @(T), @(EXT)] name:nil];
+            q_rel = [graph multiplicationWithPrimaryTensor:q_rel secondaryTensor:C(attn_scale) name:nil];
+            scores = [graph additionWithPrimaryTensor:scores secondaryTensor:q_rel name:nil];
+        }
+
+        // b_rel: b_rel_r [NH, EXT] → transpose → [EXT, NH] → permute per t → [1, NH, T, EXT]
+        {
+            MPSGraphTensor* b_rt = [graph transposeTensor:ctx->spf_b_rel_r dimension:0 withDimension:1 name:nil]; // [EXT, NH]
+            NSMutableArray<MPSGraphTensor*>* b_slices = [NSMutableArray array];
+            for (uint32_t ti = 0; ti < T; ti++) {
+                std::vector<float> bp((size_t)EXT * EXT, 0.f);
+                for (uint32_t k = 0; k < EXT; k++)
+                    bp[(size_t)k * EXT + b_dist_data[ti * EXT + k]] = 1.f;
+                MPSGraphTensor* Qt = [graph constantWithData:
+                    [NSData dataWithBytes:bp.data() length:bp.size() * sizeof(float)]
+                    shape:@[@(EXT), @(EXT)] dataType:MPSDataTypeFloat32];
+                MPSGraphTensor* bt = [graph reshapeTensor:
+                    [graph matrixMultiplicationWithPrimaryTensor:Qt secondaryTensor:b_rt name:nil]
+                    withShape:@[@1, @(EXT), @(NH)] name:nil];
+                [b_slices addObject:bt];
+            }
+            MPSGraphTensor* b_gath = [graph concatTensors:b_slices dimension:0 name:nil]; // [T, EXT, NH]
+            MPSGraphTensor* b_rel = [graph reshapeTensor:
+                [graph transposeTensor:[graph transposeTensor:b_gath dimension:0 withDimension:2 name:nil]
+                     dimension:1 withDimension:2 name:nil]
+                withShape:@[@1, @(NH), @(T), @(EXT)] name:nil];
+            b_rel = [graph multiplicationWithPrimaryTensor:b_rel secondaryTensor:C(sqrtf((float)H)) name:nil];
+            scores = [graph additionWithPrimaryTensor:scores secondaryTensor:b_rel name:nil];
+        }
+
+        // Causal mask + clamp + softmax
+        scores = [graph additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
+        scores = [graph minimumWithPrimaryTensor:scores secondaryTensor:C(50.f) name:nil];
+        scores = [graph maximumWithPrimaryTensor:scores secondaryTensor:C(-50.f) name:nil];
+        scores = [graph softMaxWithTensor:scores axis:-1 name:nil];
+
+        // Weighted sum: [B, NH, T, EXT] @ [B, NH, EXT, HD] → [B, NH, T, HD]
+        MPSGraphTensor* attn = [graph matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:V_ext name:nil];
+        attn = [graph transposeTensor:attn dimension:1 withDimension:2 name:nil]; // [B, T, NH, HD]
+        attn = [graph reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];
+
+        // O projection + residual
+        attn = [graph additionWithPrimaryTensor:
+            [graph matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o name:nil]
+            secondaryTensor:bo name:nil];
+        x_3d = [graph additionWithPrimaryTensor:residual
+            secondaryTensor:[graph reshapeTensor:attn withShape:@[@(B), @(T), @(H)] name:nil] name:nil];
+        residual = x_3d;
+
+        // Pre-LN 2
+        x_flat = [graph reshapeTensor:x_3d withShape:@[@(BT), @(H)] name:nil];
+        MPSGraphTensor* x_ln2 = layer_norm(graph, x_flat, g2, b2);
+
+        // FFN
+        MPSGraphTensor* w_f1 = sliceL(w_ffn1_all, l, @[@(H), @(ffn1_out)]);
+        MPSGraphTensor* bf1 = sliceL(b_ffn1_all, l, @[@(ffn1_out)]);
+        MPSGraphTensor* w_f2 = sliceL(w_ffn2_all, l, @[@(FFN), @(H)]);
+        MPSGraphTensor* bf2 = sliceL(b_ffn2_all, l, @[@(H)]);
+
+        MPSGraphTensor* ffn_pre = [graph additionWithPrimaryTensor:
+            [graph matrixMultiplicationWithPrimaryTensor:x_ln2 secondaryTensor:w_f1 name:nil]
+            secondaryTensor:bf1 name:nil]; // [BT, ffn1_out]
+        MPSGraphTensor* ffn_act;
+        if (is_enwik8) {
+            MPSGraphTensor* fv = [graph sliceTensor:ffn_pre dimension:1 start:0           length:(NSInteger)FFN name:nil];
+            MPSGraphTensor* fg = [graph sliceTensor:ffn_pre dimension:1 start:(NSInteger)FFN length:(NSInteger)FFN name:nil];
+            ffn_act = [graph multiplicationWithPrimaryTensor:gelu(graph, fv) secondaryTensor:fg name:nil];
+        } else {
+            ffn_act = gelu(graph, ffn_pre);
+        }
+        MPSGraphTensor* ffn_out = [graph additionWithPrimaryTensor:
+            [graph matrixMultiplicationWithPrimaryTensor:ffn_act secondaryTensor:w_f2 name:nil]
+            secondaryTensor:bf2 name:nil]; // [BT, H]
+
+        // Residual #2
+        x_3d = [graph additionWithPrimaryTensor:residual
+            secondaryTensor:[graph reshapeTensor:ffn_out withShape:@[@(B), @(T), @(H)] name:nil] name:nil];
+    }
+
+    // LN_FINAL
+    {
+        MPSGraphTensor* gf = [graph reshapeTensor:[graph sliceTensor:w_ln_final_t dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
+        MPSGraphTensor* bf = [graph reshapeTensor:[graph sliceTensor:w_ln_final_t dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
+        MPSGraphTensor* x_flat = [graph reshapeTensor:x_3d withShape:@[@(BT), @(H)] name:nil];
+        x_3d = [graph reshapeTensor:layer_norm(graph, x_flat, gf, bf) withShape:@[@(B), @(T), @(H)] name:nil];
+    }
+
+    // Output projection → logits [BT, V]
+    MPSGraphTensor* x_flat = [graph reshapeTensor:x_3d withShape:@[@(BT), @(H)] name:nil];
+    ctx->spf_out_logits = [graph additionWithPrimaryTensor:
+        [graph matrixMultiplicationWithPrimaryTensor:x_flat secondaryTensor:w_out_t name:nil]
+        secondaryTensor:b_out_t name:nil];
+
+    // ---- Compile ----
+    NSMutableDictionary* cfeeds = [NSMutableDictionary dictionary];
+    cfeeds[(id)ctx->spf_ph_tokens]    = ctx->spf_ph_tokens;
+    cfeeds[(id)ctx->spf_ph_pos_start] = ctx->spf_ph_pos_start;
+    for (uint32_t l = 0; l < L; l++) {
+        cfeeds[(id)ctx->spf_ph_mem_k[l]] = ctx->spf_ph_mem_k[l];
+        cfeeds[(id)ctx->spf_ph_mem_v[l]] = ctx->spf_ph_mem_v[l];
+    }
+    for (NSString* name in ctx->spf_weight_ph)
+        cfeeds[(id)ctx->spf_weight_ph[name]] = ctx->spf_weight_ph[name];
+    cfeeds[(id)ctx->spf_w_rel_r] = ctx->spf_w_rel_r;
+    cfeeds[(id)ctx->spf_b_rel_r] = ctx->spf_b_rel_r;
+
+    NSMutableArray<MPSGraphTensor*>* targets = [NSMutableArray array];
+    [targets addObject:ctx->spf_out_logits];
+    for (uint32_t l = 0; l < L; l++) {
+        [targets addObject:ctx->spf_out_new_k[l]];
+        [targets addObject:ctx->spf_out_new_v[l]];
+    }
+
+    NSLog(@"[SPF] Compiling segment prefill graph (B=%u, T=%u, L=%u, H=%u)...", B, T, L, H);
+    MPSGraphDevice* mpsDevice = [MPSGraphDevice deviceWithMTLDevice:ctx->device];
+    ctx->spf_exec = [graph compileWithDevice:mpsDevice feeds:cfeeds
+                              targetTensors:targets targetOperations:nil compilationDescriptor:nil];
+    if (ctx->spf_exec) {
+        ctx->spf_batch_size = B;
+        ctx->spf_seg_len    = T;
+        ctx->spf_ready      = true;
+        NSLog(@"[SPF] Compilation complete");
+    } else {
+        ctx->spf_skipped = true;
+        NSLog(@"[SPF] Compilation FAILED — falling back to per-token decode");
+    }
+}
+
+// Execute segment prefill: returns true on success
+static bool execute_segment_prefill(MPSTransformerContext* ctx,
+                                     const int32_t* input_tokens,
+                                     int n_streams, int seg_len,
+                                     float* logits_out) {
+    if (!ctx || !ctx->spf_ready) return false;
+    const uint32_t B = (uint32_t)n_streams, T = (uint32_t)seg_len;
+    const uint32_t BT = B * T;
+    const uint32_t H = ctx->config.hidden_size;
+    const uint32_t L = ctx->config.num_layers;
+    const uint32_t V = ctx->config.vocab_size;
+    const uint32_t MEM = ctx->kv_memory_len;
+    const uint32_t kv_pos = (uint32_t)ctx->kv_cache_pos;
+
+    // Allocate scratch buffers if needed
+    if (!ctx->spf_token_mtl)
+        ctx->spf_token_mtl = [ctx->device newBufferWithLength:BT * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    if (!ctx->spf_pos_mtl)
+        ctx->spf_pos_mtl = [ctx->device newBufferWithLength:sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+    // Fill token buffer (re-layout [n_streams, seg_len] row-major)
+    memcpy([ctx->spf_token_mtl contents], input_tokens, BT * sizeof(int32_t));
+    // Wait — input_tokens is [n_streams, seg_len] but we need [B*T] = same flat layout
+    // The graph processes [BT] tokens: token[b*T+t] = stream b, position t
+    // But input_tokens[s*seg_len+t] = stream s, position t — same layout!
+    // So memcpy is correct.
+
+    // Position start
+    ((int32_t*)[ctx->spf_pos_mtl contents])[0] = (int32_t)kv_pos;
+
+    @autoreleasepool {
+    NSMutableDictionary* rfeeds = [NSMutableDictionary dictionary];
+    auto makeTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape, MPSDataType dt) {
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf shape:shape dataType:dt];
+    };
+
+    rfeeds[(id)ctx->spf_ph_tokens]    = makeTD(ctx->spf_token_mtl, @[@(BT)], MPSDataTypeInt32);
+    rfeeds[(id)ctx->spf_ph_pos_start] = makeTD(ctx->spf_pos_mtl, @[@1], MPSDataTypeInt32);
+
+    // Memory K/V feeds: read from KV cache positions [0, MEM) for each layer
+    // KV cache layout: [L * B * kv_total_len, H] float (note: float, not fp16!)
+    // Wait — from the struct: kv_cache_k is `[L * batch * kv_total_len * H] float`
+    // Actually let me check the actual allocation type...
+    // The decode_fast path writes fp16 to the cache (kv_cache_write_batch kernel converts f32→f16)
+    // But the cache buffers are allocated with sizeof(float) in some paths...
+    // Let me check: kv_cache_k is created in alloc_kv_cache
+
+    // For now, read memory K/V directly from cache buffers as fp32
+    // Each layer's memory = positions [0, MEM) in the cache
+    const NSUInteger tl = ctx->kv_total_len;
+    for (uint32_t l = 0; l < L; l++) {
+        // Offset into kv_cache_k for layer l: l * B * tl * H * sizeof(float)
+        NSUInteger layer_off = (NSUInteger)l * B * tl * H * sizeof(float);
+        // We need [B, MEM, H] — but cache has [B, tl, H]
+        // Need to extract the first MEM columns from each B row
+        // This requires a copy since the memory isn't contiguous in the right layout
+
+        // For now, create temporary buffers with the memory data
+        size_t mem_size = (size_t)B * MEM * H * sizeof(float);
+        id<MTLBuffer> mem_k_buf = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mem_v_buf = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
+
+        float* src_k = (float*)[ctx->kv_cache_k contents] + l * B * tl * H;
+        float* src_v = (float*)[ctx->kv_cache_v contents] + l * B * tl * H;
+        float* dst_k = (float*)[mem_k_buf contents];
+        float* dst_v = (float*)[mem_v_buf contents];
+
+        for (uint32_t b = 0; b < B; b++) {
+            memcpy(dst_k + b * MEM * H, src_k + b * tl * H, MEM * H * sizeof(float));
+            memcpy(dst_v + b * MEM * H, src_v + b * tl * H, MEM * H * sizeof(float));
+        }
+
+        rfeeds[(id)ctx->spf_ph_mem_k[l]] = makeTD(mem_k_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
+        rfeeds[(id)ctx->spf_ph_mem_v[l]] = makeTD(mem_v_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
+    }
+
+    // Weight feeds from weightCache
+    for (NSString* name in ctx->spf_weight_ph) {
+        MPSGraphTensor* ph = ctx->spf_weight_ph[name];
+        MPSGraphTensorData* td = ctx->weightCache[name];
+        if (ph && td) rfeeds[(id)ph] = td;
+    }
+
+    // Relative PE feeds
+    if (g_nncp_profile.h == 1024 && ctx->w_rel_r_all) {
+        uint32_t NH_ = ctx->config.num_heads, HD_ = ctx->config.head_dim;
+        uint32_t DP_ = (uint32_t)g_nncp_profile.d_pos;
+        rfeeds[(id)ctx->spf_w_rel_r] = makeTD(ctx->w_rel_r_all,
+            @[@(L), @(NH_), @(HD_), @(DP_)], MPSDataTypeFloat32);
+    }
+    // b_rel_r: need [NH, EXT] from the buffer [NH, total_ext]
+    {
+        uint32_t NH_ = ctx->config.num_heads;
+        uint32_t EXT = MEM + T;
+        size_t brel_sz = (size_t)NH_ * EXT * sizeof(float);
+        const size_t MPS_MIN = 16384;
+        id<MTLBuffer> brel_buf = ctx->b_rel_r;
+        rfeeds[(id)ctx->spf_b_rel_r] = makeTD(brel_buf, @[@(NH_), @(EXT)], MPSDataTypeFloat32);
+    }
+
+    // Build inputsArray matching feedTensors order
+    NSMutableArray<MPSGraphTensorData*>* inputs = [NSMutableArray array];
+    for (MPSGraphTensor* ph in ctx->spf_exec.feedTensors) {
+        MPSGraphTensorData* feed = rfeeds[(id)ph];
+        if (!feed) {
+            NSLog(@"[SPF] missing feed tensor");
+            return false;
+        }
+        [inputs addObject:feed];
+    }
+
+    // Execute
+    NSArray<MPSGraphTensorData*>* outputs = [ctx->spf_exec
+        runWithMTLCommandQueue:ctx->commandQueue
+                   inputsArray:inputs
+                  resultsArray:nil];
+    if (!outputs || outputs.count == 0) return false;
+
+    // Read logits: first output = [BT, V]
+    MPSGraphTensorData* logits_td = outputs[0];
+    [logits_td.mpsndarray readBytes:logits_out strideBytes:NULL];
+
+    // Update KV cache: write new K/V for T positions at [kv_pos, kv_pos+T)
+    for (uint32_t l = 0; l < L; l++) {
+        MPSGraphTensorData* new_k_td = outputs[1 + l * 2];
+        MPSGraphTensorData* new_v_td = outputs[1 + l * 2 + 1];
+
+        // Read [B, T, H] fp32 data
+        size_t kv_size = (size_t)B * T * H * sizeof(float);
+        float* new_k_data = (float*)malloc(kv_size);
+        float* new_v_data = (float*)malloc(kv_size);
+        [new_k_td.mpsndarray readBytes:new_k_data strideBytes:NULL];
+        [new_v_td.mpsndarray readBytes:new_v_data strideBytes:NULL];
+
+        // Write to KV cache at positions [kv_pos, kv_pos+T) per batch
+        float* cache_k = (float*)[ctx->kv_cache_k contents] + l * B * tl * H;
+        float* cache_v = (float*)[ctx->kv_cache_v contents] + l * B * tl * H;
+        for (uint32_t b = 0; b < B; b++) {
+            memcpy(cache_k + b * tl * H + kv_pos * H,
+                   new_k_data + b * T * H, T * H * sizeof(float));
+            memcpy(cache_v + b * tl * H + kv_pos * H,
+                   new_v_data + b * T * H, T * H * sizeof(float));
+        }
+        free(new_k_data);
+        free(new_v_data);
+    }
+
+    } // @autoreleasepool
+
+    // Advance KV cache position
+    ctx->kv_cache_pos += T;
+
+    // Memory shift if needed
+    if (ctx->kv_cache_pos >= ctx->kv_total_len) {
+        const NSUInteger tl2 = ctx->kv_total_len;
+        float* ck = (float*)[ctx->kv_cache_k contents];
+        float* cv = (float*)[ctx->kv_cache_v contents];
+        for (uint32_t l = 0; l < L; l++) {
+            for (uint32_t b = 0; b < B; b++) {
+                size_t src_off = l * B * tl2 * H + b * tl2 * H + (tl2 - MEM) * H;
+                size_t dst_off = l * B * tl2 * H + b * tl2 * H;
+                memmove(ck + dst_off, ck + src_off, MEM * H * sizeof(float));
+                memmove(cv + dst_off, cv + src_off, MEM * H * sizeof(float));
+            }
+        }
+        ctx->kv_cache_pos = MEM;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Public: mps_transformer_execute_segment
 // ---------------------------------------------------------------------------
 
@@ -1712,6 +2354,20 @@ void mps_transformer_execute_segment(
 {
     if (!ctx || !input_tokens || !logits_out || n_streams <= 0 || seg_len <= 0) return;
 
+    // NOTE: Segment prefill graph (spf_*) is implemented but disabled.
+    // Lossless compression requires bit-identical logits between compress (prefill, M=B*T)
+    // and decompress (per-token, M=B). GEMM accumulation order differs → roundtrip fails.
+    // Enable via SPF_ENABLE=1 when a deterministic GEMM solution is available.
+#if SPF_ENABLE
+    if (!ctx->spf_skipped && ctx->kv_cache_valid) {
+        if (!ctx->spf_ready)
+            build_segment_prefill_graph(ctx, (uint32_t)n_streams, (uint32_t)seg_len);
+        if (ctx->spf_ready) {
+            if (execute_segment_prefill(ctx, input_tokens, n_streams, seg_len, logits_out))
+                return;
+        }
+    }
+#endif
     const size_t V = (size_t)ctx->config.vocab_size;
 
     // Temporary buffer for one decode step: [n_streams × V].

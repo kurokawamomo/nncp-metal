@@ -30,12 +30,12 @@
 
 float g_lr_override = 0.0f;  // 0 = use default 1e-4; set via --lr CLI flag
 int   g_vocab_size_override = 0;  // 0 = use default 256; set to 256+n_words for preprocessing
-NNCPProfileConfig g_nncp_profile = {256, 4, 512, 8, 32, 16, 32}; // default profile
+NNCPProfileConfig g_nncp_profile = {256, 4, 512, 8, 32, 16, 32, 64}; // default profile (d_pos=64=max(mem*2,mem+seg))
 
-// D_POS = max(MEM_LEN+SEG_LEN, MEM_LEN*2); equals 64 for default profile (16/32/32)
-#define NNCP_D_POS() ((size_t)((g_nncp_profile.mem_len >= g_nncp_profile.seg_len) \
-                               ? g_nncp_profile.mem_len * 2 \
-                               : g_nncp_profile.mem_len + g_nncp_profile.seg_len))
+// W_rel_r dimension: from profile (default: 32, enwik8: 320)
+#define NNCP_D_POS()    ((size_t)g_nncp_profile.d_pos)
+// B_rel_r dimension: full attention context = mem + seg (default: 64, enwik8: 320)
+#define NNCP_EXT_LEN()  ((size_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len))
 
 #ifdef __cplusplus
 extern "C" {
@@ -125,8 +125,9 @@ typedef struct MetalTransformerModel {
     id<MTLBuffer> bias_ffn1;  /* [num_layers x feed_forward_size] */
     id<MTLBuffer> bias_ffn2;  /* [num_layers x hidden_size] */
     id<MTLBuffer> bias_out;   /* [vocab_size] */
-    id<MTLBuffer> rel_r;      /* [NH * HD * D_POS] = [8*32*64] rel PE proj  */
-    id<MTLBuffer> b_rel_r;    /* [NH * total_len]  = [8*64]    rel PE bias  */
+    id<MTLBuffer> rel_r;      /* default=[NH,HD,D_POS] tied / enwik8=nil (per-layer を使用) */
+    id<MTLBuffer> rel_r_all;  /* enwik8 only: [L, NH, HD, D_POS] per-layer w_r */
+    id<MTLBuffer> b_rel_r;    /* [NH * total_len]  rel PE bias  */
     id<MTLBuffer> ln_final;   /* [2 * hidden_size]: gamma_f, beta_f for LN_FINAL */
 
     // Computation buffers
@@ -1089,7 +1090,8 @@ static float* g_session_init_bias_o    = NULL;  /* [L * H]          */
 static float* g_session_init_bias_ffn1 = NULL;  /* [L * FFS]        */
 static float* g_session_init_bias_ffn2 = NULL;  /* [L * H]          */
 static float* g_session_init_bias_out  = NULL;  /* [V]              */
-static float* g_session_init_rel_r     = NULL;  /* [NH * HD * D_POS] */
+static float* g_session_init_rel_r     = NULL;  /* default: [NH * HD * D_POS] */
+static float* g_session_init_rel_r_all = NULL;  /* enwik8:  [L * NH * HD * D_POS] */
 static float* g_session_init_b_rel_r   = NULL;  /* [NH * total_len]  */
 static float* g_session_init_ln_final  = NULL;  /* [2 * H]           */
 static bool   g_session_weights_ready  = false;
@@ -1102,6 +1104,7 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     const size_t H   = model->hidden_size;
     const size_t V   = model->vocab_size;
     const size_t FFS = model->feed_forward_size;
+    const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2 : 1;
 
 #define SNAPSHOT(dst, buf, n) do { \
     size_t _sz = (n) * sizeof(float); \
@@ -1115,22 +1118,27 @@ static void ensure_session_weights(MetalTransformerModel* model) {
     SNAPSHOT(g_session_init_attn_k,   model->attention_weights_k,     L * H * H);
     SNAPSHOT(g_session_init_attn_v,   model->attention_weights_v,     L * H * H);
     SNAPSHOT(g_session_init_attn_out, model->attention_output_weights, L * H * H);
-    SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS * 2);
+    SNAPSHOT(g_session_init_ffn1,     model->ffn_weights_1,           L * H * FFS * FFN1_MULT);
     SNAPSHOT(g_session_init_ffn2,     model->ffn_weights_2,           L * FFS * H);
     SNAPSHOT(g_session_init_ln,       model->layer_norm_weights,      L * 4 * H);
     SNAPSHOT(g_session_init_out_proj, model->output_projection,       H * V);
     SNAPSHOT(g_session_init_bias_k,    model->bias_k,    L * H);
     SNAPSHOT(g_session_init_bias_v,    model->bias_v,    L * H);
     SNAPSHOT(g_session_init_bias_o,    model->bias_o,    L * H);
-    SNAPSHOT(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * 2);
+    SNAPSHOT(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * FFN1_MULT);
     SNAPSHOT(g_session_init_bias_ffn2, model->bias_ffn2, L * H);
     SNAPSHOT(g_session_init_bias_out,  model->bias_out,  V);
     {
         const size_t NH_ = model->num_attention_heads;
         const size_t HD_ = model->hidden_size / NH_;
         const size_t DP_ = NNCP_D_POS();
-        SNAPSHOT(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * DP_); /* [NH,HD,D_POS] */
-        SNAPSHOT(g_session_init_b_rel_r, model->b_rel_r, NH_ * DP_);       /* [NH,D_POS] */
+        if (model->rel_r) {
+            SNAPSHOT(g_session_init_rel_r, model->rel_r, NH_ * HD_ * DP_);
+        } else if (model->rel_r_all) {
+            size_t L_ = model->num_layers;
+            SNAPSHOT(g_session_init_rel_r_all, model->rel_r_all, L_ * NH_ * HD_ * DP_);
+        }
+        SNAPSHOT(g_session_init_b_rel_r, model->b_rel_r, NH_ * DP_);
     }
     if (model->ln_final)
         SNAPSHOT(g_session_init_ln_final, model->ln_final, 2 * H);
@@ -1149,6 +1157,7 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     const size_t H   = model->hidden_size;
     const size_t V   = model->vocab_size;
     const size_t FFS = model->feed_forward_size;
+    const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2 : 1;
 
 #define RESTORE(src, buf, n) \
     memcpy([(buf) contents], (src), (n) * sizeof(float))
@@ -1158,21 +1167,26 @@ static void reset_model_to_session_weights(MetalTransformerModel* model) {
     RESTORE(g_session_init_attn_k,   model->attention_weights_k,      L * H * H);
     RESTORE(g_session_init_attn_v,   model->attention_weights_v,      L * H * H);
     RESTORE(g_session_init_attn_out, model->attention_output_weights,  L * H * H);
-    RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS * 2);
+    RESTORE(g_session_init_ffn1,     model->ffn_weights_1,            L * H * FFS * FFN1_MULT);
     RESTORE(g_session_init_ffn2,     model->ffn_weights_2,            L * FFS * H);
     RESTORE(g_session_init_ln,       model->layer_norm_weights,       L * 4 * H);
     RESTORE(g_session_init_out_proj, model->output_projection,        H * V);
     RESTORE(g_session_init_bias_k,    model->bias_k,    L * H);
     RESTORE(g_session_init_bias_v,    model->bias_v,    L * H);
     RESTORE(g_session_init_bias_o,    model->bias_o,    L * H);
-    RESTORE(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * 2);
+    RESTORE(g_session_init_bias_ffn1, model->bias_ffn1, L * FFS * FFN1_MULT);
     RESTORE(g_session_init_bias_ffn2, model->bias_ffn2, L * H);
     RESTORE(g_session_init_bias_out,  model->bias_out,  V);
     {
         const size_t NH_ = model->num_attention_heads;
         const size_t HD_ = model->hidden_size / NH_;
         const size_t DP_ = NNCP_D_POS();
-        if (g_session_init_rel_r)   RESTORE(g_session_init_rel_r,   model->rel_r,   NH_ * HD_ * DP_);
+        if (g_session_init_rel_r && model->rel_r)
+            RESTORE(g_session_init_rel_r, model->rel_r, NH_ * HD_ * DP_);
+        if (g_session_init_rel_r_all && model->rel_r_all) {
+            size_t L_ = model->num_layers;
+            RESTORE(g_session_init_rel_r_all, model->rel_r_all, L_ * NH_ * HD_ * DP_);
+        }
         if (g_session_init_b_rel_r) RESTORE(g_session_init_b_rel_r, model->b_rel_r, NH_ * DP_);
     }
     if (g_session_init_ln_final && model->ln_final)
@@ -1222,6 +1236,8 @@ static MPSTransformerContext* get_shared_mps_ctx() {
                 model->rel_r,
                 model->b_rel_r,
                 model->ln_final);
+            // enwik8: wire per-layer w_rel_r_all
+            mps_transformer_set_relr_all(g_mps_ctx, model->rel_r_all);
         }
     }
     return g_mps_ctx;
@@ -1282,7 +1298,7 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : ((g_nncp_profile.h == 1024) ? 1.6e-4f : 3e-4f),
                                                   input_size);
     }
     if (g_online_trainer) {
@@ -1541,7 +1557,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     // ---- Online trainer ----
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
-                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
+                                                  mps_ctx, (g_lr_override > 0.0f) ? g_lr_override : ((g_nncp_profile.h == 1024) ? 1.6e-4f : 3e-4f),
                                                   output_capacity);
     }
     if (g_online_trainer) {
@@ -1767,10 +1783,12 @@ size_t neural_bridge_compress_symbols(
     mps_transformer_reset_kv_cache(mps_ctx);
 
     if (!g_online_trainer) {
+        // Use n_tokens (token count after preprocessing) so lr_decay_steps matches
+        // the decompress path, which reads n_tokens from the embedded header.
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
                                                   mps_ctx,
-                                                  (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
-                                                  total_input_bytes);
+                                                  (g_lr_override > 0.0f) ? g_lr_override : ((g_nncp_profile.h == 1024) ? 1.6e-4f : 3e-4f),
+                                                  n_tokens);
     }
     if (g_online_trainer) online_trainer_reset_session(g_online_trainer, false);
 
@@ -1922,7 +1940,7 @@ size_t neural_bridge_decompress_symbols(
     if (!g_online_trainer) {
         g_online_trainer = online_trainer_create(MTLCreateSystemDefaultDevice(),
                                                   mps_ctx,
-                                                  (g_lr_override > 0.0f) ? g_lr_override : 3e-4f,
+                                                  (g_lr_override > 0.0f) ? g_lr_override : ((g_nncp_profile.h == 1024) ? 1.6e-4f : 3e-4f),
                                                   n_tokens);
     }
     if (g_online_trainer) online_trainer_reset_session(g_online_trainer, false);
@@ -2069,8 +2087,8 @@ static id<MTLComputePipelineState> create_compute_pipeline(id<MTLDevice> device,
 }
 
 // Initialize Metal Transformer model weights.
-// Matches original NNCP default profile: U(-0.0625, 0.0625) for all weight matrices
-// (init_range=1.0 / sqrt(d_model=256) = 0.0625). Biases stay zero. LayerNorm: gamma=1, beta=0.
+// Weight init: U(-init_range/sqrt(d_model), +init_range/sqrt(d_model))
+// init_range=1.0 (default) or 0.79 (enwik8), per original nncp.c profile defaults.
 static void initialize_transformer_weights(MetalTransformerModel* model) {
     if (!model || !model->device) return;
 
@@ -2078,7 +2096,8 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
     const uint32_t H   = model->hidden_size;
     const uint32_t V   = model->vocab_size;
     const uint32_t FFS = model->feed_forward_size;
-    const float    INIT_SCALE = 0.0625f; /* 1.0 / sqrt(256) */
+    const float init_range  = (g_nncp_profile.h == 1024) ? 0.79f : 1.0f;
+    const float INIT_SCALE  = init_range / sqrtf((float)g_nncp_profile.h);
 
     // Embedding
     nn_weights_init_uniform(
@@ -2108,7 +2127,7 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
         (float*)model->attention_output_weights.contents,
         (size_t)L * H * H, INIT_SCALE, 46u);
 
-    // FFN weights (seeds 47-48); ffn_weights_1 is 2x for GeGLU (value + gate)
+    // FFN weights (seeds 47-48); ffn_weights_1 is 2x for GeGLU (all profiles)
     nn_weights_init_uniform(
         (float*)model->ffn_weights_1.contents,
         (size_t)L * H * FFS * 2, INIT_SCALE, 47u);
@@ -2132,15 +2151,27 @@ static void initialize_transformer_weights(MetalTransformerModel* model) {
         (float*)model->output_projection.contents,
         (size_t)H * V, INIT_SCALE, 49u);
 
-    // Relative PE: w_rel_r ~ U(±0.0625) seed 50; b_rel_r = 0
+    // Relative PE: w_rel_r ~ U(±INIT_SCALE) seed 50+layer; b_rel_r = 0
     {
         const uint32_t NH_ = model->num_attention_heads;
         const uint32_t HD_ = H / NH_;
-        const size_t   DP_ = NNCP_D_POS();
-        nn_weights_init_uniform(
-            (float*)model->rel_r.contents,
-            (size_t)NH_ * HD_ * DP_, INIT_SCALE, 50u);  /* [NH, HD, D_POS] */
-        memset([model->b_rel_r contents], 0, (size_t)NH_ * DP_ * sizeof(float)); /* [NH, D_POS] */
+        const size_t   DP_ = NNCP_D_POS();    /* W_rel_r: [NH, HD, d_pos] */
+        const size_t   EL_ = NNCP_EXT_LEN();  /* B_rel_r: [NH, mem+seg]   */
+        if (g_nncp_profile.h == 1024) {
+            // enwik8: per-layer w_r [L, NH, HD, D_POS], seed=50+li for each layer
+            uint32_t L_ = (uint32_t)g_nncp_profile.l;
+            for (uint32_t li = 0; li < L_; li++) {
+                nn_weights_init_uniform(
+                    (float*)model->rel_r_all.contents + li * NH_ * HD_ * DP_,
+                    (size_t)NH_ * HD_ * DP_, INIT_SCALE, 50u + li);
+            }
+        } else {
+            // default: shared w_r [NH, HD, D_POS], seed=50
+            nn_weights_init_uniform(
+                (float*)model->rel_r.contents,
+                (size_t)NH_ * HD_ * DP_, INIT_SCALE, 50u);  /* [NH, HD, D_POS] */
+        }
+        memset([model->b_rel_r contents], 0, (size_t)NH_ * EL_ * sizeof(float)); /* [NH, EXT_LEN] */
     }
 
 }
@@ -2183,8 +2214,9 @@ static MetalTransformerModel* create_transformer_model(void) {
                                                      options:MTLResourceStorageModeShared];
     model->attention_output_weights = [device newBufferWithLength:model->num_layers * model->hidden_size * model->hidden_size * sizeof(float)
                                                           options:MTLResourceStorageModeShared];
-    // GeGLU FFN: FFN1 projects hidden → 2*feed_forward_size (first half=value, second half=gate)
-    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * 2 * sizeof(float)
+    // FFN1: GeGLU for all profiles (2*F output: first half=value, second=gate)
+    const size_t ffn1_mult = 2;
+    model->ffn_weights_1 = [device newBufferWithLength:model->num_layers * model->hidden_size * model->feed_forward_size * ffn1_mult * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
     model->ffn_weights_2 = [device newBufferWithLength:model->num_layers * model->feed_forward_size * model->hidden_size * sizeof(float)
                                                 options:MTLResourceStorageModeShared];
@@ -2200,17 +2232,32 @@ static MetalTransformerModel* create_transformer_model(void) {
         model->bias_k    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_v    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_o    = [device newBufferWithLength:L * H * sizeof(float) options:opts];
-        model->bias_ffn1 = [device newBufferWithLength:L * 2 * F * sizeof(float) options:opts];
+        model->bias_ffn1 = [device newBufferWithLength:L * ffn1_mult * F * sizeof(float) options:opts];
         model->bias_ffn2 = [device newBufferWithLength:L * H * sizeof(float) options:opts];
         model->bias_out  = [device newBufferWithLength:V     * sizeof(float) options:opts];
         const size_t NH_ = model->num_attention_heads;
         const size_t HD_ = H / NH_;
-        const size_t DP_ = NNCP_D_POS();  /* MEM_LEN*2 or MEM_LEN+SEG_LEN, =64 for default */
-        model->rel_r   = [device newBufferWithLength:NH_ * HD_ * DP_ * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
-        model->b_rel_r = [device newBufferWithLength:NH_ * DP_       * sizeof(float) options:opts]; /* [NH,D_POS] */
-        if (model->rel_r)   memset([model->rel_r   contents], 0, NH_ * HD_ * DP_ * sizeof(float));
-        if (model->b_rel_r) memset([model->b_rel_r contents], 0, NH_ * DP_       * sizeof(float));
-        model->ln_final = [device newBufferWithLength:2 * H * sizeof(float) options:opts]; /* [2,H] */
+        const size_t DP_ = NNCP_D_POS();     /* W_rel_r: d_pos = 32 (default), 320 (enwik8) */
+        const size_t EL_ = NNCP_EXT_LEN();  /* B_rel_r: mem+seg = 64 (default), 320 (enwik8) */
+        if (g_nncp_profile.h == 1024) {
+            // enwik8: per-layer [L, NH, HD, D_POS]
+            size_t L_ = (size_t)g_nncp_profile.l;
+            model->rel_r     = nil;
+            model->rel_r_all = [device newBufferWithLength:L_ * NH_ * HD_ * DP_ * sizeof(float) options:opts];
+            if (model->rel_r_all) memset([model->rel_r_all contents], 0, L_ * NH_ * HD_ * DP_ * sizeof(float));
+        } else {
+            // default: shared [NH, HD, D_POS]
+            model->rel_r     = [device newBufferWithLength:NH_ * HD_ * DP_ * sizeof(float) options:opts]; /* [NH,HD,D_POS] */
+            model->rel_r_all = nil;
+            if (model->rel_r) memset([model->rel_r contents], 0, NH_ * HD_ * DP_ * sizeof(float));
+        }
+        // MPSNDArray requires buffers ≥ 16384 bytes (64KB page alignment)
+        const size_t MPS_MIN_BUF = 16384;
+        size_t brel_sz = NH_ * EL_ * sizeof(float);
+        model->b_rel_r = [device newBufferWithLength:MAX(brel_sz, MPS_MIN_BUF) options:opts]; /* [NH,EXT_LEN] */
+        if (model->b_rel_r) memset([model->b_rel_r contents], 0, MAX(brel_sz, MPS_MIN_BUF));
+        size_t lnf_sz = 2 * H * sizeof(float);
+        model->ln_final = [device newBufferWithLength:MAX(lnf_sz, MPS_MIN_BUF) options:opts]; /* [2,H] */
         if (model->ln_final) {
             float* p = (float*)[model->ln_final contents];
             for (size_t i = 0; i < H; i++) { p[i] = 1.0f; p[H + i] = 0.0f; } /* gamma=1, beta=0 */
@@ -2218,7 +2265,7 @@ static MetalTransformerModel* create_transformer_model(void) {
         if (model->bias_k)    memset([model->bias_k    contents], 0, L * H * sizeof(float));
         if (model->bias_v)    memset([model->bias_v    contents], 0, L * H * sizeof(float));
         if (model->bias_o)    memset([model->bias_o    contents], 0, L * H * sizeof(float));
-        if (model->bias_ffn1) memset([model->bias_ffn1 contents], 0, L * 2 * F * sizeof(float));
+        if (model->bias_ffn1) memset([model->bias_ffn1 contents], 0, L * ffn1_mult * F * sizeof(float));
         if (model->bias_ffn2) memset([model->bias_ffn2 contents], 0, L * H * sizeof(float));
         if (model->bias_out)  memset([model->bias_out  contents], 0, V     * sizeof(float));
     }
@@ -2248,7 +2295,7 @@ static MetalTransformerModel* create_transformer_model(void) {
         !model->layer_norm_weights || !model->output_projection ||
         !model->bias_k || !model->bias_v || !model->bias_o ||
         !model->bias_ffn1 || !model->bias_ffn2 || !model->bias_out ||
-        !model->rel_r || !model->b_rel_r || !model->ln_final ||
+        !(g_nncp_profile.h == 1024 ? model->rel_r_all : model->rel_r) || !model->b_rel_r || !model->ln_final ||
         !model->context_buffer || !model->embedded_buffer || !model->attention_buffer ||
         !model->ffn_buffer || !model->logits_buffer ||
         !model->embedding_pipeline || !model->attention_pipeline || !model->ffn_pipeline || !model->output_pipeline) {

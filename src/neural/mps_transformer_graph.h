@@ -92,13 +92,17 @@ typedef struct {
     id<MTLBuffer> b_ffn1;     /* [L, F] */
     id<MTLBuffer> b_ffn2;     /* [L, H] */
     id<MTLBuffer> b_out;      /* [V] */
-    id<MTLBuffer> w_rel_r;    /* [NH, HD, D_POS] tied rel PE proj */
+    id<MTLBuffer> w_rel_r;     /* default=[NH,HD,D_POS] tied / enwik8=nil */
+    id<MTLBuffer> w_rel_r_all; /* enwik8 only: [L, NH, HD, D_POS] per-layer */
     id<MTLBuffer> b_rel_r;    /* [NH, total_len] tied rel PE bias */
     id<MTLBuffer> ln_final;   /* [2, H]: gamma_f, beta_f for LN_FINAL */
 } MPSTransformerWeightBuffers;
 
 bool mps_transformer_get_weight_buffers(MPSTransformerContext* ctx,
                                         MPSTransformerWeightBuffers* out);
+
+/** Set per-layer w_rel_r_all buffer (enwik8 only). Must be called after set_weights. */
+void mps_transformer_set_relr_all(MPSTransformerContext* ctx, id<MTLBuffer> w_rel_r_all);
 
 /**
  * Returns the configuration stored inside the context (zeroed on error).
