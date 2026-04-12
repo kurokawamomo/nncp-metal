@@ -182,6 +182,61 @@ struct ChkBwdLastCtx {
 };
 
 // ---------------------------------------------------------------------------
+// Per-layer reusable graphs (Phase 2: replaces 7-graph chunked approach)
+// ---------------------------------------------------------------------------
+
+struct PerLayerFwdGraph {
+    MPSGraph*        graph;
+    MPSGraphTensor*  x_in;       // [BT, H]
+    MPSGraphTensor*  w_q;        // [H, H]
+    MPSGraphTensor*  w_k;        // [H, H]
+    MPSGraphTensor*  w_v;        // [H, H]
+    MPSGraphTensor*  w_o;        // [H, H]
+    MPSGraphTensor*  w_ffn1;     // [H, FFN1_DIM]
+    MPSGraphTensor*  w_ffn2;     // [F, H]
+    MPSGraphTensor*  b_ffn1;     // [FFN1_DIM]
+    MPSGraphTensor*  b_ffn2;     // [H]
+    MPSGraphTensor*  w_ln;       // [4, H]
+    MPSGraphTensor*  w_rel_r;    // [NH, HD, D_POS]
+    MPSGraphTensor*  b_rel_r;    // [NH, EXT]
+    MPSGraphTensor*  kv_k;       // [B*MEM, H]
+    MPSGraphTensor*  kv_v;       // [B*MEM, H]
+    MPSGraphTensor*  x_out;      // [BT, H] output
+};
+
+struct PerLayerBwdGraph {
+    MPSGraph*        graph;
+    MPSGraphTensor*  x_in;       // [BT, H]
+    MPSGraphTensor*  grad_out;   // [BT, H]
+    MPSGraphTensor*  w_q, *w_k, *w_v, *w_o;
+    MPSGraphTensor*  w_ffn1, *w_ffn2;
+    MPSGraphTensor*  b_ffn1, *b_ffn2;
+    MPSGraphTensor*  w_ln;
+    MPSGraphTensor*  w_rel_r, *b_rel_r;
+    MPSGraphTensor*  kv_k, *kv_v;
+    // Outputs
+    MPSGraphTensor*  grad_in;    // [BT, H]
+    MPSGraphTensor*  dw_q, *dw_k, *dw_v, *dw_o;
+    MPSGraphTensor*  dw_ffn1, *dw_ffn2;
+    MPSGraphTensor*  db_ffn1, *db_ffn2;
+    MPSGraphTensor*  dw_ln;
+    MPSGraphTensor*  dw_rel_r, *db_rel_r;
+};
+
+struct LossBwdGraph {
+    MPSGraph*        graph;
+    MPSGraphTensor*  x_in;       // [BT, H]
+    MPSGraphTensor*  targets;    // [BT] int32
+    MPSGraphTensor*  w_ln_final; // [2, H]
+    MPSGraphTensor*  w_out;      // [H, V]
+    MPSGraphTensor*  b_out;      // [V]
+    // Outputs
+    MPSGraphTensor*  loss;       // scalar
+    MPSGraphTensor*  grad_in;    // [BT, H]
+    MPSGraphTensor*  dw_ln_final, *dw_out, *db_out;
+};
+
+// ---------------------------------------------------------------------------
 // Internal context struct
 // ---------------------------------------------------------------------------
 
@@ -453,6 +508,17 @@ struct OnlineTrainer {
     id<MTLBuffer>    chk_h[3];           // hidden checkpoints [BPTT_CHUNK_BT * H] float32
     id<MTLBuffer>    chk_dh[3];          // upstream grads [BPTT_CHUNK_BT * H] float32
     id<MTLBuffer>    chk_embed_buf;      // CPU-computed embedding output [BPTT_CHUNK_BT * H] float32
+
+    // ---- Per-layer reusable graphs (Phase 2) ----
+    bool              pl_ready;
+    PerLayerFwdGraph  pl_fwd;
+    PerLayerBwdGraph  pl_bwd;
+    LossBwdGraph      pl_loss;
+    id<MTLBuffer>     pl_h[SEG_MAX_LAYERS + 1]; // h[0..L]: per-layer hidden states [BT*H]
+    id<MTLBuffer>     pl_dh;                     // current upstream gradient [BT*H]
+    // Persistent per-layer weight slice views (zero-copy), created once to avoid
+    // per-call newBufferWithBytesNoCopy accumulation (~220 allocs/seg × thousands segs).
+    NSMutableDictionary<NSString*, id<MTLBuffer>>* pl_slice_views;
 };
 
 // ---------------------------------------------------------------------------
@@ -1847,6 +1913,367 @@ static MPSGraphTensor* build_chk_layers(
     return x;
 }
 
+// ---------------------------------------------------------------------------
+// Per-layer reusable graph: single transformer layer forward
+// Weight tensors are per-layer (pre-sliced on CPU), not [L,...] with in-graph slice.
+// ---------------------------------------------------------------------------
+
+static MPSGraphTensor* build_single_layer(
+    MPSGraph* g,
+    MPSGraphTensor* x,       // [BT, H]
+    MPSGraphTensor* w_q,     // [H, H]
+    MPSGraphTensor* w_k,     // [H, H]
+    MPSGraphTensor* w_v,     // [H, H]
+    MPSGraphTensor* w_o,     // [H, H]
+    MPSGraphTensor* w_ffn1,  // [H, FFN1_DIM]
+    MPSGraphTensor* w_ffn2,  // [F, H]
+    MPSGraphTensor* b_ffn1,  // [FFN1_DIM]
+    MPSGraphTensor* b_ffn2,  // [H]
+    MPSGraphTensor* w_ln,    // [4, H]
+    MPSGraphTensor* w_rel_r, // [NH, HD, D_POS]
+    MPSGraphTensor* b_rel_r, // [NH, EXT]
+    MPSGraphTensor* kv_k,    // [B*MEM, H]
+    MPSGraphTensor* kv_v,    // [B*MEM, H]
+    int B, int T, int BT,
+    uint32_t H, uint32_t NH, uint32_t HD, uint32_t F,
+    uint32_t D_POS, int MEM_LEN, int EXT_LEN,
+    MPSGraphTensor* causal_mask,
+    MPSGraphTensor* P_all_q,
+    MPSGraphTensor* Q_all_b,
+    MPSGraphTensor* b_rt_h)
+{
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const NSInteger FFN1_DIM = is_enwik8 ? (NSInteger)(2*F) : (NSInteger)F;
+    float scale = 1.0f / sqrtf((float)HD);
+
+    MPSGraphTensor* residual = x;
+
+    // LN params
+    MPSGraphTensor* gam1 = [g reshapeTensor:[g sliceTensor:w_ln dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
+    MPSGraphTensor* bet1 = [g reshapeTensor:[g sliceTensor:w_ln dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
+    MPSGraphTensor* gam2 = [g reshapeTensor:[g sliceTensor:w_ln dimension:0 start:2 length:1 name:nil] withShape:@[@(H)] name:nil];
+    MPSGraphTensor* bet2 = [g reshapeTensor:[g sliceTensor:w_ln dimension:0 start:3 length:1 name:nil] withShape:@[@(H)] name:nil];
+
+    // Pre-LN 1
+    MPSGraphTensor* x_ln = is_enwik8 ? tr_layer_norm(g, x, gam1, bet1) : x;
+
+    // QKV
+    MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_q name:nil];
+    MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_k name:nil];
+    MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_v name:nil];
+
+    // Multi-head reshape: [BT, H] → [B, NH, T, HD]
+    auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
+        t = [g reshapeTensor:t withShape:@[@(B), @(T), @(NH), @(HD)] name:nil];
+        return [g transposeTensor:t dimension:1 withDimension:2 name:nil];
+    };
+    MPSGraphTensor* q_mh = toMH(q);
+    MPSGraphTensor* k_mh = toMH(k);
+    MPSGraphTensor* v_mh = toMH(v);
+
+    // KV memory: [B*MEM, H] → [B, NH, MEM, HD]
+    auto memToMH = [&](MPSGraphTensor* m) -> MPSGraphTensor* {
+        m = [g reshapeTensor:m withShape:@[@(B), @(MEM_LEN), @(NH), @(HD)] name:nil];
+        return [g transposeTensor:m dimension:1 withDimension:2 name:nil];
+    };
+    MPSGraphTensor* k_ext = [g concatTensors:@[memToMH(kv_k), k_mh] dimension:2 name:nil];
+    MPSGraphTensor* v_ext = [g concatTensors:@[memToMH(kv_v), v_mh] dimension:2 name:nil];
+
+    // Attention scores
+    MPSGraphTensor* scores = [g matrixMultiplicationWithPrimaryTensor:q_mh
+        secondaryTensor:[g transposeTensor:k_ext dimension:2 withDimension:3 name:nil] name:nil];
+    scores = [g multiplicationWithPrimaryTensor:scores
+        secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32] name:nil];
+
+    // Relative PE (batched, same as build_chk_layers)
+    {
+        MPSGraphTensor* w_r4d = [g reshapeTensor:w_rel_r withShape:@[@1, @(NH), @(HD), @(D_POS)] name:nil];
+        MPSGraphTensor* q_rel_r = [g matrixMultiplicationWithPrimaryTensor:q_mh secondaryTensor:w_r4d name:nil];
+        MPSGraphTensor* q_bnh = [g reshapeTensor:q_rel_r withShape:@[@(B*NH), @(T), @(D_POS)] name:nil];
+        MPSGraphTensor* q4d = [g reshapeTensor:q_bnh withShape:@[@(B*NH), @(T), @1, @(D_POS)] name:nil];
+        MPSGraphTensor* q_gathered = [g matrixMultiplicationWithPrimaryTensor:q4d secondaryTensor:P_all_q name:nil];
+        MPSGraphTensor* q_rel = [g reshapeTensor:q_gathered withShape:@[@(B), @(NH), @(T), @(EXT_LEN)] name:nil];
+        q_rel = [g multiplicationWithPrimaryTensor:q_rel
+            secondaryTensor:[g constantWithScalar:scale dataType:MPSDataTypeFloat32] name:nil];
+
+        MPSGraphTensor* b_gath = [g matrixMultiplicationWithPrimaryTensor:Q_all_b secondaryTensor:b_rt_h name:nil];
+        b_gath = [g transposeTensor:b_gath dimension:0 withDimension:2 name:nil];
+        b_gath = [g transposeTensor:b_gath dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor* b_rel = [g reshapeTensor:b_gath withShape:@[@1, @(NH), @(T), @(EXT_LEN)] name:nil];
+        b_rel = [g multiplicationWithPrimaryTensor:b_rel
+            secondaryTensor:[g constantWithScalar:sqrtf((float)H) dataType:MPSDataTypeFloat32] name:nil];
+
+        scores = [g additionWithPrimaryTensor:scores
+            secondaryTensor:[g additionWithPrimaryTensor:q_rel secondaryTensor:b_rel name:nil] name:nil];
+    }
+
+    scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
+    scores = [g softMaxWithTensor:scores axis:-1 name:nil];
+
+    MPSGraphTensor* attn = [g matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v_ext name:nil];
+    attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil];
+    attn = [g reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];
+    attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o name:nil];
+
+    // Residual #1
+    MPSGraphTensor* res1 = [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil];
+    x = is_enwik8 ? res1 : tr_full_layer_norm(g, res1, gam1, bet1);
+    residual = x;
+
+    // Pre-LN 2 + FFN
+    MPSGraphTensor* x_ln2 = is_enwik8 ? tr_layer_norm(g, x, gam2, bet2) : x;
+    MPSGraphTensor* fp = [g additionWithPrimaryTensor:
+        [g matrixMultiplicationWithPrimaryTensor:x_ln2 secondaryTensor:w_ffn1 name:nil]
+        secondaryTensor:b_ffn1 name:nil];
+    MPSGraphTensor* ff;
+    if (is_enwik8) {
+        MPSGraphTensor* fv = [g sliceTensor:fp dimension:1 start:0 length:(NSInteger)F name:nil];
+        MPSGraphTensor* fg = [g sliceTensor:fp dimension:1 start:(NSInteger)F length:(NSInteger)F name:nil];
+        ff = [g multiplicationWithPrimaryTensor:tr_gelu(g, fv) secondaryTensor:fg name:nil];
+    } else {
+        ff = tr_gelu(g, fp);
+    }
+    ff = [g additionWithPrimaryTensor:
+        [g matrixMultiplicationWithPrimaryTensor:ff secondaryTensor:w_ffn2 name:nil]
+        secondaryTensor:b_ffn2 name:nil];
+
+    // Residual #2
+    MPSGraphTensor* res2 = [g additionWithPrimaryTensor:residual secondaryTensor:ff name:nil];
+    return is_enwik8 ? res2 : tr_full_layer_norm(g, res2, gam2, bet2);
+}
+
+// Build per-layer forward graph (compiled once, reused for all 20 layers)
+static void build_per_layer_fwd(OnlineTrainer* tr) {
+    const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
+    const int MEM_LEN = g_nncp_profile.mem_len;
+    const int EXT_LEN = MEM_LEN + T;
+    const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
+    const uint32_t D_POS = tr->d_pos;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const NSInteger FFN1_DIM = is_enwik8 ? (NSInteger)(2*F) : (NSInteger)F;
+
+    MPSGraph* g = [[MPSGraph alloc] init];
+    PerLayerFwdGraph& ctx = tr->pl_fwd;
+    ctx.graph = g;
+
+    // Placeholders (per-layer shapes, NOT [L,...])
+    ctx.x_in    = [g placeholderWithShape:@[@(BT), @(H)]           dataType:MPSDataTypeFloat32 name:@"pl_x"];
+    ctx.w_q     = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"pl_wq"];
+    ctx.w_k     = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"pl_wk"];
+    ctx.w_v     = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"pl_wv"];
+    ctx.w_o     = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"pl_wo"];
+    ctx.w_ffn1  = [g placeholderWithShape:@[@(H), @(FFN1_DIM)]     dataType:MPSDataTypeFloat32 name:@"pl_wf1"];
+    ctx.w_ffn2  = [g placeholderWithShape:@[@(F), @(H)]            dataType:MPSDataTypeFloat32 name:@"pl_wf2"];
+    ctx.b_ffn1  = [g placeholderWithShape:@[@(FFN1_DIM)]           dataType:MPSDataTypeFloat32 name:@"pl_bf1"];
+    ctx.b_ffn2  = [g placeholderWithShape:@[@(H)]                  dataType:MPSDataTypeFloat32 name:@"pl_bf2"];
+    ctx.w_ln    = [g placeholderWithShape:@[@4, @(H)]              dataType:MPSDataTypeFloat32 name:@"pl_wln"];
+    ctx.w_rel_r = [g placeholderWithShape:@[@(NH), @(HD), @(D_POS)] dataType:MPSDataTypeFloat32 name:@"pl_wr"];
+    ctx.b_rel_r = [g placeholderWithShape:@[@(NH), @(EXT_LEN)]     dataType:MPSDataTypeFloat32 name:@"pl_br"];
+    ctx.kv_k    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvk"];
+    ctx.kv_v    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvv"];
+
+    // Build constants (causal mask + relative PE tables)
+    std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
+    for (int t = 0; t < T; t++)
+        for (int k = MEM_LEN; k < EXT_LEN; k++)
+            if (k - MEM_LEN > t) mask_data[t * EXT_LEN + k] = -1e9f;
+    MPSGraphTensor* causal_mask = [g constantWithData:
+        [NSData dataWithBytes:mask_data.data() length:mask_data.size() * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
+    for (int t = 0; t < T; t++)
+        for (int k = 0; k < EXT_LEN; k++) {
+            int d = MEM_LEN + t - k;
+            q_dist_vec[t * EXT_LEN + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+            b_dist_vec[t * EXT_LEN + k] = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
+        }
+
+    // P_all_q [1, T, D_POS, EXT_LEN]
+    size_t p_total = (size_t)T * D_POS * EXT_LEN;
+    std::vector<float> p_all(p_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
+    MPSGraphTensor* P_all_q = [g constantWithData:
+        [NSData dataWithBytes:p_all.data() length:p_total * sizeof(float)]
+        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    // Q_all_b [T, EXT_LEN, EXT_LEN]
+    size_t b_total = (size_t)T * EXT_LEN * EXT_LEN;
+    std::vector<float> b_all(b_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            b_all[(size_t)ti * EXT_LEN * EXT_LEN + (size_t)kk * EXT_LEN + b_dist_vec[ti * EXT_LEN + kk]] = 1.f;
+    MPSGraphTensor* Q_all_b = [g constantWithData:
+        [NSData dataWithBytes:b_all.data() length:b_total * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    // b_rt_h: slice b_rel_r to [NH, EXT_LEN] → transpose → [1, EXT_LEN, NH]
+    MPSGraphTensor* b_r_sliced = [g sliceTensor:ctx.b_rel_r dimension:1 start:0 length:EXT_LEN name:nil];
+    MPSGraphTensor* b_rt_h = [g reshapeTensor:
+        [g transposeTensor:b_r_sliced dimension:0 withDimension:1 name:nil]
+        withShape:@[@1, @(EXT_LEN), @(NH)] name:nil];
+
+    ctx.x_out = build_single_layer(g, ctx.x_in,
+        ctx.w_q, ctx.w_k, ctx.w_v, ctx.w_o,
+        ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
+        ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
+        B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
+        causal_mask, P_all_q, Q_all_b, b_rt_h);
+}
+
+// Build per-layer backward graph (proxy loss method, compiled once)
+static void build_per_layer_bwd(OnlineTrainer* tr) {
+    const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
+    const int MEM_LEN = g_nncp_profile.mem_len;
+    const int EXT_LEN = MEM_LEN + T;
+    const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
+    const uint32_t D_POS = tr->d_pos;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const NSInteger FFN1_DIM = is_enwik8 ? (NSInteger)(2*F) : (NSInteger)F;
+
+    MPSGraph* g = [[MPSGraph alloc] init];
+    PerLayerBwdGraph& ctx = tr->pl_bwd;
+    ctx.graph = g;
+
+    // Placeholders
+    ctx.x_in     = [g placeholderWithShape:@[@(BT), @(H)]           dataType:MPSDataTypeFloat32 name:@"plb_x"];
+    ctx.grad_out = [g placeholderWithShape:@[@(BT), @(H)]           dataType:MPSDataTypeFloat32 name:@"plb_dh"];
+    ctx.w_q      = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"plb_wq"];
+    ctx.w_k      = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"plb_wk"];
+    ctx.w_v      = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"plb_wv"];
+    ctx.w_o      = [g placeholderWithShape:@[@(H), @(H)]            dataType:MPSDataTypeFloat32 name:@"plb_wo"];
+    ctx.w_ffn1   = [g placeholderWithShape:@[@(H), @(FFN1_DIM)]     dataType:MPSDataTypeFloat32 name:@"plb_wf1"];
+    ctx.w_ffn2   = [g placeholderWithShape:@[@(F), @(H)]            dataType:MPSDataTypeFloat32 name:@"plb_wf2"];
+    ctx.b_ffn1   = [g placeholderWithShape:@[@(FFN1_DIM)]           dataType:MPSDataTypeFloat32 name:@"plb_bf1"];
+    ctx.b_ffn2   = [g placeholderWithShape:@[@(H)]                  dataType:MPSDataTypeFloat32 name:@"plb_bf2"];
+    ctx.w_ln     = [g placeholderWithShape:@[@4, @(H)]              dataType:MPSDataTypeFloat32 name:@"plb_wln"];
+    ctx.w_rel_r  = [g placeholderWithShape:@[@(NH), @(HD), @(D_POS)] dataType:MPSDataTypeFloat32 name:@"plb_wr"];
+    ctx.b_rel_r  = [g placeholderWithShape:@[@(NH), @(EXT_LEN)]     dataType:MPSDataTypeFloat32 name:@"plb_br"];
+    ctx.kv_k     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvk"];
+    ctx.kv_v     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvv"];
+
+    // Same constants as fwd
+    std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
+    for (int t = 0; t < T; t++)
+        for (int k = MEM_LEN; k < EXT_LEN; k++)
+            if (k - MEM_LEN > t) mask_data[t * EXT_LEN + k] = -1e9f;
+    MPSGraphTensor* causal_mask = [g constantWithData:
+        [NSData dataWithBytes:mask_data.data() length:mask_data.size() * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
+    for (int t = 0; t < T; t++)
+        for (int k = 0; k < EXT_LEN; k++) {
+            int d = MEM_LEN + t - k;
+            q_dist_vec[t * EXT_LEN + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+            b_dist_vec[t * EXT_LEN + k] = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
+        }
+    size_t p_total = (size_t)T * D_POS * EXT_LEN;
+    std::vector<float> p_all(p_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
+    MPSGraphTensor* P_all_q = [g constantWithData:
+        [NSData dataWithBytes:p_all.data() length:p_total * sizeof(float)]
+        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+    size_t b_total = (size_t)T * EXT_LEN * EXT_LEN;
+    std::vector<float> b_all(b_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            b_all[(size_t)ti * EXT_LEN * EXT_LEN + (size_t)kk * EXT_LEN + b_dist_vec[ti * EXT_LEN + kk]] = 1.f;
+    MPSGraphTensor* Q_all_b = [g constantWithData:
+        [NSData dataWithBytes:b_all.data() length:b_total * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* b_r_sliced = [g sliceTensor:ctx.b_rel_r dimension:1 start:0 length:EXT_LEN name:nil];
+    MPSGraphTensor* b_rt_h = [g reshapeTensor:
+        [g transposeTensor:b_r_sliced dimension:0 withDimension:1 name:nil]
+        withShape:@[@1, @(EXT_LEN), @(NH)] name:nil];
+
+    // Forward recompute
+    MPSGraphTensor* h_out = build_single_layer(g, ctx.x_in,
+        ctx.w_q, ctx.w_k, ctx.w_v, ctx.w_o,
+        ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
+        ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
+        B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
+        causal_mask, P_all_q, Q_all_b, b_rt_h);
+
+    // Proxy loss
+    MPSGraphTensor* proxy = [g reductionSumWithTensor:
+        [g multiplicationWithPrimaryTensor:h_out secondaryTensor:ctx.grad_out name:nil]
+        axes:@[@0, @1] name:nil];
+
+    // Compute gradients
+    NSArray<MPSGraphTensor*>* wt = @[
+        ctx.x_in, ctx.w_q, ctx.w_k, ctx.w_v, ctx.w_o,
+        ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
+        ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r
+    ];
+    NSDictionary<MPSGraphTensor*, MPSGraphTensor*>* grads =
+        [g gradientForPrimaryTensor:proxy withTensors:wt name:nil];
+
+    ctx.grad_in  = grads[ctx.x_in];
+    ctx.dw_q     = grads[ctx.w_q];
+    ctx.dw_k     = grads[ctx.w_k];
+    ctx.dw_v     = grads[ctx.w_v];
+    ctx.dw_o     = grads[ctx.w_o];
+    ctx.dw_ffn1  = grads[ctx.w_ffn1];
+    ctx.dw_ffn2  = grads[ctx.w_ffn2];
+    ctx.db_ffn1  = grads[ctx.b_ffn1];
+    ctx.db_ffn2  = grads[ctx.b_ffn2];
+    ctx.dw_ln    = grads[ctx.w_ln];
+    ctx.dw_rel_r = grads[ctx.w_rel_r];
+    ctx.db_rel_r = grads[ctx.b_rel_r];
+}
+
+// Build loss backward graph (LN_FINAL + output proj + CE loss)
+static void build_loss_bwd(OnlineTrainer* tr) {
+    const int BT = BPTT_CHUNK_BT;
+    const uint32_t H = tr->H, V = tr->V;
+    MPSGraph* g = [[MPSGraph alloc] init];
+    LossBwdGraph& ctx = tr->pl_loss;
+    ctx.graph = g;
+
+    ctx.x_in       = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pll_x"];
+    ctx.targets    = [g placeholderWithShape:@[@(BT)]        dataType:MPSDataTypeInt32   name:@"pll_tgt"];
+    ctx.w_ln_final = [g placeholderWithShape:@[@2, @(H)]     dataType:MPSDataTypeFloat32 name:@"pll_wlnf"];
+    ctx.w_out      = [g placeholderWithShape:@[@(H), @(V)]   dataType:MPSDataTypeFloat32 name:@"pll_wout"];
+    ctx.b_out      = [g placeholderWithShape:@[@(V)]         dataType:MPSDataTypeFloat32 name:@"pll_bout"];
+
+    // LN_FINAL
+    MPSGraphTensor* gf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
+    MPSGraphTensor* bf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
+    MPSGraphTensor* x = tr_layer_norm(g, ctx.x_in, gf, bf);
+
+    // Output projection + clamp
+    MPSGraphTensor* logits = [g additionWithPrimaryTensor:
+        [g matrixMultiplicationWithPrimaryTensor:x secondaryTensor:ctx.w_out name:nil]
+        secondaryTensor:ctx.b_out name:nil];
+    {
+        MPSGraphTensor* cp = [g constantWithScalar: 50.f dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* cn = [g constantWithScalar:-50.f dataType:MPSDataTypeFloat32];
+        logits = [g minimumWithPrimaryTensor:logits secondaryTensor:cp name:nil];
+        logits = [g maximumWithPrimaryTensor:logits secondaryTensor:cn name:nil];
+    }
+
+    // CE loss
+    MPSGraphTensor* one_hot = [g oneHotWithIndicesTensor:ctx.targets depth:V axis:1
+                                               dataType:MPSDataTypeFloat32 name:nil];
+    ctx.loss = [g softMaxCrossEntropyWithSourceTensor:logits labelsTensor:one_hot
+                                                  axis:-1 reductionType:MPSGraphLossReductionTypeMean
+                                                  name:@"pll_loss"];
+
+    NSArray<MPSGraphTensor*>* wt = @[ctx.x_in, ctx.w_ln_final, ctx.w_out, ctx.b_out];
+    NSDictionary<MPSGraphTensor*, MPSGraphTensor*>* grads =
+        [g gradientForPrimaryTensor:ctx.loss withTensors:wt name:nil];
+
+    ctx.grad_in     = grads[ctx.x_in];
+    ctx.dw_ln_final = grads[ctx.w_ln_final];
+    ctx.dw_out      = grads[ctx.w_out];
+    ctx.db_out      = grads[ctx.b_out];
+}
+
 // Shared setup for relative PE index tables and causal mask used by all chunked graphs.
 struct ChkGraphSetup {
     int B, T, BT, MEM_LEN, EXT_LEN;
@@ -2400,24 +2827,20 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         build_layer_group_bwd_last_graph(tr);
     }
 
-    // ---- New 7-graph layer-chunked gradient checkpoint (L > 8) ----
+    // ---- Per-layer reusable graphs (Phase 2, replaces 7-graph chunked approach) ----
+    tr->pl_ready = false;
     tr->chunked_graph_built = false;
     if ((int)tr->L > 8) {
-        tr->chk_k = (int)tr->L / 4;
-        for (int g_idx = 0; g_idx < 3; g_idx++) {
-            tr->chk_fwd[g_idx].graph = [[MPSGraph alloc] init];
-            build_chunked_fwd_graph(tr, g_idx);
-        }
-        for (int g_idx = 1; g_idx <= 2; g_idx++) {
-            int midIdx = g_idx - 1;
-            tr->chk_mid[midIdx].graph = [[MPSGraph alloc] init];
-            build_chunked_bwd_mid_graph(tr, g_idx, midIdx);
-        }
-        tr->chk_first.graph = [[MPSGraph alloc] init];
-        build_chunked_bwd_first_graph(tr);
-        tr->chk_last.graph  = [[MPSGraph alloc] init];
-        build_chunked_bwd_last_graph(tr);
-        tr->chunked_graph_built = true;
+        build_per_layer_fwd(tr);
+        build_per_layer_bwd(tr);
+        build_loss_bwd(tr);
+        // Allocate h[0..L] buffers for saved hidden states
+        const size_t h_size = (size_t)BPTT_CHUNK_BT * tr->H;
+        for (uint32_t i = 0; i <= tr->L; i++)
+            tr->pl_h[i] = [device newBufferWithLength:h_size * sizeof(float) options:MTLResourceStorageModeShared];
+        tr->pl_dh = [device newBufferWithLength:h_size * sizeof(float) options:MTLResourceStorageModeShared];
+        tr->pl_slice_views = [NSMutableDictionary dictionary];
+        tr->pl_ready = true;
     }
 
     // ---- Pre-allocate gradient buffers ----
@@ -2667,10 +3090,8 @@ void online_trainer_flush(OnlineTrainer* tr) {
         copyGrad(tr->tb_grad_b_out,    tr->grad_b_out,    (size_t)V);
 
         if (tr->ps_rmsprop || tr->ps_sgd) {
-            // Gradient clipping (CPU, in-place)
-            clip_gradients(tr, tr->grad_clip);
-
             // Update LR schedule: count N samples, then compute new LR
+            clip_gradients(tr, tr->grad_clip);
             tr->train_step += (uint64_t)N;
             tr->lr = compute_lr(tr);
 
@@ -2760,7 +3181,312 @@ void online_trainer_latch_kv_memory(OnlineTrainer* tr) {
 }
 
 // ---------------------------------------------------------------------------
-// Layer-chunked training: 7-step flow per BPTT chunk.
+// Per-layer training: forward 20 layers, then backward 20 layers
+// copy_grads=true: COPY grads; copy_grads=false: ADD to existing grads.
+// ---------------------------------------------------------------------------
+
+static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
+    const MPSTransformerWeightBuffers& wb,
+    const int32_t* seg_inputs, const int32_t* seg_targets,
+    int t_start, bool copy_grads)
+{
+    const int B       = SEG_TRAIN_STREAMS;
+    const int T       = SEG_TRAIN_LEN;
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
+    const int BT      = (int)BPTT_CHUNK_BT;
+    const int MEM_LEN = g_nncp_profile.mem_len;
+    const int BM      = B * MEM_LEN;
+    uint32_t L = tr->L, H = tr->H, F = tr->F, V = tr->V;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const size_t FFN1_MULT = is_enwik8 ? 2UL : 1UL;
+    const size_t h_size = (size_t)BT * H;
+    const int EXT_LEN = MEM_LEN + T_CHUNK;
+
+    // 1. Pack tokens
+    {
+        int32_t* dst_in  = (int32_t*)[tr->seg_buf_input contents];
+        int32_t* dst_tgt = (int32_t*)[tr->seg_buf_target contents];
+        for (int s = 0; s < B; s++)
+            for (int t = 0; t < T_CHUNK; t++) {
+                dst_in [s * T_CHUNK + t] = seg_inputs [s * T + t_start + t];
+                dst_tgt[s * T_CHUNK + t] = seg_targets[s * T + t_start + t];
+            }
+    }
+
+    // 2. Reset KV memory
+    {
+        const size_t buf_slots = (size_t)B * (size_t)MEM_LEN;
+        for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li])
+                memcpy([tr->kv_mem_buf_k[li] contents], [tr->kv_pre_seg_buf_k[li] contents], buf_slots * H * sizeof(float));
+            else
+                memset([tr->kv_mem_buf_k[li] contents], 0, buf_slots * H * sizeof(float));
+            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_v[li])
+                memcpy([tr->kv_mem_buf_v[li] contents], [tr->kv_pre_seg_buf_v[li] contents], buf_slots * H * sizeof(float));
+            else
+                memset([tr->kv_mem_buf_v[li] contents], 0, buf_slots * H * sizeof(float));
+        }
+    }
+
+    // 3. CPU embedding → pl_h[0]
+    {
+        const float embed_scale = sqrtf((float)H);
+        const float* embed_ptr = (const float*)[wb.embed contents];
+        float* dst = (float*)[tr->pl_h[0] contents];
+        const int32_t* tokens = (const int32_t*)[tr->seg_buf_input contents];
+        for (int i = 0; i < BT; i++) {
+            int32_t tok = tokens[i];
+            if (tok < 0 || (uint32_t)tok >= V) tok = 0;
+            const float* src = embed_ptr + (size_t)tok * H;
+            float* d = dst + (size_t)i * H;
+            for (uint32_t j = 0; j < H; j++) d[j] = src[j] * embed_scale;
+        }
+    }
+
+    // Helpers
+    auto floatTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf shape:shape dataType:MPSDataTypeFloat32];
+    };
+    auto copyToBuffer = [](id<MTLBuffer> dst, MPSGraphTensorData* td) {
+        if (td && dst) [td.mpsndarray readBytes:[dst contents] strideBytes:NULL];
+    };
+    auto addToBuffer = [](id<MTLBuffer> dst, MPSGraphTensorData* td) {
+        if (!td || !dst) return;
+        size_t n = [dst length] / sizeof(float);
+        float* p = (float*)[dst contents];
+        std::vector<float> tmp(n);
+        [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
+        for (size_t i = 0; i < n; i++) p[i] += tmp[i];
+    };
+
+    NSArray<NSNumber*>* shape_h   = @[@(BT), @(H)];
+    NSArray<NSNumber*>* shape_wq  = @[@(H), @(H)];
+    NSArray<NSNumber*>* shape_wf1 = @[@(H), @(FFN1_MULT * F)];
+    NSArray<NSNumber*>* shape_wf2 = @[@(F), @(H)];
+    NSArray<NSNumber*>* shape_bf1 = @[@(FFN1_MULT * F)];
+    NSArray<NSNumber*>* shape_bf2 = @[@(H)];
+    NSArray<NSNumber*>* shape_wln = @[@4, @(H)];
+    NSArray<NSNumber*>* shape_wr  = @[@(tr->NH), @(tr->HD), @(tr->d_pos)];
+    NSArray<NSNumber*>* shape_br  = @[@(tr->NH), @(EXT_LEN)]; // must match graph placeholder (MEM+T, not mem+seg)
+    NSArray<NSNumber*>* shape_kv  = @[@(BM), @(H)];
+
+    // Per-trainer persistent slice view cache. Views are created once per
+    // (buffer, layer, size) and reused across all training segments. This avoids
+    // accumulating thousands of newBufferWithBytesNoCopy allocations which cause
+    // Metal internal resource pressure and eventually MPSNDArray private-memory
+    // assertions on the output path.
+    auto sliceTD = [&](id<MTLBuffer> buf, uint32_t layer, size_t per_layer_floats,
+                       NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
+        size_t byte_off = (size_t)layer * per_layer_floats * sizeof(float);
+        size_t byte_len = per_layer_floats * sizeof(float);
+        NSString* key     = [NSString stringWithFormat:@"%p_%u_%zu", (void*)buf, layer, per_layer_floats];
+        NSString* copyKey = [NSString stringWithFormat:@"copy_%@", key];
+        uint8_t* base = (uint8_t*)[buf contents];
+        id<MTLBuffer> view = tr->pl_slice_views[key];
+        if (view) {
+            // If this cached entry is a copy (not zero-copy into buf), refresh it.
+            if (tr->pl_slice_views[copyKey] != nil) {
+                memcpy([view contents], base + byte_off, byte_len);
+            }
+            return [[MPSGraphTensorData alloc] initWithMTLBuffer:view shape:shape dataType:MPSDataTypeFloat32];
+        }
+        size_t page = 16384;
+        size_t aligned_off = (byte_off / page) * page;
+        size_t delta = byte_off - aligned_off;
+        if (delta == 0) {
+            size_t aligned_len = ((byte_len + page - 1) / page) * page;
+            view = [tr->device newBufferWithBytesNoCopy:base
+                                                 length:aligned_len
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+        }
+        if (!view) {
+            // Fallback for mid-buffer offset: persistent copy buffer, refreshed per call.
+            view = [tr->device newBufferWithLength:byte_len options:MTLResourceStorageModeShared];
+            memcpy([view contents], base + byte_off, byte_len);
+            tr->pl_slice_views[copyKey] = view; // sentinel marking this as copy-type
+        }
+        tr->pl_slice_views[key] = view;
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:view shape:shape dataType:MPSDataTypeFloat32];
+    };
+
+    // Build per-layer feed helper
+    auto buildLayerFeeds = [&](NSMutableDictionary* feeds, PerLayerFwdGraph& fg, uint32_t layer,
+                                id<MTLBuffer> h_in_buf) {
+        feeds[fg.x_in]    = floatTD(h_in_buf, shape_h);
+        feeds[fg.w_q]     = sliceTD(wb.attn_q,   layer, H*H,           shape_wq);
+        feeds[fg.w_k]     = sliceTD(wb.attn_k,   layer, H*H,           shape_wq);
+        feeds[fg.w_v]     = sliceTD(wb.attn_v,   layer, H*H,           shape_wq);
+        feeds[fg.w_o]     = sliceTD(wb.attn_out,  layer, H*H,           shape_wq);
+        feeds[fg.w_ffn1]  = sliceTD(wb.ffn1,      layer, H*F*FFN1_MULT, shape_wf1);
+        feeds[fg.w_ffn2]  = sliceTD(wb.ffn2,      layer, F*H,           shape_wf2);
+        feeds[fg.b_ffn1]  = sliceTD(wb.b_ffn1,    layer, F*FFN1_MULT,   shape_bf1);
+        feeds[fg.b_ffn2]  = sliceTD(wb.b_ffn2,    layer, H,             shape_bf2);
+        feeds[fg.w_ln]    = sliceTD(wb.ln,         layer, 4*H,           shape_wln);
+        // w_rel_r: enwik8 per-layer from w_rel_r_all; default shared
+        if (is_enwik8 && wb.w_rel_r_all)
+            feeds[fg.w_rel_r] = sliceTD(wb.w_rel_r_all, layer, tr->NH*tr->HD*tr->d_pos, shape_wr);
+        else if (wb.w_rel_r)
+            feeds[fg.w_rel_r] = floatTD(wb.w_rel_r, shape_wr);
+        feeds[fg.b_rel_r] = floatTD(wb.b_rel_r, shape_br);
+        if (layer < SEG_MAX_LAYERS && tr->kv_mem_buf_k[layer])
+            feeds[fg.kv_k] = floatTD(tr->kv_mem_buf_k[layer], shape_kv);
+        if (layer < SEG_MAX_LAYERS && tr->kv_mem_buf_v[layer])
+            feeds[fg.kv_v] = floatTD(tr->kv_mem_buf_v[layer], shape_kv);
+    };
+
+    // ---- Forward pass: 20 layers ----
+    for (uint32_t i = 0; i < L; i++) {
+        @autoreleasepool {
+            NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
+            buildLayerFeeds(feeds, tr->pl_fwd, i, tr->pl_h[i]);
+            NSDictionary* res = [tr->pl_fwd.graph runWithFeeds:feeds
+                targetTensors:@[tr->pl_fwd.x_out] targetOperations:nil];
+            copyToBuffer(tr->pl_h[i + 1], res[tr->pl_fwd.x_out]);
+        }
+    }
+
+    // ---- Loss backward: LN_FINAL + CE ----
+    float loss_val = 0.0f;
+    @autoreleasepool {
+        NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
+        LossBwdGraph& lg = tr->pl_loss;
+        feeds[lg.x_in]       = floatTD(tr->pl_h[L], shape_h);
+        feeds[lg.targets]    = [[MPSGraphTensorData alloc] initWithMTLBuffer:tr->seg_buf_target
+                                 shape:@[@(BT)] dataType:MPSDataTypeInt32];
+        feeds[lg.w_ln_final] = floatTD(wb.ln_final, @[@2, @(H)]);
+        feeds[lg.w_out]      = floatTD(wb.out_proj, @[@(H), @(V)]);
+        feeds[lg.b_out]      = floatTD(wb.b_out, @[@(V)]);
+
+        NSMutableArray* targets = [NSMutableArray array];
+        [targets addObject:lg.loss];
+        if (lg.grad_in)     [targets addObject:lg.grad_in];
+        if (lg.dw_ln_final) [targets addObject:lg.dw_ln_final];
+        if (lg.dw_out)      [targets addObject:lg.dw_out];
+        if (lg.db_out)      [targets addObject:lg.db_out];
+
+        NSDictionary* res = [lg.graph runWithFeeds:feeds targetTensors:targets targetOperations:nil];
+        MPSGraphTensorData* lossData = res[lg.loss];
+        if (lossData) [lossData.mpsndarray readBytes:&loss_val strideBytes:NULL];
+        copyToBuffer(tr->pl_dh, res[lg.grad_in]);
+
+        auto putGrad = copy_grads ? copyToBuffer : addToBuffer;
+        putGrad(tr->grad_ln_final, res[lg.dw_ln_final]);
+        putGrad(tr->grad_out,      res[lg.dw_out]);
+        putGrad(tr->grad_b_out,    res[lg.db_out]);
+    }
+
+    // ---- Backward pass: 20 layers (reversed) ----
+    for (int i = (int)L - 1; i >= 0; i--) {
+        @autoreleasepool {
+            NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
+            PerLayerBwdGraph& bg = tr->pl_bwd;
+            // Same weight feeds as forward, but use bwd graph placeholders
+            feeds[bg.x_in]     = floatTD(tr->pl_h[i], shape_h);
+            feeds[bg.grad_out] = floatTD(tr->pl_dh, shape_h);
+            feeds[bg.w_q]      = sliceTD(wb.attn_q,   i, H*H,           shape_wq);
+            feeds[bg.w_k]      = sliceTD(wb.attn_k,   i, H*H,           shape_wq);
+            feeds[bg.w_v]      = sliceTD(wb.attn_v,   i, H*H,           shape_wq);
+            feeds[bg.w_o]      = sliceTD(wb.attn_out,  i, H*H,           shape_wq);
+            feeds[bg.w_ffn1]   = sliceTD(wb.ffn1,      i, H*F*FFN1_MULT, shape_wf1);
+            feeds[bg.w_ffn2]   = sliceTD(wb.ffn2,      i, F*H,           shape_wf2);
+            feeds[bg.b_ffn1]   = sliceTD(wb.b_ffn1,    i, F*FFN1_MULT,   shape_bf1);
+            feeds[bg.b_ffn2]   = sliceTD(wb.b_ffn2,    i, H,             shape_bf2);
+            feeds[bg.w_ln]     = sliceTD(wb.ln,         i, 4*H,           shape_wln);
+            if (is_enwik8 && wb.w_rel_r_all)
+                feeds[bg.w_rel_r] = sliceTD(wb.w_rel_r_all, i, tr->NH*tr->HD*tr->d_pos, shape_wr);
+            else if (wb.w_rel_r)
+                feeds[bg.w_rel_r] = floatTD(wb.w_rel_r, shape_wr);
+            feeds[bg.b_rel_r] = floatTD(wb.b_rel_r, shape_br);
+            if ((uint32_t)i < SEG_MAX_LAYERS && tr->kv_mem_buf_k[i])
+                feeds[bg.kv_k] = floatTD(tr->kv_mem_buf_k[i], shape_kv);
+            if ((uint32_t)i < SEG_MAX_LAYERS && tr->kv_mem_buf_v[i])
+                feeds[bg.kv_v] = floatTD(tr->kv_mem_buf_v[i], shape_kv);
+
+            NSMutableArray* tgts = [NSMutableArray array];
+            if (bg.grad_in)  [tgts addObject:bg.grad_in];
+            if (bg.dw_q)     [tgts addObject:bg.dw_q];
+            if (bg.dw_k)     [tgts addObject:bg.dw_k];
+            if (bg.dw_v)     [tgts addObject:bg.dw_v];
+            if (bg.dw_o)     [tgts addObject:bg.dw_o];
+            if (bg.dw_ffn1)  [tgts addObject:bg.dw_ffn1];
+            if (bg.dw_ffn2)  [tgts addObject:bg.dw_ffn2];
+            if (bg.db_ffn1)  [tgts addObject:bg.db_ffn1];
+            if (bg.db_ffn2)  [tgts addObject:bg.db_ffn2];
+            if (bg.dw_ln)    [tgts addObject:bg.dw_ln];
+            if (bg.dw_rel_r) [tgts addObject:bg.dw_rel_r];
+            if (bg.db_rel_r) [tgts addObject:bg.db_rel_r];
+
+            NSDictionary* res = [bg.graph runWithFeeds:feeds targetTensors:tgts targetOperations:nil];
+
+            // Update upstream gradient for next layer
+            copyToBuffer(tr->pl_dh, res[bg.grad_in]);
+
+            // Accumulate per-layer weight grads into the full [L,...] grad buffers
+            // For layer i: offset = i * per_layer_size for each weight
+            bool is_copy = (copy_grads && i == (int)L - 1);
+            auto putGrad = [&](id<MTLBuffer> full_buf, MPSGraphTensorData* td, size_t per_layer_n) {
+                if (!td || !full_buf) return;
+                float* dst = (float*)[full_buf contents] + (size_t)i * per_layer_n;
+                std::vector<float> tmp(per_layer_n);
+                [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
+                if (is_copy || copy_grads) {
+                    // First chunk: copy this layer; rest was not touched yet by this chunk
+                    memcpy(dst, tmp.data(), per_layer_n * sizeof(float));
+                } else {
+                    for (size_t j = 0; j < per_layer_n; j++) dst[j] += tmp[j];
+                }
+            };
+            putGrad(tr->grad_q,    res[bg.dw_q],    H * H);
+            putGrad(tr->grad_k,    res[bg.dw_k],    H * H);
+            putGrad(tr->grad_v,    res[bg.dw_v],    H * H);
+            putGrad(tr->grad_o,    res[bg.dw_o],    H * H);
+            putGrad(tr->grad_ffn1, res[bg.dw_ffn1], H * F * FFN1_MULT);
+            putGrad(tr->grad_ffn2, res[bg.dw_ffn2], F * H);
+            putGrad(tr->grad_b_ffn1, res[bg.db_ffn1], F * FFN1_MULT);
+            putGrad(tr->grad_b_ffn2, res[bg.db_ffn2], H);
+            putGrad(tr->grad_ln,   res[bg.dw_ln],   4 * H);
+            // rel_r: enwik8 per-layer → offset into rel_r_all; default → single buffer
+            if (is_enwik8 && tr->grad_rel_r_all)
+                putGrad(tr->grad_rel_r_all, res[bg.dw_rel_r], tr->NH * tr->HD * tr->d_pos);
+            else if (tr->grad_rel_r)
+                putGrad(tr->grad_rel_r, res[bg.dw_rel_r], tr->NH * tr->HD * tr->d_pos);
+            // b_rel_r: shared (not per-layer), always addToBuffer
+            if (bg.db_rel_r && res[bg.db_rel_r] && tr->grad_b_rel_r) {
+                float* dst = (float*)[tr->grad_b_rel_r contents];
+                size_t n = (size_t)tr->NH * tr->ext_len;
+                std::vector<float> tmp(n);
+                [((MPSGraphTensorData*)res[bg.db_rel_r]).mpsndarray readBytes:tmp.data() strideBytes:NULL];
+                if (copy_grads && i == (int)L - 1)
+                    memcpy(dst, tmp.data(), n * sizeof(float));
+                else
+                    for (size_t j = 0; j < n; j++) dst[j] += tmp[j];
+            }
+        }
+    }
+
+    // ---- Embed gradient (CPU) ----
+    // d(embed)/d(w_embed) = one_hot^T × dh × embed_scale
+    {
+        const float embed_scale = sqrtf((float)H);
+        const int32_t* tokens = (const int32_t*)[tr->seg_buf_input contents];
+        const float* dh = (const float*)[tr->pl_dh contents];
+        float* ge = (float*)[tr->grad_embed contents];
+        if (copy_grads) memset(ge, 0, (size_t)V * H * sizeof(float));
+        for (int i = 0; i < BT; i++) {
+            int32_t tok = tokens[i];
+            if (tok < 0 || (uint32_t)tok >= V) continue;
+            const float* dh_row = dh + (size_t)i * H;
+            float* ge_row = ge + (size_t)tok * H;
+            for (uint32_t j = 0; j < H; j++) ge_row[j] += dh_row[j] * embed_scale;
+        }
+    }
+
+    return loss_val;
+}
+
+// ---------------------------------------------------------------------------
+// Layer-chunked training: 7-step flow per BPTT chunk (legacy, kept for reference).
 // copy_grads=true: COPY grads; copy_grads=false: ADD to existing grads.
 // ---------------------------------------------------------------------------
 
@@ -3136,8 +3862,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         return false;
     }
 
-    // ---- Chunked path (L > 8) ----
-    if ((int)tr->L > 8 && tr->chunked_graph_built) {
+    // ---- Per-layer path (L > 8) ----
+    if ((int)tr->L > 8 && tr->pl_ready) {
         // @autoreleasepool: releases MTLCommandBuffer/Encoder from optimizer step and any
         // ObjC objects created by run_chunked_bptt_chunk that escape its inner pools.
         @autoreleasepool {
@@ -3149,8 +3875,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V;
         const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
 
-        float loss1 = run_chunked_bptt_chunk(tr, wb, seg_inputs, seg_targets, 0,       true);
-        float loss2 = run_chunked_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
+        float loss1 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, 0,       true);
+        float loss2 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
         float avg_loss = (loss1 + loss2) * 0.5f;
 
         // [WQNORM-DIAG]
@@ -3177,7 +3903,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         }
 
         if (tr->ps_rmsprop || tr->ps_sgd) {
-            clip_gradients(tr, tr->grad_clip);
             tr->train_step += 1ULL;
             tr->lr = compute_lr(tr);
 
@@ -3185,6 +3910,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                 fprintf(stderr, "[LR-DEBUG] step=%llu lr=%.2e loss=%.4f\n",
                         (unsigned long long)tr->train_step, tr->lr, avg_loss);
             }
+
+            clip_gradients(tr, tr->grad_clip);
 
             id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -3439,7 +4166,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
-        clip_gradients(tr, tr->grad_clip);
         tr->train_step += 1ULL;  // +1 per segment (= n_streams * seg_len bytes), matching original nncp.c
         tr->lr = compute_lr(tr);
 
@@ -3452,6 +4178,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                         (unsigned long long)tr->train_step, tr->lr, loss_val);
             }
         }
+
+        clip_gradients(tr, tr->grad_clip);
 
         id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

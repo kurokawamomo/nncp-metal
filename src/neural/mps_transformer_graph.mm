@@ -63,6 +63,7 @@ struct MPSTransformerContext {
     id<MTLComputePipelineState> ps_embedding;
     id<MTLComputePipelineState> ps_layer_norm;
     id<MTLComputePipelineState> ps_linear;
+    id<MTLComputePipelineState> ps_linear_amx;  // AMX-accelerated GEMM (dims must be 8-aligned)
     id<MTLComputePipelineState> ps_attn_score;
     id<MTLComputePipelineState> ps_attn_value;
     id<MTLComputePipelineState> ps_geglu;
@@ -482,6 +483,7 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_embedding           = makePSO(@"transformer_embedding_lookup");
     ctx->ps_layer_norm          = makePSO(@"transformer_layer_norm");
     ctx->ps_linear              = makePSO(@"transformer_linear");
+    ctx->ps_linear_amx          = makePSO(@"transformer_linear_amx");
     ctx->ps_attn_score          = makePSO(@"transformer_attention_score");
     ctx->ps_attn_value          = makePSO(@"transformer_attention_value");
     ctx->ps_geglu               = makePSO(@"transformer_geglu");
@@ -601,8 +603,11 @@ static inline uint16_t fp32_to_fp16_bits(float x) {
 
 static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
     if (!ctx || !ctx->kv_cache_valid) return;
-    // MGD graph uses shared w_rel_r; enwik8 per-layer w_rel_r_all is not supported
-    if (ctx->w_rel_r_all && !ctx->w_rel_r) { ctx->mgd_skipped = true; return; }
+    const bool mgd_per_layer_wr = (ctx->w_rel_r_all != nil);
+    // Metal compute + AMX path is 2.8x faster than MGD for enwik8.
+    // Skip MGD and use Metal compute path for all profiles.
+    (void)batch_size; (void)mgd_per_layer_wr;
+    return;
 
     const uint32_t H   = ctx->config.hidden_size;
     const uint32_t V   = ctx->config.vocab_size;
@@ -708,7 +713,10 @@ static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
     MPSGraphTensor* b_ffn1_all   = weightPH(@"b_ffn1",     @[@(L), @(2u*FFN)]);
     MPSGraphTensor* b_ffn2_all   = weightPH(@"b_ffn2",     @[@(L), @(H)]);
     MPSGraphTensor* b_out_t      = weightPH(@"b_out",      @[@(V)]);
-    MPSGraphTensor* w_rel_r_t    = weightPH(@"w_rel_r",    @[@(NH), @(HD), @(TL)]);
+    uint32_t D_POS = (uint32_t)g_nncp_profile.d_pos;
+    MPSGraphTensor* w_rel_r_t = mgd_per_layer_wr
+        ? weightPH(@"w_rel_r", @[@(L), @(NH), @(HD), @(D_POS)])
+        : weightPH(@"w_rel_r", @[@(NH), @(HD), @(TL)]);
     MPSGraphTensor* b_rel_r_t    = weightPH(@"b_rel_r",    @[@(NH), @(TL)]);
 
     // ---- Constant shorthands ----
@@ -743,9 +751,12 @@ static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
     // Reshape to [1, NH, 1, TL] for broadcast over [B, NH, 1, TL]
     MPSGraphTensor* b_rel_4d = [graph reshapeTensor:b_rel_gathered
                                           withShape:@[@1, @(NH), @1, @(TL)] name:nil];
-    // w_rel_r as [1, NH, HD, TL] for batched matmul
-    MPSGraphTensor* w_rel_r_4d = [graph reshapeTensor:w_rel_r_t
-                                            withShape:@[@1, @(NH), @(HD), @(TL)] name:nil];
+    // w_rel_r_4d: shared [1,NH,HD,TL] or per-layer (built inside loop)
+    MPSGraphTensor* w_rel_r_4d = nil;
+    if (!mgd_per_layer_wr) {
+        w_rel_r_4d = [graph reshapeTensor:w_rel_r_t
+                                withShape:@[@1, @(NH), @(HD), @(TL)] name:nil];
+    }
 
     const float attn_scale = 1.0f / sqrtf((float)HD);
     NSMutableArray<MPSGraphTensor*>* new_k_list = [NSMutableArray array];
@@ -838,9 +849,16 @@ static void build_mgd_graph(MPSTransformerContext* ctx, uint32_t batch_size) {
                                                         secondaryTensor:C(attn_scale) name:nil];
 
         // ---- Relative PE ----
-        // q_rel = Q_mh @ w_rel_r_4d: [B, NH, 1, HD] @ [1, NH, HD, TL] = [B, NH, 1, TL]
+        // For enwik8 per-layer: slice w_rel_r_t[i] from [L,NH,HD,D_POS] → [1,NH,HD,D_POS]
+        MPSGraphTensor* wr_4d_i = w_rel_r_4d;
+        if (mgd_per_layer_wr) {
+            MPSGraphTensor* wr_i = [graph sliceTensor:w_rel_r_t dimension:0
+                                                start:(NSInteger)i length:1 name:nil];
+            wr_4d_i = wr_i;  // already [1, NH, HD, D_POS]
+        }
+        // q_rel = Q_mh @ wr_4d_i: [B, NH, 1, HD] @ [1, NH, HD, D_POS] = [B, NH, 1, D_POS]
         MPSGraphTensor* q_rel_raw = [graph matrixMultiplicationWithPrimaryTensor:Q_mh
-                                                                 secondaryTensor:w_rel_r_4d name:nil];
+                                                                 secondaryTensor:wr_4d_i name:nil];
         // Gather q_rel at qdist: q_rel[b,h,0,t] = q_rel_raw[b,h,0,qdist[t]]
         MPSGraphTensor* q_rel = [graph gatherWithUpdatesTensor:q_rel_raw
                                                  indicesTensor:ph_qdist
@@ -1011,10 +1029,20 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
             makeTD((id<MTLBuffer>)ctx->mgd_kv_v_views[l], @[@(B), @(TL), @(H)], MPSDataTypeFloat16);
     }
     // Weight data: map each placeholder tensor → MPSGraphTensorData from weightCache
+    // For per-layer w_rel_r (enwik8), feed w_rel_r_all buffer directly
     for (NSString* name in ctx->mgd_weight_ph_map) {
         MPSGraphTensor* ph = ctx->mgd_weight_ph_map[name];
-        MPSGraphTensorData* td = ctx->weightCache[name];
-        if (ph && td) rfeeds[(id)ph] = td;
+        if ([name isEqualToString:@"w_rel_r"] && ctx->w_rel_r_all && !ctx->w_rel_r) {
+            uint32_t D_POS_f = (uint32_t)g_nncp_profile.d_pos;
+            uint32_t NH_f = ctx->config.num_heads;
+            uint32_t HD_f = ctx->config.head_dim;
+            rfeeds[(id)ph] = makeTD(ctx->w_rel_r_all,
+                                    @[@(L), @(NH_f), @(HD_f), @(D_POS_f)],
+                                    MPSDataTypeFloat32);
+        } else {
+            MPSGraphTensorData* td = ctx->weightCache[name];
+            if (ph && td) rfeeds[(id)ph] = td;
+        }
     }
 
     // ---- Build inputsArray ordered by executable's feedTensors (macOS 15+) ----
@@ -1088,6 +1116,303 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Batched segment decode: dispatch all T steps in one command buffer
+// ---------------------------------------------------------------------------
+
+// Encode one decode step onto an existing encoder (no commit).
+// The caller manages the command buffer lifecycle.
+static void encode_decode_step(MPSTransformerContext* ctx,
+                                id<MTLComputeCommandEncoder> enc,
+                                id<MTLBuffer> token_buf,   // [batch] int32 for this step
+                                id<MTLBuffer> logit_buf,   // [batch*V] float output for this step
+                                uint32_t batch_size,
+                                uint32_t kv_pos);  // forward declaration — implemented after dispatch_linear
+
+// Dispatch linear projection: uses AMX (simdgroup_matrix) when M, K, N are 8-aligned.
+static void dispatch_linear(id<MTLComputeCommandEncoder> enc,
+                             MPSTransformerContext* ctx,
+                             id<MTLBuffer> input, NSUInteger inp_off,
+                             id<MTLBuffer> weight, NSUInteger w_off,
+                             id<MTLBuffer> bias, NSUInteger b_off,
+                             id<MTLBuffer> output, NSUInteger out_off,
+                             uint32_t M, uint32_t K, uint32_t N) {
+    [enc setBuffer:input  offset:inp_off atIndex:0];
+    [enc setBuffer:weight offset:w_off   atIndex:1];
+    [enc setBuffer:bias   offset:b_off   atIndex:2];
+    [enc setBuffer:output offset:out_off atIndex:3];
+    [enc setBytes:&K length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
+
+    if (ctx->ps_linear_amx && (M % 8 == 0) && (K % 8 == 0) && (N % 8 == 0)) {
+        [enc setComputePipelineState:ctx->ps_linear_amx];
+        [enc dispatchThreadgroups:MTLSizeMake(N / 8, M / 8, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [enc setComputePipelineState:ctx->ps_linear];
+        [enc dispatchThreads:MTLSizeMake(N * 32u, M, 1)
+            threadsPerThreadgroup:MTLSizeMake(32u, MIN(M, 8u), 1)];
+    }
+}
+
+// Encode one decode step into an existing command encoder.
+// Does NOT commit — caller batches multiple steps into one command buffer.
+static void encode_decode_step(MPSTransformerContext* ctx,
+                                id<MTLComputeCommandEncoder> enc,
+                                id<MTLBuffer> token_buf,
+                                id<MTLBuffer> logit_buf,
+                                uint32_t batch_size,
+                                uint32_t kv_pos) {
+    const uint32_t H   = ctx->config.hidden_size;
+    const uint32_t V   = ctx->config.vocab_size;
+    const uint32_t L   = ctx->config.num_layers;
+    const uint32_t NH  = ctx->config.num_heads;
+    const uint32_t HD  = ctx->config.head_dim;
+    const uint32_t FFN = ctx->config.ffn_size;
+    const uint32_t max_sl = ctx->kv_total_len;
+    const float    eps = 1e-5f;
+    auto tg1D = [](uint32_t n) -> MTLSize { return MTLSizeMake(MIN(n, 64u), 1, 1); };
+
+    // Embedding
+    [enc setComputePipelineState:ctx->ps_embedding];
+    [enc setBuffer:token_buf           offset:0 atIndex:0];
+    [enc setBuffer:ctx->w_embed        offset:0 atIndex:1];
+    [enc setBuffer:ctx->dec_buf_embed  offset:0 atIndex:2];
+    [enc setBytes:&H length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&V length:sizeof(uint32_t) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(batch_size, H, 1)
+        threadsPerThreadgroup:MTLSizeMake(MIN(batch_size, 8u), MIN(H, 32u), 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Embed scale
+    {
+        uint32_t es = batch_size * H;
+        float sc = sqrtf((float)H);
+        [enc setComputePipelineState:ctx->ps_element_scale];
+        [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:0];
+        [enc setBytes:&sc length:sizeof(float) atIndex:1];
+        [enc setBytes:&es length:sizeof(uint32_t) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(es, 1, 1) threadsPerThreadgroup:tg1D(es)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+
+    id<MTLBuffer> x_buf = ctx->dec_buf_embed;
+    const bool use_post_ln = (g_nncp_profile.h != 1024);
+    const uint32_t ffn1_dec_out = (g_nncp_profile.h == 1024) ? 2u * FFN : FFN;
+
+    for (uint32_t layer = 0; layer < L; layer++) {
+        const NSUInteger off_HH    = (NSUInteger)layer * H * H * sizeof(float);
+        const NSUInteger off_FFN1  = (NSUInteger)layer * H * ffn1_dec_out * sizeof(float);
+        const NSUInteger off_FFN2  = (NSUInteger)layer * FFN * H * sizeof(float);
+        const NSUInteger off_LN    = (NSUInteger)layer * 4 * H * sizeof(float);
+        const NSUInteger off_bias_H   = (NSUInteger)layer * H * sizeof(float);
+        const NSUInteger off_bias_FFN = (NSUInteger)layer * ffn1_dec_out * sizeof(float);
+
+        id<MTLBuffer> bk_buf = ctx->w_b_k ?: ctx->dec_zero_H;
+        id<MTLBuffer> bv_buf = ctx->w_b_v ?: ctx->dec_zero_H;
+        id<MTLBuffer> bo_buf = ctx->w_b_o ?: ctx->dec_zero_H;
+        id<MTLBuffer> bffn1_buf = ctx->w_b_ffn1 ?: ctx->dec_zero_FFN2;
+        id<MTLBuffer> bffn2_buf = ctx->w_b_ffn2 ?: ctx->dec_zero_H;
+        NSUInteger bk_off = ctx->w_b_k ? off_bias_H : 0;
+        NSUInteger bv_off = ctx->w_b_v ? off_bias_H : 0;
+        NSUInteger bo_off = ctx->w_b_o ? off_bias_H : 0;
+        NSUInteger bffn1_off = ctx->w_b_ffn1 ? off_bias_FFN : 0;
+        NSUInteger bffn2_off = ctx->w_b_ffn2 ? off_bias_H : 0;
+
+        // Pre-LN 1
+        if (!use_post_ln) {
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:x_buf offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln1 offset:0 atIndex:1];
+            [enc setBuffer:ctx->w_ln offset:off_LN atIndex:2];
+            [enc setBuffer:ctx->w_ln offset:off_LN + H*sizeof(float) atIndex:3];
+            [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        id<MTLBuffer> qkv_src = use_post_ln ? x_buf : ctx->dec_buf_ln1;
+
+        // QKV
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_q, off_HH, ctx->dec_zero_H, 0, ctx->dec_buf_q, 0, batch_size, H, H);
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_k, off_HH, bk_buf, bk_off, ctx->dec_buf_k, 0, batch_size, H, H);
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_v, off_HH, bv_buf, bv_off, ctx->dec_buf_v, 0, batch_size, H, H);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // KV cache write
+        {
+            uint32_t layer_batch_base = layer * batch_size;
+            [enc setComputePipelineState:ctx->ps_kv_cache_write_batch];
+            [enc setBuffer:ctx->dec_buf_k offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_v offset:0 atIndex:1];
+            [enc setBuffer:ctx->kv_cache_k offset:0 atIndex:2];
+            [enc setBuffer:ctx->kv_cache_v offset:0 atIndex:3];
+            [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&max_sl length:sizeof(uint32_t) atIndex:5];
+            [enc setBytes:&kv_pos length:sizeof(uint32_t) atIndex:6];
+            [enc setBytes:&layer_batch_base length:sizeof(uint32_t) atIndex:7];
+            [enc dispatchThreads:MTLSizeMake(H, batch_size, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(H, 32u), MIN(batch_size, 8u), 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Attention
+        uint32_t kv_len = kv_pos + 1;
+        float attn_scale = 1.0f / sqrtf((float)HD);
+        NSUInteger kv_layer_off = (NSUInteger)layer * batch_size * max_sl * H * sizeof(uint16_t);
+        uint32_t d_pos_val = (uint32_t)g_nncp_profile.d_pos;
+        uint32_t total_len_v = (uint32_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len);
+
+        [enc setComputePipelineState:ctx->ps_attn_decode_cached];
+        [enc setBuffer:ctx->dec_buf_q offset:0 atIndex:0];
+        [enc setBuffer:ctx->kv_cache_k offset:kv_layer_off atIndex:1];
+        [enc setBuffer:ctx->kv_cache_v offset:kv_layer_off atIndex:2];
+        [enc setBuffer:ctx->dec_buf_attn_val offset:0 atIndex:3];
+        [enc setBuffer:ctx->dec_buf_scores_decode offset:0 atIndex:4];
+        [enc setBytes:&NH length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&HD length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&kv_len length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&max_sl length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&attn_scale length:sizeof(float) atIndex:9];
+        if (g_nncp_profile.h == 1024 && ctx->w_rel_r_all) {
+            NSUInteger wrel_off = (NSUInteger)layer * ctx->config.num_heads * HD * d_pos_val * sizeof(float);
+            [enc setBuffer:ctx->w_rel_r_all offset:wrel_off atIndex:10];
+        } else {
+            [enc setBuffer:ctx->w_rel_r offset:0 atIndex:10];
+        }
+        [enc setBuffer:ctx->b_rel_r offset:0 atIndex:11];
+        float b_rel_scale = sqrtf((float)H);
+        [enc setBytes:&d_pos_val length:sizeof(uint32_t) atIndex:12];
+        [enc setBytes:&total_len_v length:sizeof(uint32_t) atIndex:13];
+        [enc setBytes:&b_rel_scale length:sizeof(float) atIndex:14];
+        [enc dispatchThreads:MTLSizeMake(NH * 32u, batch_size, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // O projection
+        dispatch_linear(enc, ctx, ctx->dec_buf_attn_val, 0, ctx->w_attn_out, off_HH, bo_buf, bo_off, ctx->dec_buf_attn_proj, 0, batch_size, H, H);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Residual #1
+        uint32_t total_H = batch_size * H;
+        [enc setComputePipelineState:ctx->ps_element_add];
+        [enc setBuffer:x_buf offset:0 atIndex:0];
+        [enc setBuffer:ctx->dec_buf_attn_proj offset:0 atIndex:1];
+        [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:2];
+        [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // LN 2
+        if (use_post_ln) {
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln1 offset:0 atIndex:1];
+            [enc setBuffer:ctx->w_ln offset:off_LN atIndex:2];
+            [enc setBuffer:ctx->w_ln offset:off_LN + H*sizeof(float) atIndex:3];
+            [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ln2 offset:0 atIndex:1];
+            [enc setBuffer:ctx->w_ln offset:off_LN + 2*H*sizeof(float) atIndex:2];
+            [enc setBuffer:ctx->w_ln offset:off_LN + 3*H*sizeof(float) atIndex:3];
+            [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        id<MTLBuffer> ffn_src = use_post_ln ? ctx->dec_buf_ln1 : ctx->dec_buf_ln2;
+
+        // FFN1
+        dispatch_linear(enc, ctx, ffn_src, 0, ctx->w_ffn_1, off_FFN1, bffn1_buf, bffn1_off, ctx->dec_buf_ffn1, 0, batch_size, H, ffn1_dec_out);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Activation
+        id<MTLBuffer> ffn_act_out;
+        if (!use_post_ln) {
+            [enc setComputePipelineState:ctx->ps_geglu];
+            [enc setBuffer:ctx->dec_buf_ffn1 offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_geglu offset:0 atIndex:1];
+            [enc setBytes:&FFN length:sizeof(uint32_t) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(FFN, batch_size, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(FFN, 64u), MIN(batch_size, 8u), 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ffn_act_out = ctx->dec_buf_geglu;
+        } else {
+            uint32_t n_gelu = batch_size * FFN;
+            [enc setComputePipelineState:ctx->ps_gelu];
+            [enc setBuffer:ctx->dec_buf_ffn1 offset:0 atIndex:0];
+            [enc setBytes:&n_gelu length:sizeof(uint32_t) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_gelu, 1, 1) threadsPerThreadgroup:tg1D(n_gelu)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ffn_act_out = ctx->dec_buf_ffn1;
+        }
+
+        // FFN2
+        dispatch_linear(enc, ctx, ffn_act_out, 0, ctx->w_ffn_2, off_FFN2, bffn2_buf, bffn2_off, ctx->dec_buf_ffn2, 0, batch_size, FFN, H);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Residual #2
+        if (use_post_ln) {
+            [enc setComputePipelineState:ctx->ps_element_add];
+            [enc setBuffer:ctx->dec_buf_ln1 offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ffn2 offset:0 atIndex:1];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:2];
+            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->ps_layer_norm];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:1];
+            [enc setBuffer:ctx->w_ln offset:off_LN + 2*H*sizeof(float) atIndex:2];
+            [enc setBuffer:ctx->w_ln offset:off_LN + 3*H*sizeof(float) atIndex:3];
+            [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&eps length:sizeof(float) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            [enc setComputePipelineState:ctx->ps_element_add];
+            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
+            [enc setBuffer:ctx->dec_buf_ffn2 offset:0 atIndex:1];
+            [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:2];
+            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        x_buf = ctx->dec_buf_embed;
+    }
+
+    // LN_FINAL
+    if (g_nncp_profile.h == 1024 && ctx->w_ln_final) {
+        [enc setComputePipelineState:ctx->ps_layer_norm];
+        [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:0];
+        [enc setBuffer:ctx->dec_buf_ln1 offset:0 atIndex:1];
+        [enc setBuffer:ctx->w_ln_final offset:0 atIndex:2];
+        [enc setBuffer:ctx->w_ln_final offset:H*sizeof(float) atIndex:3];
+        [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&eps length:sizeof(float) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        x_buf = ctx->dec_buf_ln1;
+    }
+
+    // Output projection → logit_buf
+    id<MTLBuffer> b_out_buf = ctx->w_b_out ?: ctx->dec_zero_V;
+    [enc setComputePipelineState:ctx->ps_linear];
+    [enc setBuffer:x_buf offset:0 atIndex:0];
+    [enc setBuffer:ctx->w_out_proj offset:0 atIndex:1];
+    [enc setBuffer:b_out_buf offset:0 atIndex:2];
+    [enc setBuffer:logit_buf offset:0 atIndex:3];
+    [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&V length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(V * 32u, batch_size, 1)
+        threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 // Batched decode: process batch_size tokens simultaneously (one per stream),
@@ -1209,38 +1534,13 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         }
         id<MTLBuffer> qkv_src = use_post_ln ? x_buf : ctx->dec_buf_ln1;
 
-        // ---- Q, K, V projections: grid = [H*32, batch_size, 1] ----
-        [enc setComputePipelineState:ctx->ps_linear];
-
-        // Q (no bias: query_bias=0 per original NNCP default)
-        [enc setBuffer:qkv_src           offset:0      atIndex:0];
-        [enc setBuffer:ctx->w_attn_q     offset:off_HH atIndex:1];
-        [enc setBuffer:ctx->dec_zero_H   offset:0      atIndex:2];
-        [enc setBuffer:ctx->dec_buf_q    offset:0      atIndex:3];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
-
-        // K
-        [enc setBuffer:qkv_src          offset:0      atIndex:0];
-        [enc setBuffer:ctx->w_attn_k    offset:off_HH atIndex:1];
-        [enc setBuffer:bk_buf           offset:bk_off atIndex:2];
-        [enc setBuffer:ctx->dec_buf_k   offset:0      atIndex:3];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
-
-        // V
-        [enc setBuffer:qkv_src          offset:0      atIndex:0];
-        [enc setBuffer:ctx->w_attn_v    offset:off_HH atIndex:1];
-        [enc setBuffer:bv_buf           offset:bv_off atIndex:2];
-        [enc setBuffer:ctx->dec_buf_v   offset:0      atIndex:3];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
+        // ---- Q, K, V projections (AMX-accelerated when 8-aligned) ----
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_q, off_HH,
+                        ctx->dec_zero_H, 0, ctx->dec_buf_q, 0, batch_size, H, H);
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_k, off_HH,
+                        bk_buf, bk_off, ctx->dec_buf_k, 0, batch_size, H, H);
+        dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_v, off_HH,
+                        bv_buf, bv_off, ctx->dec_buf_v, 0, batch_size, H, H);
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -1310,16 +1610,9 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Attention output projection: grid = [H*32, batch_size, 1] ----
-        [enc setComputePipelineState:ctx->ps_linear];
-        [enc setBuffer:ctx->dec_buf_attn_val  offset:0      atIndex:0];
-        [enc setBuffer:ctx->w_attn_out        offset:off_HH atIndex:1];
-        [enc setBuffer:bo_buf                 offset:bo_off atIndex:2];
-        [enc setBuffer:ctx->dec_buf_attn_proj offset:0      atIndex:3];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
+        // ---- Attention output projection (AMX) ----
+        dispatch_linear(enc, ctx, ctx->dec_buf_attn_val, 0, ctx->w_attn_out, off_HH,
+                        bo_buf, bo_off, ctx->dec_buf_attn_proj, 0, batch_size, H, H);
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -1363,16 +1656,10 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         // FFN reads from dec_buf_ln1 (Post-LN, default) or dec_buf_ln2 (Pre-LN, enwik8)
         id<MTLBuffer> ffn_src = use_post_ln ? ctx->dec_buf_ln1 : ctx->dec_buf_ln2;
 
-        // ---- FFN1: [batch, H] → [batch, ffn1_dec_out] ----
-        [enc setComputePipelineState:ctx->ps_linear];
-        [enc setBuffer:ffn_src           offset:0         atIndex:0];
-        [enc setBuffer:ctx->w_ffn_1      offset:off_FFN1  atIndex:1];
-        [enc setBuffer:bffn1_buf         offset:bffn1_off atIndex:2];
-        [enc setBuffer:ctx->dec_buf_ffn1 offset:0         atIndex:3];
-        [enc setBytes:&H             length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&ffn1_dec_out  length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(ffn1_dec_out * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
+        // ---- FFN1 (AMX): [batch, H] → [batch, ffn1_dec_out] ----
+        dispatch_linear(enc, ctx, ffn_src, 0, ctx->w_ffn_1, off_FFN1,
+                        bffn1_buf, bffn1_off, ctx->dec_buf_ffn1, 0,
+                        batch_size, H, ffn1_dec_out);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // Activation: GeGLU (enwik8) → dec_buf_geglu, or GELU in-place (default)
@@ -1398,16 +1685,10 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
             ffn_act_out = ctx->dec_buf_ffn1;
         }
 
-        // ---- FFN2: [batch, FFN] → [batch, H] ----
-        [enc setComputePipelineState:ctx->ps_linear];
-        [enc setBuffer:ffn_act_out        offset:0         atIndex:0];
-        [enc setBuffer:ctx->w_ffn_2       offset:off_FFN2  atIndex:1];
-        [enc setBuffer:bffn2_buf          offset:bffn2_off atIndex:2];
-        [enc setBuffer:ctx->dec_buf_ffn2  offset:0         atIndex:3];
-        [enc setBytes:&FFN length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H   length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32u, batch_size, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u, MIN(batch_size, 8u), 1)];
+        // ---- FFN2 (AMX): [batch, FFN] → [batch, H] ----
+        dispatch_linear(enc, ctx, ffn_act_out, 0, ctx->w_ffn_2, off_FFN2,
+                        bffn2_buf, bffn2_off, ctx->dec_buf_ffn2, 0,
+                        batch_size, FFN, H);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         if (use_post_ln) {
@@ -2369,42 +2650,70 @@ void mps_transformer_execute_segment(
     }
 #endif
     const size_t V = (size_t)ctx->config.vocab_size;
+    const uint32_t B = (uint32_t)n_streams;
 
-    // Temporary buffer for one decode step: [n_streams × V].
-    float*   step_logits = (float*)  malloc((size_t)n_streams * V * sizeof(float));
-    int32_t* pos_tokens  = (int32_t*)malloc((size_t)n_streams * sizeof(int32_t));
-
-    if (!step_logits || !pos_tokens) {
-        free(step_logits); free(pos_tokens);
-        memset(logits_out, 0, (size_t)n_streams * seg_len * V * sizeof(float));
-        return;
-    }
-
-    // Run the decode fast path (KV-cache) once per segment position.
-    // Each call updates kv_cache_pos, accumulating causal context across the
-    // entire segment — equivalent to a causal prefill but using existing
-    // single-token infrastructure.
-    //
-    // input_tokens layout : [n_streams, seg_len]  row-major
-    // logits_out layout   : [n_streams, seg_len, V]  row-major
-    for (int t = 0; t < seg_len; t++) {
-        // Gather position-t tokens for all streams (non-contiguous → temp buf).
-        for (int s = 0; s < n_streams; s++)
-            pos_tokens[s] = input_tokens[s * seg_len + t];
-
-        bool ok = mps_transformer_execute_decode_fast(ctx, pos_tokens,
-                                                      step_logits, (uint32_t)n_streams);
-        if (!ok) memset(step_logits, 0, (size_t)n_streams * V * sizeof(float));
-
-        // Scatter step results into logits_out[(s * seg_len + t) * V].
-        for (int s = 0; s < n_streams; s++) {
-            memcpy(logits_out + ((size_t)s * seg_len + t) * V,
-                   step_logits + (size_t)s * V,
-                   V * sizeof(float));
+    // Ensure decode pipeline is ready
+    if (!ctx->decode_pipeline_ready || ctx->kv_cache_batch_size != B) {
+        ctx->decode_pipeline_ready = false;
+        ctx->mgd_ready = false;
+        if (!setup_decode_pipeline(ctx, B)) {
+            memset(logits_out, 0, (size_t)n_streams * seg_len * V * sizeof(float));
+            return;
         }
     }
-    // KV cache is already advanced by seg_len through the decode steps above.
 
-    free(step_logits);
-    free(pos_tokens);
+    // Reusable token buffer (allocated once, reused per step)
+    MTLResourceOptions sharedOpts = MTLResourceStorageModeShared;
+    if (!ctx->dec_buf_input || [ctx->dec_buf_input length] < B * sizeof(int32_t)) {
+        ctx->dec_buf_input = [ctx->device newBufferWithLength:B * sizeof(int32_t) options:sharedOpts];
+    }
+
+    // Per-step execution with @autoreleasepool to prevent ObjC object accumulation
+    for (int t = 0; t < seg_len; t++) {
+        @autoreleasepool {
+        // Fill token buffer for this step
+        int32_t* tok = (int32_t*)[ctx->dec_buf_input contents];
+        for (int s = 0; s < n_streams; s++)
+            tok[s] = input_tokens[s * seg_len + t];
+
+        id<MTLCommandBuffer> cmd = [ctx->commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        encode_decode_step(ctx, enc, ctx->dec_buf_input, ctx->dec_buf_logits, B,
+                           (uint32_t)ctx->kv_cache_pos);
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        // Copy logits for this step
+        float* src = (float*)[ctx->dec_buf_logits contents];
+        for (int s = 0; s < n_streams; s++) {
+            memcpy(logits_out + ((size_t)s * seg_len + t) * V,
+                   src + (size_t)s * V, V * sizeof(float));
+        }
+
+        ctx->kv_cache_pos++;
+        } // @autoreleasepool
+    }
+
+    // KV memory shift if needed
+    if (ctx->kv_cache_pos >= (NSUInteger)ctx->kv_total_len) {
+        uint32_t num_lb    = ctx->config.num_layers * ctx->kv_cache_batch_size;
+        uint32_t total_len = ctx->kv_total_len;
+        uint32_t mem_len   = ctx->kv_memory_len;
+        uint32_t n_shift   = num_lb * mem_len * ctx->config.hidden_size;
+        id<MTLCommandBuffer> sc = [ctx->commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
+        [se setComputePipelineState:ctx->ps_kv_memory_shift];
+        [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
+        [se setBuffer:ctx->kv_cache_v offset:0 atIndex:1];
+        [se setBytes:&total_len length:sizeof(uint32_t) atIndex:2];
+        [se setBytes:&mem_len   length:sizeof(uint32_t) atIndex:3];
+        [se setBytes:&ctx->config.hidden_size length:sizeof(uint32_t) atIndex:4];
+        [se dispatchThreads:MTLSizeMake(n_shift, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n_shift, 64u), 1, 1)];
+        [se endEncoding]; [sc commit]; [sc waitUntilCompleted];
+        ctx->kv_cache_pos = ctx->kv_memory_len;
+    }
 }

@@ -59,7 +59,7 @@ if(USE_METAL)
     if(METAL_COMPILER AND METAL_AVAILABLE EQUAL 0)
         add_custom_command(
             OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
-            COMMAND xcrun -sdk macosx metal ${METAL_SOURCES} -o ${CMAKE_BINARY_DIR}/default.metallib
+            COMMAND xcrun -sdk macosx metal -std=metal3.0 ${METAL_SOURCES} -o ${CMAKE_BINARY_DIR}/default.metallib
             DEPENDS ${METAL_SOURCES}
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             COMMENT "Compiling Metal shaders"

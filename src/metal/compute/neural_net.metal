@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // Activation functions
@@ -83,6 +84,39 @@ kernel void transformer_linear(
     float sum = simd_sum(partial);
     if (lane == 0)
         output[batch_idx * out_dim + out_idx] = sum;
+}
+
+// 3b. AMX-accelerated GEMM using simdgroup_matrix (Metal 3.0+)
+// output[m, n] = sum_k(input[m, k] * weight[k, n]) + bias[n]
+// Each simdgroup computes one 8×8 output tile.
+// Requires M, K, N all multiples of 8 (used for Q/K/V/O/FFN projections, NOT output proj).
+// Dispatch: threadgroups [N/8, M/8, 1], threads_per_threadgroup [32, 1, 1] (1 simdgroup)
+kernel void transformer_linear_amx(
+    device const float* input  [[buffer(0)]],  // [M, K]
+    device const float* weight [[buffer(1)]],  // [K, N] row-major
+    device const float* bias   [[buffer(2)]],  // [N]
+    device float*       output [[buffer(3)]],  // [M, N]
+    constant uint& K [[buffer(4)]],  // in_dim
+    constant uint& N [[buffer(5)]],  // out_dim
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint m_start = tgid.y * 8;
+    uint n_start = tgid.x * 8;
+
+    // Initialize accumulator to bias (broadcast: same row for all 8 rows)
+    simdgroup_float8x8 c;
+    simdgroup_load(c, bias + n_start, 0);  // stride=0 → broadcast row
+
+    // Tiled GEMM: accumulate K/8 tiles
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, input  + m_start * K + k,       K);  // [8, 8] tile from input
+        simdgroup_load(b, weight + k       * N + n_start, N);  // [8, 8] tile from weight
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+
+    simdgroup_store(c, output + m_start * N + n_start, N);
 }
 
 // 4. Multi-Head Attention: Score Computation (Q * K^T) + Mask + Softmax + (Score * V)
