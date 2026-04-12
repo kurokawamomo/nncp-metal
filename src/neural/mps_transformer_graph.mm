@@ -63,7 +63,9 @@ struct MPSTransformerContext {
     id<MTLComputePipelineState> ps_embedding;
     id<MTLComputePipelineState> ps_layer_norm;
     id<MTLComputePipelineState> ps_linear;
-    id<MTLComputePipelineState> ps_linear_amx;  // AMX-accelerated GEMM (dims must be 8-aligned)
+    id<MTLComputePipelineState> ps_linear_amx;       // AMX-accelerated GEMM
+    id<MTLComputePipelineState> ps_linear_residual;  // fused GEMM + residual add
+    id<MTLComputePipelineState> ps_linear_residual_amx;
     id<MTLComputePipelineState> ps_attn_score;
     id<MTLComputePipelineState> ps_attn_value;
     id<MTLComputePipelineState> ps_geglu;
@@ -484,6 +486,8 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_layer_norm          = makePSO(@"transformer_layer_norm");
     ctx->ps_linear              = makePSO(@"transformer_linear");
     ctx->ps_linear_amx          = makePSO(@"transformer_linear_amx");
+    ctx->ps_linear_residual     = makePSO(@"transformer_linear_residual");
+    ctx->ps_linear_residual_amx = makePSO(@"transformer_linear_residual_amx");
     ctx->ps_attn_score          = makePSO(@"transformer_attention_score");
     ctx->ps_attn_value          = makePSO(@"transformer_attention_value");
     ctx->ps_geglu               = makePSO(@"transformer_geglu");
@@ -1157,6 +1161,34 @@ static void dispatch_linear(id<MTLComputeCommandEncoder> enc,
     }
 }
 
+// Fused GEMM + residual add: output = matmul(input, weight) + bias + residual
+static void dispatch_linear_residual(id<MTLComputeCommandEncoder> enc,
+                                      MPSTransformerContext* ctx,
+                                      id<MTLBuffer> input, NSUInteger inp_off,
+                                      id<MTLBuffer> weight, NSUInteger w_off,
+                                      id<MTLBuffer> bias, NSUInteger b_off,
+                                      id<MTLBuffer> output, NSUInteger out_off,
+                                      id<MTLBuffer> residual, NSUInteger res_off,
+                                      uint32_t M, uint32_t K, uint32_t N) {
+    [enc setBuffer:input    offset:inp_off atIndex:0];
+    [enc setBuffer:weight   offset:w_off   atIndex:1];
+    [enc setBuffer:bias     offset:b_off   atIndex:2];
+    [enc setBuffer:output   offset:out_off atIndex:3];
+    [enc setBytes:&K length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
+    [enc setBuffer:residual offset:res_off atIndex:6];
+
+    if (ctx->ps_linear_residual_amx && (M % 8 == 0) && (K % 8 == 0) && (N % 8 == 0)) {
+        [enc setComputePipelineState:ctx->ps_linear_residual_amx];
+        [enc dispatchThreadgroups:MTLSizeMake(N / 8, M / 8, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [enc setComputePipelineState:ctx->ps_linear_residual];
+        [enc dispatchThreads:MTLSizeMake(N * 32u, M, 1)
+            threadsPerThreadgroup:MTLSizeMake(32u, MIN(M, 8u), 1)];
+    }
+}
+
 // Encode one decode step into an existing command encoder.
 // Does NOT commit — caller batches multiple steps into one command buffer.
 static void encode_decode_step(MPSTransformerContext* ctx,
@@ -1290,18 +1322,12 @@ static void encode_decode_step(MPSTransformerContext* ctx,
         [enc dispatchThreads:MTLSizeMake(NH * 32u, batch_size, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // O projection
-        dispatch_linear(enc, ctx, ctx->dec_buf_attn_val, 0, ctx->w_attn_out, off_HH, bo_buf, bo_off, ctx->dec_buf_attn_proj, 0, batch_size, H, H);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // Residual #1
+        // O projection + residual #1 (fused)
         uint32_t total_H = batch_size * H;
-        [enc setComputePipelineState:ctx->ps_element_add];
-        [enc setBuffer:x_buf offset:0 atIndex:0];
-        [enc setBuffer:ctx->dec_buf_attn_proj offset:0 atIndex:1];
-        [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:2];
-        [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+        dispatch_linear_residual(enc, ctx,
+            ctx->dec_buf_attn_val, 0, ctx->w_attn_out, off_HH,
+            bo_buf, bo_off, ctx->dec_buf_x_mid, 0,
+            x_buf, 0, batch_size, H, H);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // LN 2
@@ -1353,19 +1379,15 @@ static void encode_decode_step(MPSTransformerContext* ctx,
             ffn_act_out = ctx->dec_buf_ffn1;
         }
 
-        // FFN2
-        dispatch_linear(enc, ctx, ffn_act_out, 0, ctx->w_ffn_2, off_FFN2, bffn2_buf, bffn2_off, ctx->dec_buf_ffn2, 0, batch_size, FFN, H);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // Residual #2
+        // FFN2 + Residual #2 (fused)
         if (use_post_ln) {
-            [enc setComputePipelineState:ctx->ps_element_add];
-            [enc setBuffer:ctx->dec_buf_ln1 offset:0 atIndex:0];
-            [enc setBuffer:ctx->dec_buf_ffn2 offset:0 atIndex:1];
-            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:2];
-            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
-            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            // post-LN: output = FFN2(act) + dec_buf_ln1 → dec_buf_x_mid
+            dispatch_linear_residual(enc, ctx,
+                ffn_act_out, 0, ctx->w_ffn_2, off_FFN2,
+                bffn2_buf, bffn2_off, ctx->dec_buf_x_mid, 0,
+                ctx->dec_buf_ln1, 0, batch_size, FFN, H);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // Post-LN 2: dec_buf_x_mid → dec_buf_embed
             [enc setComputePipelineState:ctx->ps_layer_norm];
             [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
             [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:1];
@@ -1376,12 +1398,11 @@ static void encode_decode_step(MPSTransformerContext* ctx,
             [enc dispatchThreads:MTLSizeMake(batch_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         } else {
-            [enc setComputePipelineState:ctx->ps_element_add];
-            [enc setBuffer:ctx->dec_buf_x_mid offset:0 atIndex:0];
-            [enc setBuffer:ctx->dec_buf_ffn2 offset:0 atIndex:1];
-            [enc setBuffer:ctx->dec_buf_embed offset:0 atIndex:2];
-            [enc setBytes:&total_H length:sizeof(uint32_t) atIndex:3];
-            [enc dispatchThreads:MTLSizeMake(total_H, 1, 1) threadsPerThreadgroup:tg1D(total_H)];
+            // pre-LN: output = FFN2(act) + dec_buf_x_mid → dec_buf_embed
+            dispatch_linear_residual(enc, ctx,
+                ffn_act_out, 0, ctx->w_ffn_2, off_FFN2,
+                bffn2_buf, bffn2_off, ctx->dec_buf_embed, 0,
+                ctx->dec_buf_x_mid, 0, batch_size, FFN, H);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
         x_buf = ctx->dec_buf_embed;

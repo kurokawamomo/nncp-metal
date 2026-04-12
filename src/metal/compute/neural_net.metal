@@ -62,6 +62,70 @@ kernel void transformer_layer_norm(
 }
 
 // 3. Linear projection: Y = X @ W + b
+// Fused GEMM + residual add: output = matmul(input, weight) + bias + residual
+// Same dispatch as transformer_linear: [out_dim*32, batch, 1], threadgroup [32, 8, 1]
+kernel void transformer_linear_residual(
+    device const float* input    [[buffer(0)]],
+    device const float* weight   [[buffer(1)]],
+    device const float* bias     [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint& in_dim  [[buffer(4)]],
+    constant uint& out_dim [[buffer(5)]],
+    device const float* residual [[buffer(6)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint out_idx   = gid.x / 32;
+    uint batch_idx = gid.y;
+    if (out_idx >= out_dim) return;
+
+    float partial = (lane == 0) ? bias[out_idx] : 0.0f;
+    for (uint i = lane; i < in_dim; i += 32)
+        partial += input[batch_idx * in_dim + i] * weight[i * out_dim + out_idx];
+
+    float sum = simd_sum(partial);
+    if (lane == 0)
+        output[batch_idx * out_dim + out_idx] = sum + residual[batch_idx * out_dim + out_idx];
+}
+
+// AMX version of fused GEMM + residual add
+kernel void transformer_linear_residual_amx(
+    device const float* input    [[buffer(0)]],
+    device const float* weight   [[buffer(1)]],
+    device const float* bias     [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    device const float* residual [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint m_start = tgid.y * 8;
+    uint n_start = tgid.x * 8;
+
+    simdgroup_float8x8 c;
+    simdgroup_load(c, bias + n_start, 0);
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, input  + m_start * K + k,       K);
+        simdgroup_load(b, weight + k       * N + n_start, N);
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+
+    // Store GEMM result, then add residual (simdgroup_matrix has no element-wise add)
+    simdgroup_store(c, output + m_start * N + n_start, N);
+
+    // Element-wise residual add (each lane handles one element)
+    // 8×8 = 64 elements, 32 lanes → 2 elements per lane
+    for (uint i = lane; i < 64; i += 32) {
+        uint row = i / 8;
+        uint col = i % 8;
+        uint idx = (m_start + row) * N + (n_start + col);
+        output[idx] += residual[idx];
+    }
+}
+
 // SIMD-parallel: 32 lanes per output element, dispatch [out_dim*32, batch, 1], threadgroup [32, 8, 1]
 kernel void transformer_linear(
     device const float* input  [[buffer(0)]],
