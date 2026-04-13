@@ -526,3 +526,515 @@ kernel void element_add(
     if (gid >= size) return;
     output[gid] = a[gid] + b[gid];
 }
+
+// =============================================================================
+// Phase M-1: Manual Metal backward kernels
+//
+// All kernels are FP32 and deterministic (fixed accumulation order, no atomics).
+// Each kernel is designed so a single simdgroup owns each output element/tile,
+// so reductions are through simd_sum (ordered) or serial k-loops (ordered).
+// =============================================================================
+
+// B1. linear_bw_input: dX = dY @ W^T   (forward: Y = X @ W + b)
+//   shapes: dY [M, N], W [K, N] row-major, dX [M, K]
+//   dX[m,k] = sum_n dY[m,n] * W[k,n]
+// AMX tiled: 1 simdgroup per 8x8 output tile of dX
+// Dispatch: threadgroups [K/8, M/8, 1], threads_per_threadgroup [32, 1, 1]
+// Requires M, K multiples of 8; N handled in 8-step loop (must be multiple of 8).
+kernel void linear_bw_input_amx(
+    device const float* dY     [[buffer(0)]],  // [M, N]
+    device const float* W      [[buffer(1)]],  // [K, N]
+    device float*       dX     [[buffer(2)]],  // [M, K]
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint m_start = tgid.y * 8;
+    uint k_start = tgid.x * 8;
+
+    simdgroup_float8x8 c;
+    simdgroup_float8x8 zero;
+    simdgroup_load(zero, dY, 0);  // dummy; will overwrite with zero-fill via multiply
+    // Zero-init c by subtracting itself
+    c = simdgroup_float8x8(0.0f);
+
+    // dX[m,k] = sum_n dY[m,n] * W[k,n]
+    // As tiles: C[8,8] += A[8,8] * B^T[8,8] where A=dY tile, B=W tile with rows k,k+7 and cols n
+    for (uint n = 0; n < N; n += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, dY + m_start * N + n, N, ulong2(0, 0), false);  // [8(m), 8(n)]
+        // W tile at rows [k_start..+8), cols [n..+8) — we want its transpose so that
+        //   b_t[n_col, k_row] acts as the B matrix multiplied from the right.
+        simdgroup_load(b, W + k_start * N + n, N, ulong2(0, 0), true);    // transposed: [8(n), 8(k)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+
+    simdgroup_store(c, dX + m_start * K + k_start, K);
+}
+
+// B2. linear_bw_weight: dW = X^T @ dY   (forward: Y = X @ W + b)
+//   shapes: X [M, K], dY [M, N], dW [K, N]
+//   dW[k,n] = sum_m X[m,k] * dY[m,n]
+// Dispatch: threadgroups [N/8, K/8, 1], threads_per_threadgroup [32, 1, 1]
+// Requires K, N multiples of 8; M handled in 8-step loop.
+kernel void linear_bw_weight_amx(
+    device const float* X      [[buffer(0)]],  // [M, K]
+    device const float* dY     [[buffer(1)]],  // [M, N]
+    device float*       dW     [[buffer(2)]],  // [K, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint k_start = tgid.y * 8;
+    uint n_start = tgid.x * 8;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+
+    // dW[k,n] = sum_m X[m,k] * dY[m,n]
+    // tile: C[8(k),8(n)] += A^T[8(k),8(m)] * B[8(m),8(n)]
+    for (uint m = 0; m < M; m += 8) {
+        simdgroup_float8x8 a, b;
+        // X tile rows [m..+8), cols [k_start..+8); transpose so rows become k
+        simdgroup_load(a, X  + m * K + k_start, K, ulong2(0, 0), true);   // [8(k), 8(m)]
+        simdgroup_load(b, dY + m * N + n_start, N, ulong2(0, 0), false);  // [8(m), 8(n)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+
+    simdgroup_store(c, dW + k_start * N + n_start, N);
+}
+
+// B3. linear_bw_bias: db[n] = sum_m dY[m, n]
+// Dispatch: [N*32, 1, 1]  — 32 lanes per output element
+kernel void linear_bw_bias(
+    device const float* dY [[buffer(0)]],  // [M, N]
+    device float*       db [[buffer(1)]],  // [N]
+    constant uint& M [[buffer(2)]],
+    constant uint& N [[buffer(3)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint n = gid / 32;
+    if (n >= N) return;
+    float partial = 0.0f;
+    for (uint m = lane; m < M; m += 32)
+        partial += dY[m * N + n];
+    float sum = simd_sum(partial);
+    if (lane == 0) db[n] = sum;
+}
+
+// B4. rmsnorm_bw: RMSNorm(x) = x * inv_rms * gamma   (no mean subtraction, no beta)
+//   Given saved y = x * inv_rms * gamma (so x_norm = x*inv_rms = y/gamma)
+//   and inv_rms [batch], and gamma [D]:
+//     gy_s = grad_y * gamma
+//     grad_x = inv_rms * (gy_s - x_norm * mean_d(gy_s * x_norm))
+//     d_gamma[i] += sum_batch grad_y[b,i] * x_norm[b,i]
+//
+// Here we pass x directly (not saved y) — easier and the forward always has x in scope.
+// Dispatch rmsnorm_bw_x:   [batch * 32, 1, 1]   threadgroup [32,1,1]   (per-vector reduction)
+// Dispatch rmsnorm_bw_gamma: [D * 32, 1, 1]     threadgroup [32,1,1]   (per-column reduction)
+kernel void rmsnorm_bw_x(
+    device const float* grad_y  [[buffer(0)]],  // [B, D]
+    device const float* x       [[buffer(1)]],  // [B, D]
+    device const float* gamma   [[buffer(2)]],  // [D]
+    device const float* inv_rms [[buffer(3)]],  // [B]
+    device float*       grad_x  [[buffer(4)]],  // [B, D]
+    constant uint& D [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint b = gid / 32;
+    uint base = b * D;
+    float ir = inv_rms[b];
+
+    // mean_d(gy_s * x_norm) where gy_s = grad_y*gamma, x_norm = x*ir
+    // = ir * mean_d(grad_y * gamma * x)
+    float partial = 0.0f;
+    for (uint i = lane; i < D; i += 32)
+        partial += grad_y[base + i] * gamma[i] * x[base + i];
+    float s = simd_sum(partial) * ir / (float)D;  // mean(gy_s * x_norm)
+
+    for (uint i = lane; i < D; i += 32) {
+        float gy_s = grad_y[base + i] * gamma[i];
+        float xn   = x[base + i] * ir;
+        grad_x[base + i] = ir * (gy_s - xn * s);
+    }
+}
+
+kernel void rmsnorm_bw_gamma(
+    device const float* grad_y  [[buffer(0)]],  // [B, D]
+    device const float* x       [[buffer(1)]],  // [B, D]
+    device const float* inv_rms [[buffer(2)]],  // [B]
+    device float*       d_gamma [[buffer(3)]],  // [D]
+    constant uint& B [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint i = gid / 32;
+    if (i >= D) return;
+    float partial = 0.0f;
+    for (uint b = lane; b < B; b += 32)
+        partial += grad_y[b * D + i] * x[b * D + i] * inv_rms[b];
+    float sum = simd_sum(partial);
+    if (lane == 0) d_gamma[i] = sum;
+}
+
+// B5. softmax_bw: dx[i] = y[i] * (dy[i] - sum_j dy[j]*y[j])
+//   y is the saved softmax output.
+// Dispatch: [row_count * 32, 1, 1], threadgroup [32, 1, 1]
+kernel void softmax_bw(
+    device const float* dy     [[buffer(0)]],  // [B, D]
+    device const float* y      [[buffer(1)]],  // [B, D]
+    device float*       dx     [[buffer(2)]],  // [B, D]
+    constant uint& D [[buffer(3)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint b = gid / 32;
+    uint base = b * D;
+    float partial = 0.0f;
+    for (uint i = lane; i < D; i += 32)
+        partial += dy[base + i] * y[base + i];
+    float s = simd_sum(partial);
+    for (uint i = lane; i < D; i += 32)
+        dx[base + i] = y[base + i] * (dy[base + i] - s);
+}
+
+// B6. geglu_bw: forward is y = GELU(val) * gate, input layout [B, 2D] = [val|gate]
+//   grad_val  = grad_y * gate * gelu'(val)
+//   grad_gate = grad_y * GELU(val)
+//   grad_x    = concat(grad_val, grad_gate)  at same 2D layout
+// Dispatch: [D, B, 1]
+kernel void geglu_bw(
+    device const float* grad_y [[buffer(0)]],  // [B, D]
+    device const float* x      [[buffer(1)]],  // [B, 2D] (val | gate)
+    device float*       grad_x [[buffer(2)]],  // [B, 2D]
+    constant uint& D [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;
+    uint b = gid.y;
+    if (d >= D) return;
+    const uint row2 = b * 2u * D;
+    float val  = x[row2 + d];
+    float gate = x[row2 + D + d];
+    float gy   = grad_y[b * D + d];
+
+    // gelu(v) and gelu'(v)
+    const float k0 = 0.7978845608028654f; // sqrt(2/pi)
+    float v2 = val * val;
+    float inner = k0 * (val + 0.044715f * val * v2);
+    float th = tanh(inner);
+    float sech2 = 1.0f - th * th;
+    float gelu_v = 0.5f * val * (1.0f + th);
+    float dinner = k0 * (1.0f + 3.0f * 0.044715f * v2);
+    float gelu_prime = 0.5f * (1.0f + th) + 0.5f * val * sech2 * dinner;
+
+    grad_x[row2 + d]     = gy * gate * gelu_prime;  // grad_val
+    grad_x[row2 + D + d] = gy * gelu_v;             // grad_gate
+}
+
+
+/* ========================================================================
+ * Backward kernels merged from backward_kernels.metal (Pane2 → M-2 prep)
+ *   B11: ce_softmax_fused_bw
+ *   B9:  rel_pe_q_scatter_bw, rel_pe_br_scatter_bw(_v2)
+ *   B10: embed_bw(_simd)
+ * Deterministic (no atomic scatter-add).
+ * ======================================================================== */
+
+/* ========================================================================
+ * B11: Fused cross-entropy + softmax backward
+ *
+ * Computes: d_logits[b, v] = softmax(logits)[b, v] - onehot(target[b])[v]
+ *
+ * This is the most efficient form of CE+softmax backward:
+ *   ∂L/∂logits = P(v) - 1{v == target}
+ *
+ * Input:
+ *   logits:  [B, V] float — raw logits (before softmax)
+ *   targets: [B]    int32 — target class indices
+ * Output:
+ *   d_logits: [B, V] float — gradient of loss w.r.t. logits
+ *
+ * Dispatch: [V, B, 1], threadgroup [min(V, 256), 1, 1]
+ *
+ * The kernel computes softmax inline (max-shift for stability)
+ * then subtracts 1.0 at the target index.
+ * ======================================================================== */
+
+kernel void ce_softmax_fused_bw(
+    device const float*   logits   [[buffer(0)]],  // [B, V]
+    device const int32_t* targets  [[buffer(1)]],  // [B]
+    device float*         d_logits [[buffer(2)]],  // [B, V]
+    constant uint&        V        [[buffer(3)]],  // vocab_size
+    uint2 gid [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint v = gid.x;
+    uint b = gid.y;
+    if (v >= V) return;
+
+    // Pointer to this batch element's logits
+    device const float* row = logits + (size_t)b * V;
+
+    // Pass 1: find max (for numerical stability)
+    // Each thread finds max over its stride
+    float local_max = -1e30f;
+    for (uint i = lane; i < V; i += 32)
+        local_max = max(local_max, row[i]);
+    float row_max = simd_max(local_max);
+
+    // Pass 2: compute sum of exp(logits - max)
+    float local_sum = 0.0f;
+    for (uint i = lane; i < V; i += 32)
+        local_sum += exp(row[i] - row_max);
+    float row_sum = simd_sum(local_sum);
+
+    // Compute softmax probability for this element
+    float prob = exp(row[v] - row_max) / row_sum;
+
+    // Subtract 1.0 at target index: d_logits = prob - onehot(target)
+    int32_t target = targets[b];
+    float grad = prob - ((int32_t)v == target ? 1.0f : 0.0f);
+
+    d_logits[(size_t)b * V + v] = grad;
+}
+
+// Variant: SIMD-parallel version for large V (one simdgroup per batch element)
+// Dispatch: [V_padded, B, 1] where V_padded = ceil(V/32)*32
+// This version is simpler — each thread handles one V element
+kernel void ce_softmax_fused_bw_simple(
+    device const float*   logits   [[buffer(0)]],
+    device const int32_t* targets  [[buffer(1)]],
+    device float*         d_logits [[buffer(2)]],
+    constant uint&        V        [[buffer(3)]],
+    uint gid_x [[thread_position_in_grid]],
+    uint gid_y [[threads_per_grid]]
+) {
+    // Simple per-element version: requires softmax to be pre-computed
+    // or we recompute per element (wasteful). Use the simd version above instead.
+}
+
+/* ========================================================================
+ * B9: Relative PE backward — q_rel scatter (deterministic)
+ *
+ * Forward:
+ *   q_rel_raw = Q_mh @ W_rel_r            [B*NH, 1, HD] @ [NH, HD, D_POS] → [B*NH, 1, D_POS]
+ *   q_rel_shifted[t] = q_rel_raw[qdist[t]] for each t in 0..TL-1
+ *
+ * Backward (scatter of d_q_rel_shifted → d_q_rel_raw):
+ *   d_q_rel_raw[d] = sum_t { d_q_rel_shifted[t] * (qdist[t] == d) }
+ *
+ * This is the transpose of the forward gather: P^T @ d_q_rel_shifted
+ * where P[d, t] = 1 if qdist[t] == d.
+ *
+ * For determinism (no atomic scatter-add), we use the dense matmul approach:
+ *   d_q_rel_raw = d_q_rel_shifted @ P     (P^T applied via matmul)
+ *
+ * But P is a permutation matrix, so the matmul is just an indexed copy.
+ * For T=1 (decode), qdist has only TL entries → P is [D_POS, TL].
+ * We compute d_q_rel_raw[d] = sum over t where qdist[t]==d of d_q_rel_shifted[t].
+ *
+ * Simpler deterministic approach for decode (T=1):
+ *   For each d in 0..D_POS-1:
+ *     d_q_rel_raw[b*NH + h, d] = sum_{t: qdist[t]==d} d_q_rel_shifted[b*NH + h, t]
+ *
+ * Since multiple t values can map to the same d, we need the full sum.
+ * This is inherently a reduction, but since we iterate over t (not scatter to d),
+ * it's deterministic.
+ *
+ * Dispatch: [D_POS, B*NH, 1], threadgroup [min(D_POS, 64), 1, 1]
+ * Each thread handles one (batch*head, d_pos) output element.
+ * ======================================================================== */
+
+kernel void rel_pe_q_scatter_bw(
+    device const float*   d_shifted  [[buffer(0)]],  // [B*NH, TL] d_q_rel_shifted
+    device float*         d_raw      [[buffer(1)]],  // [B*NH, D_POS] d_q_rel_raw (output)
+    device const int32_t* qdist      [[buffer(2)]],  // [TL] index mapping
+    constant uint&        TL         [[buffer(3)]],  // total KV length
+    constant uint&        D_POS      [[buffer(4)]],  // d_pos dimension
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;    // d_pos index
+    uint bnh = gid.y;  // batch * num_heads index
+    if (d >= D_POS) return;
+
+    // Deterministic reduction: for each t, check if qdist[t] == d
+    float sum = 0.0f;
+    for (uint t = 0; t < TL; t++) {
+        if ((uint)qdist[t] == d) {
+            sum += d_shifted[bnh * TL + t];
+        }
+    }
+    d_raw[bnh * D_POS + d] = sum;
+}
+
+/* ========================================================================
+ * B9: Relative PE backward — b_rel_r scatter (deterministic)
+ *
+ * Forward:
+ *   b_rel[h, t] = b_rel_r[h, bdist[t]] * sqrt(H)
+ *
+ * Backward:
+ *   d_b_rel_r[h, d] = sqrt(H) * sum_{t: bdist[t]==d} d_scores[h, t]
+ *
+ * Same deterministic reduction approach as q_scatter.
+ *
+ * Dispatch: [TL, NH, 1] — one thread per (head, bdist_target) pair
+ * ======================================================================== */
+
+kernel void rel_pe_br_scatter_bw(
+    device const float*   d_scores   [[buffer(0)]],  // [B, NH, 1, TL] or [NH, TL]
+    device float*         d_b_rel_r  [[buffer(1)]],  // [NH, TL] (accumulate)
+    device const int32_t* bdist      [[buffer(2)]],  // [TL]
+    constant uint&        TL         [[buffer(3)]],
+    constant uint&        B          [[buffer(4)]],
+    constant float&       b_scale    [[buffer(5)]],  // sqrt(H)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;   // target position in b_rel_r
+    uint h = gid.y;   // head index
+    if (d >= TL) return;
+
+    // Deterministic reduction: accumulate from all t where bdist[t] == d
+    // Sum across all batch elements
+    float sum = 0.0f;
+    for (uint t = 0; t < TL; t++) {
+        if ((uint)bdist[t] == d) {
+            // d_scores layout: [B, NH, 1, TL] → batch loop
+            for (uint b = 0; b < B; b++) {
+                sum += d_scores[b * gid.y /* NH placeholder */ + h * TL + t];
+                // NOTE: actual index depends on d_scores layout
+                // For [B, NH, 1, TL]: index = b * NH * TL + h * TL + t
+            }
+        }
+    }
+    d_b_rel_r[h * TL + d] += sum * b_scale;
+}
+
+// Corrected version with explicit stride
+kernel void rel_pe_br_scatter_bw_v2(
+    device const float*   d_scores   [[buffer(0)]],  // [B, NH, TL] flattened
+    device float*         d_b_rel_r  [[buffer(1)]],  // [NH, TL] output (zero-initialized)
+    device const int32_t* bdist      [[buffer(2)]],  // [TL]
+    constant uint&        TL         [[buffer(3)]],
+    constant uint&        NH         [[buffer(4)]],
+    constant uint&        B          [[buffer(5)]],
+    constant float&       b_scale    [[buffer(6)]],  // sqrt(H)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;   // target d_pos index in b_rel_r
+    uint h = gid.y;   // head index
+    if (d >= TL || h >= NH) return;
+
+    float sum = 0.0f;
+    for (uint t = 0; t < TL; t++) {
+        if ((uint)bdist[t] == d) {
+            for (uint b = 0; b < B; b++) {
+                sum += d_scores[(size_t)b * NH * TL + h * TL + t];
+            }
+        }
+    }
+    d_b_rel_r[h * TL + d] = sum * b_scale;
+}
+
+/* ========================================================================
+ * B10: Embedding backward (deterministic)
+ *
+ * Forward:
+ *   output[b, h] = W_embed[token_id[b], h] * embed_scale
+ *
+ * Backward:
+ *   d_W_embed[v, h] += sum_{b: token_id[b]==v} d_output[b, h] * embed_scale
+ *
+ * For determinism (no atomic scatter-add), we use the oneHot+matmul approach:
+ *   oneHot: [B, V] where oneHot[b, token_id[b]] = 1
+ *   d_W_embed = oneHot^T @ d_output * embed_scale  → [V, B] @ [B, H] = [V, H]
+ *
+ * But constructing the full oneHot matrix is wasteful for large V.
+ * Instead, for each (v, h) output element, we sum over matching batch elements:
+ *   d_W_embed[v, h] = embed_scale * sum_{b: token_id[b]==v} d_output[b, h]
+ *
+ * This is deterministic because we iterate over b (not scatter to v).
+ * For B=32 (small), the inner loop is cheap.
+ *
+ * Dispatch: [H, V, 1] with threadgroup [min(H, 64), 1, 1]
+ * Each thread handles one (v, h) element of d_W_embed.
+ *
+ * Note: This kernel ACCUMULATES into d_W_embed (+=), so it must be
+ * zero-initialized before the first call, or called with accumulate=false.
+ * ======================================================================== */
+
+kernel void embed_bw(
+    device const float*   d_output    [[buffer(0)]],  // [B, H] upstream gradient
+    device const int32_t* token_ids   [[buffer(1)]],  // [B] input token IDs
+    device float*         d_W_embed   [[buffer(2)]],  // [V, H] weight gradient (accumulate)
+    constant uint&        B           [[buffer(3)]],  // batch size
+    constant uint&        H           [[buffer(4)]],  // hidden_size
+    constant uint&        V           [[buffer(5)]],  // vocab_size
+    constant float&       embed_scale [[buffer(6)]],  // sqrt(d_model)
+    constant uint&        accumulate  [[buffer(7)]],  // 0=overwrite, 1=add
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint h = gid.x;  // hidden dimension
+    uint v = gid.y;  // vocab index
+    if (h >= H || v >= V) return;
+
+    // Sum d_output[b, h] for all b where token_ids[b] == v
+    float sum = 0.0f;
+    for (uint b = 0; b < B; b++) {
+        if ((uint)token_ids[b] == v) {
+            sum += d_output[b * H + h];
+        }
+    }
+
+    float grad = sum * embed_scale;
+    uint idx = v * H + h;
+    if (accumulate) {
+        d_W_embed[idx] += grad;
+    } else {
+        d_W_embed[idx] = grad;
+    }
+}
+
+// Optimized: SIMD-parallel version using simd_sum for the batch reduction
+// Dispatch: [H * 32, V, 1], threadgroup [32, min(V, 8), 1]
+// 32 lanes cooperate on one (v, h) pair — each lane handles B/32 batch elements
+kernel void embed_bw_simd(
+    device const float*   d_output    [[buffer(0)]],
+    device const int32_t* token_ids   [[buffer(1)]],
+    device float*         d_W_embed   [[buffer(2)]],
+    constant uint&        B           [[buffer(3)]],
+    constant uint&        H           [[buffer(4)]],
+    constant uint&        V           [[buffer(5)]],
+    constant float&       embed_scale [[buffer(6)]],
+    constant uint&        accumulate  [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint h = gid.x / 32;
+    uint v = gid.y;
+    if (h >= H || v >= V) return;
+
+    // Each lane sums over a subset of batch elements
+    float partial = 0.0f;
+    for (uint b = lane; b < B; b += 32) {
+        if ((uint)token_ids[b] == v) {
+            partial += d_output[b * H + h];
+        }
+    }
+    float sum = simd_sum(partial);
+
+    if (lane == 0) {
+        float grad = sum * embed_scale;
+        uint idx = v * H + h;
+        if (accumulate) {
+            d_W_embed[idx] += grad;
+        } else {
+            d_W_embed[idx] = grad;
+        }
+    }
+}

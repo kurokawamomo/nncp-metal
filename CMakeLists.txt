@@ -137,6 +137,13 @@ if(USE_METAL)
     )
 
     target_compile_definitions(nncp PRIVATE USE_METAL=1)
+    # Phase M-2 Part 1: Metal backward path (opt-in). When ON, wires Metal
+    # kernels for loss/layer backward via metal_bw_* helpers in online_trainer.mm.
+    option(NNCP_METAL_BW "Enable Metal backward compute path (Phase M-2)" OFF)
+    if(NNCP_METAL_BW)
+        target_compile_definitions(nncp PRIVATE NNCP_METAL_BW=1)
+        message(STATUS "  Metal-BW (Phase M-2): enabled")
+    endif()
     add_dependencies(nncp metal_shaders)
 
     add_custom_command(TARGET nncp POST_BUILD
@@ -147,6 +154,32 @@ if(USE_METAL)
     )
 
     install(TARGETS nncp DESTINATION bin)
+
+    # Phase M-1 backward kernel verification harness
+    add_executable(bw_verify src/metal/bw_verify.mm)
+    target_link_libraries(bw_verify
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK}
+    )
+    add_dependencies(bw_verify metal_shaders)
+    add_custom_command(TARGET bw_verify POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_BINARY_DIR}/default.metallib
+            $<TARGET_FILE_DIR:bw_verify>/default.metallib
+    )
+
+    # Phase M-2 Part 1 loss-backward verification
+    add_executable(m2_verify src/metal/m2_verify.mm)
+    target_link_libraries(m2_verify
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK}
+    )
+    add_dependencies(m2_verify metal_shaders)
+    add_custom_command(TARGET m2_verify POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_BINARY_DIR}/default.metallib
+            $<TARGET_FILE_DIR:m2_verify>/default.metallib
+    )
 endif()
 
 message(STATUS "")
