@@ -62,10 +62,14 @@ struct MPSTransformerContext {
     // Compute pipeline states (loaded from default.metallib / neural_net.metal)
     id<MTLComputePipelineState> ps_embedding;
     id<MTLComputePipelineState> ps_layer_norm;
+    id<MTLComputePipelineState> ps_layer_norm_fused;       // Wave 4: threadgroup-staged RMSNorm
+    id<MTLComputePipelineState> ps_layer_norm_fused_full;  // Wave 4: Post-LN variant
     id<MTLComputePipelineState> ps_linear;
     id<MTLComputePipelineState> ps_linear_amx;       // AMX-accelerated GEMM
     id<MTLComputePipelineState> ps_linear_residual;  // fused GEMM + residual add
     id<MTLComputePipelineState> ps_linear_residual_amx;
+    id<MTLComputePipelineState> ps_linear_amx_bf16;   // Wave 4: BF16 decode FFN
+    id<MTLComputePipelineState> ps_fp32_to_bf16;      // element-wise FP32→BF16 cast
     id<MTLComputePipelineState> ps_attn_score;
     id<MTLComputePipelineState> ps_attn_value;
     id<MTLComputePipelineState> ps_geglu;
@@ -118,6 +122,7 @@ struct MPSTransformerContext {
     id<MTLComputePipelineState> ps_kv_cache_write;
     id<MTLComputePipelineState> ps_kv_cache_write_batch;
     id<MTLComputePipelineState> ps_attn_decode_cached;
+    id<MTLComputePipelineState> ps_attn_decode_cached_online;  // Wave4: online-softmax variant
     id<MTLComputePipelineState> ps_kv_memory_shift;
 
     bool decode_pipeline_ready;
@@ -174,6 +179,10 @@ struct MPSTransformerContext {
     // Scratch Metal buffers
     id<MTLBuffer>    spf_token_mtl;     // [B*T] int32
     id<MTLBuffer>    spf_pos_mtl;       // [] int32 scalar
+    // Wave 4 A1: pre-allocated memory KV scratch per layer. GPU blit copy から feed に使う。
+    // サイズ [B*MEM*H] fp32 per layer。既存の CPU memcpy loop を blit encoder に置換。
+    NSMutableArray<id<MTLBuffer>>* spf_mem_k_scratch;
+    NSMutableArray<id<MTLBuffer>>* spf_mem_v_scratch;
 };
 
 // ---------------------------------------------------------------------------
@@ -484,6 +493,8 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
 
     ctx->ps_embedding           = makePSO(@"transformer_embedding_lookup");
     ctx->ps_layer_norm          = makePSO(@"transformer_layer_norm");
+    ctx->ps_layer_norm_fused      = makePSO(@"transformer_layer_norm_fused");
+    ctx->ps_layer_norm_fused_full = makePSO(@"transformer_layer_norm_fused_full");
     ctx->ps_linear              = makePSO(@"transformer_linear");
     ctx->ps_linear_amx          = makePSO(@"transformer_linear_amx");
     ctx->ps_linear_residual     = makePSO(@"transformer_linear_residual");
@@ -497,7 +508,17 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_kv_cache_write       = makePSO(@"kv_cache_write");
     ctx->ps_kv_cache_write_batch = makePSO(@"kv_cache_write_batch");
     ctx->ps_attn_decode_cached   = makePSO(@"transformer_attention_decode_cached");
+    ctx->ps_attn_decode_cached_online = makePSO(@"transformer_attention_decode_cached_online");
     ctx->ps_kv_memory_shift      = makePSO(@"kv_memory_shift");
+
+    // Wave 4: env-selected fused LN (threadgroup-staged 1-pass). Default OFF
+    // until bit-exact roundtrip is verified. Set NNCP_FUSED_LN=1 to enable.
+    {
+        const char* e = getenv("NNCP_FUSED_LN");
+        if (e && e[0] == '1' && ctx->ps_layer_norm_fused) {
+            ctx->ps_layer_norm = ctx->ps_layer_norm_fused;
+        }
+    }
 
     if (!ctx->ps_embedding   || !ctx->ps_layer_norm || !ctx->ps_linear              ||
         !ctx->ps_attn_score  || !ctx->ps_attn_value || !ctx->ps_geglu || !ctx->ps_gelu ||
@@ -1297,7 +1318,18 @@ static void encode_decode_step(MPSTransformerContext* ctx,
         uint32_t d_pos_val = (uint32_t)g_nncp_profile.d_pos;
         uint32_t total_len_v = (uint32_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len);
 
-        [enc setComputePipelineState:ctx->ps_attn_decode_cached];
+        {
+            static int g_attn_online_sel = -1;
+            if (g_attn_online_sel < 0) {
+                const char* v = getenv("NNCP_ATTN_ONLINE");
+                g_attn_online_sel = (v && v[0] == '0') ? 0 : 1;  // default ON
+            }
+            id<MTLComputePipelineState> _pso =
+                (g_attn_online_sel && ctx->ps_attn_decode_cached_online)
+                    ? ctx->ps_attn_decode_cached_online
+                    : ctx->ps_attn_decode_cached;
+            [enc setComputePipelineState:_pso];
+        }
         [enc setBuffer:ctx->dec_buf_q offset:0 atIndex:0];
         [enc setBuffer:ctx->kv_cache_k offset:kv_layer_off atIndex:1];
         [enc setBuffer:ctx->kv_cache_v offset:kv_layer_off atIndex:2];
@@ -1600,7 +1632,18 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         uint32_t d_pos_val   = (uint32_t)g_nncp_profile.d_pos;
         uint32_t total_len_v = (uint32_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len);
 
-        [enc setComputePipelineState:ctx->ps_attn_decode_cached];
+        {
+            static int g_attn_online_sel = -1;
+            if (g_attn_online_sel < 0) {
+                const char* v = getenv("NNCP_ATTN_ONLINE");
+                g_attn_online_sel = (v && v[0] == '0') ? 0 : 1;  // default ON
+            }
+            id<MTLComputePipelineState> _pso =
+                (g_attn_online_sel && ctx->ps_attn_decode_cached_online)
+                    ? ctx->ps_attn_decode_cached_online
+                    : ctx->ps_attn_decode_cached;
+            [enc setComputePipelineState:_pso];
+        }
         [enc setBuffer:ctx->dec_buf_q             offset:0            atIndex:0];
         [enc setBuffer:ctx->kv_cache_k            offset:kv_layer_off atIndex:1];
         [enc setBuffer:ctx->kv_cache_v            offset:kv_layer_off atIndex:2];
@@ -2522,30 +2565,47 @@ static bool execute_segment_prefill(MPSTransformerContext* ctx,
     // For now, read memory K/V directly from cache buffers as fp32
     // Each layer's memory = positions [0, MEM) in the cache
     const NSUInteger tl = ctx->kv_total_len;
-    for (uint32_t l = 0; l < L; l++) {
-        // Offset into kv_cache_k for layer l: l * B * tl * H * sizeof(float)
-        NSUInteger layer_off = (NSUInteger)l * B * tl * H * sizeof(float);
-        // We need [B, MEM, H] — but cache has [B, tl, H]
-        // Need to extract the first MEM columns from each B row
-        // This requires a copy since the memory isn't contiguous in the right layout
-
-        // For now, create temporary buffers with the memory data
+    // Wave 4 A1: lazy-alloc pre-allocated scratch (reused across seg calls), then GPU blit copy.
+    if (!ctx->spf_mem_k_scratch) {
+        ctx->spf_mem_k_scratch = [NSMutableArray arrayWithCapacity:L];
+        ctx->spf_mem_v_scratch = [NSMutableArray arrayWithCapacity:L];
         size_t mem_size = (size_t)B * MEM * H * sizeof(float);
-        id<MTLBuffer> mem_k_buf = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
-        id<MTLBuffer> mem_v_buf = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
-
-        float* src_k = (float*)[ctx->kv_cache_k contents] + l * B * tl * H;
-        float* src_v = (float*)[ctx->kv_cache_v contents] + l * B * tl * H;
-        float* dst_k = (float*)[mem_k_buf contents];
-        float* dst_v = (float*)[mem_v_buf contents];
-
-        for (uint32_t b = 0; b < B; b++) {
-            memcpy(dst_k + b * MEM * H, src_k + b * tl * H, MEM * H * sizeof(float));
-            memcpy(dst_v + b * MEM * H, src_v + b * tl * H, MEM * H * sizeof(float));
+        for (uint32_t l = 0; l < L; l++) {
+            id<MTLBuffer> mk = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> mv = [ctx->device newBufferWithLength:mem_size options:MTLResourceStorageModeShared];
+            [ctx->spf_mem_k_scratch addObject:mk];
+            [ctx->spf_mem_v_scratch addObject:mv];
         }
-
-        rfeeds[(id)ctx->spf_ph_mem_k[l]] = makeTD(mem_k_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
-        rfeeds[(id)ctx->spf_ph_mem_v[l]] = makeTD(mem_v_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
+    }
+    {
+        // GPU blit: kv_cache[B, tl, H] の先頭 MEM 列ずつを scratch[B, MEM, H] に per-stream コピー。
+        // stride が異なるため per (l, b) で独立 blit (L*B 回)。
+        id<MTLCommandBuffer> blit_cb = [ctx->commandQueue commandBufferWithUnretainedReferences];
+        id<MTLBlitCommandEncoder> blit = [blit_cb blitCommandEncoder];
+        const size_t row_bytes = (size_t)MEM * H * sizeof(float);
+        const size_t src_row_stride = (size_t)tl * H * sizeof(float);
+        for (uint32_t l = 0; l < L; l++) {
+            id<MTLBuffer> mem_k_buf = ctx->spf_mem_k_scratch[l];
+            id<MTLBuffer> mem_v_buf = ctx->spf_mem_v_scratch[l];
+            NSUInteger layer_off = (NSUInteger)l * B * tl * H * sizeof(float);
+            for (uint32_t b = 0; b < B; b++) {
+                [blit copyFromBuffer:ctx->kv_cache_k
+                        sourceOffset:layer_off + (NSUInteger)b * src_row_stride
+                            toBuffer:mem_k_buf
+                   destinationOffset:(NSUInteger)b * row_bytes
+                                size:row_bytes];
+                [blit copyFromBuffer:ctx->kv_cache_v
+                        sourceOffset:layer_off + (NSUInteger)b * src_row_stride
+                            toBuffer:mem_v_buf
+                   destinationOffset:(NSUInteger)b * row_bytes
+                                size:row_bytes];
+            }
+            rfeeds[(id)ctx->spf_ph_mem_k[l]] = makeTD(mem_k_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
+            rfeeds[(id)ctx->spf_ph_mem_v[l]] = makeTD(mem_v_buf, @[@(B), @(MEM), @(H)], MPSDataTypeFloat32);
+        }
+        [blit endEncoding];
+        [blit_cb commit];
+        [blit_cb waitUntilCompleted];
     }
 
     // Weight feeds from weightCache

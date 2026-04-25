@@ -61,6 +61,82 @@ kernel void transformer_layer_norm(
         output[base + i] = input[base + i] * inv_rms * gamma[i];
 }
 
+// Wave 4: Fused 1-pass RMSNorm — stages input + gamma into threadgroup memory
+// so the second pass reads from threadgroup instead of device. Pattern inspired
+// by llama.cpp kernel_norm_fuse_impl.
+// Requires H <= 2048 (tg mem: 2 × 2048 × 4B = 16KB < 32KB budget).
+// Dispatch: [batch*32, 1, 1], threadgroup [32, 1, 1]
+kernel void transformer_layer_norm_fused(
+    device const float* input       [[buffer(0)]],
+    device float*       output      [[buffer(1)]],
+    device const float* gamma       [[buffer(2)]],
+    device const float* beta        [[buffer(3)]],   // unused (RMSNorm)
+    constant uint&      hidden_size [[buffer(4)]],
+    constant float&     eps         [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float x_tg[2048];
+    threadgroup float g_tg[2048];
+
+    uint batch_idx = gid / 32;
+    uint base = batch_idx * hidden_size;
+
+    float partial_ms = 0.0f;
+    for (uint i = lane; i < hidden_size; i += 32) {
+        float v = input[base + i];
+        x_tg[i] = v;
+        g_tg[i] = gamma[i];
+        partial_ms += v * v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float ms = simd_sum(partial_ms) / (float)hidden_size;
+    float inv_rms = rsqrt(ms + eps);
+
+    for (uint i = lane; i < hidden_size; i += 32)
+        output[base + i] = x_tg[i] * inv_rms * g_tg[i];
+}
+
+// Fused Post-LN variant: (x - mean)/sqrt(var+eps) * gamma + beta
+kernel void transformer_layer_norm_fused_full(
+    device const float* input       [[buffer(0)]],
+    device float*       output      [[buffer(1)]],
+    device const float* gamma       [[buffer(2)]],
+    device const float* beta        [[buffer(3)]],
+    constant uint&      hidden_size [[buffer(4)]],
+    constant float&     eps         [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float x_tg[2048];
+    threadgroup float g_tg[2048];
+    threadgroup float b_tg[2048];
+
+    uint batch_idx = gid / 32;
+    uint base = batch_idx * hidden_size;
+
+    float partial_sum = 0.0f;
+    float partial_sq  = 0.0f;
+    for (uint i = lane; i < hidden_size; i += 32) {
+        float v = input[base + i];
+        x_tg[i] = v;
+        g_tg[i] = gamma[i];
+        b_tg[i] = beta[i];
+        partial_sum += v;
+        partial_sq  += v * v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float invH = 1.0f / (float)hidden_size;
+    float mean = simd_sum(partial_sum) * invH;
+    float var  = simd_sum(partial_sq)  * invH - mean * mean;
+    float inv_std = rsqrt(var + eps);
+
+    for (uint i = lane; i < hidden_size; i += 32)
+        output[base + i] = (x_tg[i] - mean) * inv_std * g_tg[i] + b_tg[i];
+}
+
 // 3. Linear projection: Y = X @ W + b
 // Fused GEMM + residual add: output = matmul(input, weight) + bias + residual
 // Same dispatch as transformer_linear: [out_dim*32, batch, 1], threadgroup [32, 8, 1]
@@ -434,6 +510,98 @@ kernel void transformer_attention_decode_cached(
         }
         // Guard against NaN in attention output (e.g. when V_cache contains garbage)
         output[out_base + d] = isnan(acc) ? 0.0f : acc;
+    }
+}
+
+// 6d. Decode Attention with KV Cache — online-softmax variant (Wave 4)
+// Single K loop: dot + online softmax running (m, s) + V_acc per-lane registers.
+// Identical signature to transformer_attention_decode_cached so dispatch code
+// need only swap the PSO. scores_tmp buffer arg is unused (kept for compat).
+// Numerical output differs by FP32 accumulation order; bit-exact not guaranteed,
+// validated via MD5 roundtrip + bpc on enwik4.
+kernel void transformer_attention_decode_cached_online(
+    device const float* Q          [[buffer(0)]],
+    device const half*  K_cache    [[buffer(1)]],
+    device const half*  V_cache    [[buffer(2)]],
+    device float*       output     [[buffer(3)]],
+    device float*       scores_tmp [[buffer(4)]],  // unused
+    constant uint&      num_heads  [[buffer(5)]],
+    constant uint&      head_dim   [[buffer(6)]],
+    constant uint&      kv_len     [[buffer(7)]],
+    constant uint&      max_seq_len[[buffer(8)]],
+    constant float&     scale      [[buffer(9)]],
+    device const float* W_rel_r    [[buffer(10)]],
+    device const float* B_rel_r    [[buffer(11)]],
+    constant uint&      d_pos          [[buffer(12)]],
+    constant uint&      total_len      [[buffer(13)]],
+    constant float&     b_rel_r_scale  [[buffer(14)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    (void)scores_tmp;
+    const uint h = gid.x / 32;
+    const uint b = gid.y;
+    if (h >= num_heads) return;
+
+    const uint H          = num_heads * head_dim;
+    const uint q_base     = b * H + h * head_dim;
+    const uint out_base   = b * H + h * head_dim;
+    const uint cache_batch_base = b * max_seq_len;
+    const uint w_rel_head_off = h * head_dim * d_pos;
+
+    // head_dim/32 elements per lane (hd=32 → 1, hd=128 → 4). Cap 4.
+    float q_local[4];
+    float v_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint per = head_dim / 32;
+    for (uint i = 0; i < per; i++) {
+        uint d = lane + i * 32;
+        q_local[i] = (d < head_dim) ? Q[q_base + d] : 0.0f;
+    }
+
+    float m = -1e9f;
+    float s = 0.0f;
+
+    for (uint k = 0; k < kv_len; k++) {
+        const uint k_base = (cache_batch_base + k) * H + h * head_dim;
+        const uint dist = kv_len - 1 - k;
+        const uint dr   = dist % d_pos;
+
+        float dot_partial = 0.0f;
+        float q_rel_partial = 0.0f;
+        for (uint i = 0; i < per; i++) {
+            uint d = lane + i * 32;
+            if (d < head_dim) {
+                float kv = (float)K_cache[k_base + d];
+                dot_partial   += q_local[i] * kv;
+                q_rel_partial += q_local[i] * W_rel_r[w_rel_head_off + d * d_pos + dr];
+            }
+        }
+        float dot  = simd_sum(dot_partial) * scale;
+        float qrel = simd_sum(q_rel_partial) * scale;
+        dot += qrel + B_rel_r[h * total_len + dist] * b_rel_r_scale;
+        dot = clamp(dot, -50.0f, 50.0f);
+
+        float new_m = max(m, dot);
+        float alpha = exp(m - new_m);
+        float beta  = exp(dot - new_m);
+        s = s * alpha + beta;
+
+        const uint v_base = (cache_batch_base + k) * H + h * head_dim;
+        for (uint i = 0; i < per; i++) {
+            uint d = lane + i * 32;
+            float vv = (d < head_dim) ? (float)V_cache[v_base + d] : 0.0f;
+            v_acc[i] = v_acc[i] * alpha + vv * beta;
+        }
+        m = new_m;
+    }
+
+    float inv_s = 1.0f / (s + 1e-9f);
+    for (uint i = 0; i < per; i++) {
+        uint d = lane + i * 32;
+        if (d < head_dim) {
+            float o = v_acc[i] * inv_s;
+            output[out_base + d] = isnan(o) ? 0.0f : o;
+        }
     }
 }
 

@@ -48,6 +48,8 @@ test_*.txt
 *_test.*
 tests/test_*
 cuda-compatibility-tests
+*_bench.mm
+*_measure.mm
 
 # Temporary files
 *.tmp
