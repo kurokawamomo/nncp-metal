@@ -918,6 +918,10 @@ struct OnlineTrainer {
 
     // Metal compute
     id<MTLCommandQueue>         cmdQueue;
+    // Wave1-3: Residency Set (macOS 15+). Long-lived large buffers (weights, grads, velocity,
+    // kv mem) added here; committed + attached to cmdQueue so they stay GPU-resident and
+    // dispatch-time tracking overhead is reduced.
+    id<MTLResidencySet>         residency_set API_AVAILABLE(macos(15.0));
     id<MTLComputePipelineState> ps_sgd;
     id<MTLComputePipelineState> ps_rmsprop;
     id<MTLComputePipelineState> ps_element_add_rb;  // element_add for readback-GPU path
@@ -2679,6 +2683,35 @@ static MPSGraphTensor* matmul_fp16(MPSGraph* g,
     return [g matrixMultiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
 }
 
+// Wave 2 (BF16 train GEMM): Mixed-precision matmul using bfloat.
+// bfloat: 8-bit exponent (FP32 range, no underflow) + 7-bit mantissa.
+// Spike on M3 Pro / Metal 3.1 confirmed simdgroup_matrix<bfloat,8,8> 1.26x on
+// BT=1024 GEMM. Gradient flow: cast(FP32→BF16) → matmul → cast(BF16→FP32).
+// MPSGraph autodiff propagates FP32 grads through cast backward nodes.
+// Bit-exact: compress/decompress both drive the same path → same rounding.
+// Default ON for enwik8 (H=1024); disable via NNCP_BF16_TRAIN=0.
+static bool nncp_bf16_train_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char* e = getenv("NNCP_BF16_TRAIN");
+        cached = (e && e[0] == '0') ? 0 : 1;  // default ON
+    }
+    return cached != 0;
+}
+
+static MPSGraphTensor* matmul_bf16(MPSGraph* g,
+                                    MPSGraphTensor* a,
+                                    MPSGraphTensor* b,
+                                    bool use_bf16) {
+    if (use_bf16 && nncp_bf16_train_enabled()) {
+        MPSGraphTensor* abf = [g castTensor:a toType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor* bbf = [g castTensor:b toType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor* cbf = [g matrixMultiplicationWithPrimaryTensor:abf secondaryTensor:bbf name:nil];
+        return [g castTensor:cbf toType:MPSDataTypeFloat32 name:nil];
+    }
+    return [g matrixMultiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
+}
+
 // Helper: build K transformer layers [gStart, gEnd) on graph g, starting from x.
 // Returns the output hidden tensor.
 static MPSGraphTensor* build_chk_layers(
@@ -2765,9 +2798,9 @@ static MPSGraphTensor* build_chk_layers(
         MPSGraphTensor* bet2  = [g reshapeTensor:[g sliceTensor:ln_l dimension:0 start:3 length:1 name:nil] withShape:@[@(H)] name:nil];
 
         MPSGraphTensor* x_cl1 = is_enwik8_cl ? tr_layer_norm(g, x, gam1, bet1) : x;
-        MPSGraphTensor* q  = matmul_fp16(g, x_cl1, w_q_i, is_enwik8_cl);
-        MPSGraphTensor* k  = matmul_fp16(g, x_cl1, w_k_i, is_enwik8_cl);
-        MPSGraphTensor* v  = matmul_fp16(g, x_cl1, w_v_i, is_enwik8_cl);
+        MPSGraphTensor* q  = matmul_bf16(g, x_cl1, w_q_i, is_enwik8_cl);
+        MPSGraphTensor* k  = matmul_bf16(g, x_cl1, w_k_i, is_enwik8_cl);
+        MPSGraphTensor* v  = matmul_bf16(g, x_cl1, w_v_i, is_enwik8_cl);
 
         auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
             t = [g reshapeTensor:t withShape:@[@(B), @(T), @(NH), @(HD)] name:nil];
@@ -2830,7 +2863,7 @@ static MPSGraphTensor* build_chk_layers(
         MPSGraphTensor* attn = [g matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v_ext name:nil];
         attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil];
         attn = [g reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];
-        attn = matmul_fp16(g, attn, w_o_i, is_enwik8_cl);
+        attn = matmul_bf16(g, attn, w_o_i, is_enwik8_cl);
         attn = maybe_dropout(g, attn, dropout_rate_cl);
 
         // Residual #1 + Post-LN (default) / no extra LN (enwik8)
@@ -2841,7 +2874,7 @@ static MPSGraphTensor* build_chk_layers(
         // FFN input: Pre-LN (enwik8) or direct (default)
         MPSGraphTensor* x_cl2 = is_enwik8_cl ? tr_layer_norm(g, x, gam2, bet2) : x;
         MPSGraphTensor* fp = [g additionWithPrimaryTensor:
-            matmul_fp16(g, x_cl2, w_ffn1_i, is_enwik8_cl)
+            matmul_bf16(g, x_cl2, w_ffn1_i, is_enwik8_cl)
             secondaryTensor:b_ffn1_i name:nil];
         MPSGraphTensor* ff;
         if (is_enwik8_cl) {
@@ -2853,7 +2886,7 @@ static MPSGraphTensor* build_chk_layers(
             ff = tr_gelu(g, fp);
         }
         ff = [g additionWithPrimaryTensor:
-            matmul_fp16(g, ff, w_ffn2_i, is_enwik8_cl)
+            matmul_bf16(g, ff, w_ffn2_i, is_enwik8_cl)
             secondaryTensor:b_ffn2_i name:nil];
         ff = maybe_dropout(g, ff, dropout_rate_cl);
 
@@ -3524,7 +3557,7 @@ static void build_chunked_bwd_last_graph(OnlineTrainer* tr) {
     // Phase E: FP16 matmul for enwik8 (H=1024 always true in chunked path)
     const bool is_enwik8_clast = (g_nncp_profile.h == 1024);
     MPSGraphTensor* logits = [g additionWithPrimaryTensor:
-        matmul_fp16(g, x, ctx.ts_w_out, is_enwik8_clast)
+        matmul_bf16(g, x, ctx.ts_w_out, is_enwik8_clast)
         secondaryTensor:ctx.ts_w_b_out name:nil];
     {
         MPSGraphTensor* cp = [g constantWithScalar: 50.f dataType:MPSDataTypeFloat32];
@@ -3656,11 +3689,11 @@ static float sanitize_and_l2(id<MTLBuffer> buf, size_t n) {
     return (float)sqrt(sum);
 }
 
-// Scale a gradient buffer in-place by scalar (CPU)
+// Scale a gradient buffer in-place by scalar (CPU, vDSP)
 static void scale_grad(id<MTLBuffer> buf, size_t n, float scale) {
     if (!buf || n == 0 || scale == 1.0f) return;
     float* p = (float*)[buf contents];
-    for (size_t i = 0; i < n; i++) p[i] *= scale;
+    vDSP_vsmul(p, 1, &scale, p, 1, (vDSP_Length)n);
 }
 
 // Per-tensor L2 norm clip (matches original libnc sgd_opt_update_var behavior)
@@ -3776,6 +3809,19 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->d_pos   = (uint32_t)g_nncp_profile.d_pos;
     tr->ext_len = (uint32_t)(g_nncp_profile.mem_len + g_nncp_profile.seg_len);
 
+    // Wave1-3: Residency Set alloc (macOS 15+). buffer alloc 箇所で addAllocation し、
+    // init 末尾で commit + addResidencySet する。
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor* rsd = [[MTLResidencySetDescriptor alloc] init];
+        rsd.label = @"nncp_online_trainer_weights";
+        rsd.initialCapacity = 256;
+        NSError* rserr = nil;
+        tr->residency_set = [device newResidencySetWithDescriptor:rsd error:&rserr];
+        if (!tr->residency_set) {
+            NSLog(@"[OnlineTrainer] Residency set alloc failed: %@", rserr);
+        }
+    }
+
     // ---- Build single-sample training graph ----
     tr->graph = [[MPSGraph alloc] init];
     build_training_graph(tr);
@@ -3810,9 +3856,12 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         build_loss_bwd(tr);
         // Allocate h[0..L] buffers for saved hidden states
         const size_t h_size = (size_t)BPTT_CHUNK_BT * tr->H;
-        for (uint32_t i = 0; i <= tr->L; i++)
+        for (uint32_t i = 0; i <= tr->L; i++) {
             tr->pl_h[i] = [device newBufferWithLength:h_size * sizeof(float) options:MTLResourceStorageModeShared];
+            if (@available(macOS 15.0, *)) { if (tr->residency_set && tr->pl_h[i]) [tr->residency_set addAllocation:tr->pl_h[i]]; }
+        }
         tr->pl_dh = [device newBufferWithLength:h_size * sizeof(float) options:MTLResourceStorageModeShared];
+        if (@available(macOS 15.0, *)) { if (tr->residency_set && tr->pl_dh) [tr->residency_set addAllocation:tr->pl_dh]; }
         tr->pl_slice_views = [NSMutableDictionary dictionary];
         tr->pl_ready = true;
     }
@@ -3820,7 +3869,9 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     // ---- Pre-allocate gradient buffers ----
     MTLResourceOptions opts = MTLResourceStorageModeShared;
     auto newBuf = [&](size_t n_floats) -> id<MTLBuffer> {
-        return [device newBufferWithLength:n_floats * sizeof(float) options:opts];
+        id<MTLBuffer> b = [device newBufferWithLength:n_floats * sizeof(float) options:opts];
+        if (@available(macOS 15.0, *)) { if (tr->residency_set && b) [tr->residency_set addAllocation:b]; }
+        return b;
     };
 
     uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V, S=tr->S;
@@ -3844,6 +3895,7 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     auto newZeroBuf = [&](size_t n_floats) -> id<MTLBuffer> {
         id<MTLBuffer> b = [device newBufferWithLength:n_floats * sizeof(float) options:opts];
         memset([b contents], 0, n_floats * sizeof(float));
+        if (@available(macOS 15.0, *)) { if (tr->residency_set && b) [tr->residency_set addAllocation:b]; }
         return b;
     };
     tr->v_embed    = newZeroBuf((size_t)V * H);
@@ -3992,6 +4044,24 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     tr->seg_buf_input  = [device newBufferWithLength:BPTT_CHUNK_BT * sizeof(int32_t) options:opts];
     tr->seg_buf_target = [device newBufferWithLength:BPTT_CHUNK_BT * sizeof(int32_t) options:opts];
 
+    // Wave1-3: add remaining long-lived buffers (allocated directly, not via newBuf lambda)
+    if (@available(macOS 15.0, *)) {
+        if (tr->residency_set) {
+            auto add = ^(id<MTLBuffer> b) { if (b) [tr->residency_set addAllocation:b]; };
+            for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+                add(tr->kv_mem_buf_k[li]); add(tr->kv_mem_buf_v[li]);
+            }
+            for (int li = 0; li < SEG_MAX_LAYERS; li++) {
+                add(tr->kv_pre_seg_buf_k[li]); add(tr->kv_pre_seg_buf_v[li]);
+            }
+            for (int i = 0; i < 3; i++) { add(tr->checkpoint_h[i]); add(tr->chk_h[i]); add(tr->chk_dh[i]); }
+            add(tr->d_hidden_tmp); add(tr->chk_embed_buf);
+            add(tr->buf_input); add(tr->buf_target);
+            add(tr->batch_buf_input); add(tr->batch_buf_target);
+            add(tr->seg_buf_input); add(tr->seg_buf_target);
+        }
+    }
+
     // ---- Optimizer pipelines ----
     tr->cmdQueue = [device newCommandQueue];
     id<MTLLibrary> metalLib = load_metal_library(device);
@@ -4018,6 +4088,17 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
 
     if (!tr->ps_rmsprop) {
         //NSLog(@"[OnlineTrainer] RMSProp pipeline failed — will fall back to SGD");
+    }
+
+    // Wave1-3: commit residency set and attach to command queue. Once committed, all added
+    // allocations are made GPU-resident until released; queue attach makes the set visible
+    // to subsequent command buffers without per-dispatch tracking.
+    if (@available(macOS 15.0, *)) {
+        if (tr->residency_set && tr->cmdQueue) {
+            [tr->residency_set commit];
+            [tr->residency_set requestResidency];
+            [tr->cmdQueue addResidencySet:tr->residency_set];
+        }
     }
 
     return tr;

@@ -404,10 +404,17 @@ static int64_t put_bit_flush(PutBitState *s) {
 
 // Helper functions
 static float vec_sum_f32(const float* data, int len) {
-    float sum = 0.0f;
-    for (int i = 0; i < len; i++) {
-        sum += data[i];
+    // vDSP_sve: pairwise NEON reduction. For small len (<8) scalar loop is
+    // lower overhead. Bit-exact parity with original scalar sum is NOT
+    // guaranteed due to different accumulation order; validated via MD5+bpc
+    // round-trip (both encode and decode use the same reduction path).
+    if (len < 8) {
+        float sum = 0.0f;
+        for (int i = 0; i < len; i++) sum += data[i];
+        return sum;
     }
+    float sum;
+    vDSP_sve(data, 1, &sum, (vDSP_Length)len);
     return sum;
 }
 
