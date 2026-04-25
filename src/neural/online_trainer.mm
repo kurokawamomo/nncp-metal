@@ -1010,6 +1010,16 @@ struct OnlineTrainer {
     id<MTLBuffer>   grad_rel_r_all;   // [L * NH * HD * D_POS]
     id<MTLBuffer>   v_rel_r_all;      // RMSProp 2nd moment
 
+    // seg_graph chunk2 scratch — direct-write from MPSGraph, then GPU element_add → grad_*
+    // Allocated only for default profile (seg_graph path). enwik8 uses per-layer pl_* path.
+    id<MTLBuffer>   sg_grad_embed;
+    id<MTLBuffer>   sg_grad_q, sg_grad_k, sg_grad_v, sg_grad_o;
+    id<MTLBuffer>   sg_grad_ffn1, sg_grad_ffn2;
+    id<MTLBuffer>   sg_grad_ln, sg_grad_ln_final;
+    id<MTLBuffer>   sg_grad_out;
+    id<MTLBuffer>   sg_grad_b_ffn1, sg_grad_b_ffn2, sg_grad_b_out;
+    id<MTLBuffer>   sg_grad_rel_r, sg_grad_b_rel_r;
+
     // Phase E2.3: KV cache memory context (per-layer, non-learnable)
     MPSGraphTensor* ts_kv_mem_k[SEG_MAX_LAYERS];  // [MEM_LEN, H] placeholder per layer
     MPSGraphTensor* ts_kv_mem_v[SEG_MAX_LAYERS];
@@ -3869,6 +3879,25 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         }
         tr->grad_b_rel_r = newBuf(NH_ * TLEN);
         tr->v_b_rel_r    = newZeroBuf(NH_ * TLEN);
+
+        // seg_graph chunk2 scratch — default profile only (enwik8 uses per-layer path)
+        if (g_nncp_profile.h != 1024) {
+            tr->sg_grad_embed    = newBuf((size_t)V * H);
+            tr->sg_grad_q        = newBuf((size_t)L * H * H);
+            tr->sg_grad_k        = newBuf((size_t)L * H * H);
+            tr->sg_grad_v        = newBuf((size_t)L * H * H);
+            tr->sg_grad_o        = newBuf((size_t)L * H * H);
+            tr->sg_grad_ffn1     = newBuf((size_t)L * H * F * FFN1_MULT);
+            tr->sg_grad_ffn2     = newBuf((size_t)L * F * H);
+            tr->sg_grad_ln       = newBuf((size_t)L * 4 * H);
+            tr->sg_grad_ln_final = newBuf((size_t)2 * H);
+            tr->sg_grad_out      = newBuf((size_t)H * V);
+            tr->sg_grad_b_ffn1   = newBuf((size_t)L * F * FFN1_MULT);
+            tr->sg_grad_b_ffn2   = newBuf((size_t)L * H);
+            tr->sg_grad_b_out    = newBuf((size_t)V);
+            tr->sg_grad_rel_r    = newBuf(NH_ * HD_ * DPOS);
+            tr->sg_grad_b_rel_r  = newBuf(NH_ * TLEN);
+        }
     }
 
     // ---- Phase M-Readback: GPU-resident backward readback scratch ----
@@ -6495,31 +6524,82 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
         [tr->seg_graph runWithFeeds:buildFeeds() targetTensors:targets targetOperations:nil];
 
-    // Accumulate chunk 2 grads into grad_* buffers (add to chunk 1 grads)
-    auto accumulateGrad = [&](MPSGraphTensor* ts, id<MTLBuffer> gbuf) {
-        MPSGraphTensorData* td = results[ts];
-        if (!td || !gbuf) return;
-        size_t n = [gbuf length] / sizeof(float);
-        std::vector<float> tmp(n);
-        [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
-        float* dst = (float*)[gbuf contents];
-        for (size_t i = 0; i < n; i++) dst[i] += tmp[i];
-    };
-    accumulateGrad(tr->ts_grad_embed,    tr->grad_embed);
-    accumulateGrad(tr->ts_grad_q,        tr->grad_q);
-    accumulateGrad(tr->ts_grad_k,        tr->grad_k);
-    accumulateGrad(tr->ts_grad_v,        tr->grad_v);
-    accumulateGrad(tr->ts_grad_o,        tr->grad_o);
-    accumulateGrad(tr->ts_grad_ffn1,     tr->grad_ffn1);
-    accumulateGrad(tr->ts_grad_ffn2,     tr->grad_ffn2);
-    accumulateGrad(tr->ts_grad_ln,       tr->grad_ln);
-    accumulateGrad(tr->ts_grad_ln_final, tr->grad_ln_final);
-    accumulateGrad(tr->ts_grad_out,      tr->grad_out);
-    accumulateGrad(tr->ts_grad_b_ffn1,   tr->grad_b_ffn1);
-    accumulateGrad(tr->ts_grad_b_ffn2,   tr->grad_b_ffn2);
-    accumulateGrad(tr->ts_grad_b_out,    tr->grad_b_out);
-    accumulateGrad(tr->ts_grad_rel_r,    tr->grad_rel_r);
-    accumulateGrad(tr->ts_grad_b_rel_r,  tr->grad_b_rel_r);
+    // Accumulate chunk 2 grads into grad_* buffers.
+    // Fast path: readBytes → sg_* scratch, then one GPU element_add encoder adds all into grad_*.
+    // Fallback: CPU loop add (if sg_* not allocated).
+    const bool use_gpu_accum = (tr->sg_grad_embed != nil) && (tr->ps_element_add_rb != nil);
+    if (use_gpu_accum) {
+        auto readToScratch = [&](MPSGraphTensor* ts, id<MTLBuffer> sbuf) {
+            MPSGraphTensorData* td = results[ts];
+            if (td && sbuf) [td.mpsndarray readBytes:[sbuf contents] strideBytes:NULL];
+        };
+        readToScratch(tr->ts_grad_embed,    tr->sg_grad_embed);
+        readToScratch(tr->ts_grad_q,        tr->sg_grad_q);
+        readToScratch(tr->ts_grad_k,        tr->sg_grad_k);
+        readToScratch(tr->ts_grad_v,        tr->sg_grad_v);
+        readToScratch(tr->ts_grad_o,        tr->sg_grad_o);
+        readToScratch(tr->ts_grad_ffn1,     tr->sg_grad_ffn1);
+        readToScratch(tr->ts_grad_ffn2,     tr->sg_grad_ffn2);
+        readToScratch(tr->ts_grad_ln,       tr->sg_grad_ln);
+        readToScratch(tr->ts_grad_ln_final, tr->sg_grad_ln_final);
+        readToScratch(tr->ts_grad_out,      tr->sg_grad_out);
+        readToScratch(tr->ts_grad_b_ffn1,   tr->sg_grad_b_ffn1);
+        readToScratch(tr->ts_grad_b_ffn2,   tr->sg_grad_b_ffn2);
+        readToScratch(tr->ts_grad_b_out,    tr->sg_grad_b_out);
+        readToScratch(tr->ts_grad_rel_r,    tr->sg_grad_rel_r);
+        readToScratch(tr->ts_grad_b_rel_r,  tr->sg_grad_b_rel_r);
+
+        id<MTLCommandBuffer> acb = [tr->cmdQueue commandBuffer];
+        id<MTLComputeCommandEncoder> aenc = [acb computeCommandEncoder];
+        auto addGPU = [&](id<MTLBuffer> dst, id<MTLBuffer> src, size_t n) {
+            if (!dst || !src) return;
+            dispatch_element_add(aenc, tr->ps_element_add_rb,
+                                 dst, 0, src, 0, dst, 0, (uint32_t)n);
+        };
+        addGPU(tr->grad_embed,    tr->sg_grad_embed,    (size_t)V * H);
+        addGPU(tr->grad_q,        tr->sg_grad_q,        (size_t)L * H * H);
+        addGPU(tr->grad_k,        tr->sg_grad_k,        (size_t)L * H * H);
+        addGPU(tr->grad_v,        tr->sg_grad_v,        (size_t)L * H * H);
+        addGPU(tr->grad_o,        tr->sg_grad_o,        (size_t)L * H * H);
+        addGPU(tr->grad_ffn1,     tr->sg_grad_ffn1,     (size_t)L * H * F * FFN1_MULT);
+        addGPU(tr->grad_ffn2,     tr->sg_grad_ffn2,     (size_t)L * F * H);
+        addGPU(tr->grad_ln,       tr->sg_grad_ln,       (size_t)L * 4 * H);
+        addGPU(tr->grad_ln_final, tr->sg_grad_ln_final, (size_t)2 * H);
+        addGPU(tr->grad_out,      tr->sg_grad_out,      (size_t)H * V);
+        addGPU(tr->grad_b_ffn1,   tr->sg_grad_b_ffn1,   (size_t)L * F * FFN1_MULT);
+        addGPU(tr->grad_b_ffn2,   tr->sg_grad_b_ffn2,   (size_t)L * H);
+        addGPU(tr->grad_b_out,    tr->sg_grad_b_out,    (size_t)V);
+        addGPU(tr->grad_rel_r,    tr->sg_grad_rel_r,    (size_t)tr->NH * tr->HD * tr->d_pos);
+        addGPU(tr->grad_b_rel_r,  tr->sg_grad_b_rel_r,  (size_t)tr->NH * tr->ext_len);
+        [aenc endEncoding];
+        [acb commit];
+        [acb waitUntilCompleted];
+    } else {
+        auto accumulateGrad = [&](MPSGraphTensor* ts, id<MTLBuffer> gbuf) {
+            MPSGraphTensorData* td = results[ts];
+            if (!td || !gbuf) return;
+            size_t n = [gbuf length] / sizeof(float);
+            std::vector<float> tmp(n);
+            [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
+            float* dst = (float*)[gbuf contents];
+            for (size_t i = 0; i < n; i++) dst[i] += tmp[i];
+        };
+        accumulateGrad(tr->ts_grad_embed,    tr->grad_embed);
+        accumulateGrad(tr->ts_grad_q,        tr->grad_q);
+        accumulateGrad(tr->ts_grad_k,        tr->grad_k);
+        accumulateGrad(tr->ts_grad_v,        tr->grad_v);
+        accumulateGrad(tr->ts_grad_o,        tr->grad_o);
+        accumulateGrad(tr->ts_grad_ffn1,     tr->grad_ffn1);
+        accumulateGrad(tr->ts_grad_ffn2,     tr->grad_ffn2);
+        accumulateGrad(tr->ts_grad_ln,       tr->grad_ln);
+        accumulateGrad(tr->ts_grad_ln_final, tr->grad_ln_final);
+        accumulateGrad(tr->ts_grad_out,      tr->grad_out);
+        accumulateGrad(tr->ts_grad_b_ffn1,   tr->grad_b_ffn1);
+        accumulateGrad(tr->ts_grad_b_ffn2,   tr->grad_b_ffn2);
+        accumulateGrad(tr->ts_grad_b_out,    tr->grad_b_out);
+        accumulateGrad(tr->ts_grad_rel_r,    tr->grad_rel_r);
+        accumulateGrad(tr->ts_grad_b_rel_r,  tr->grad_b_rel_r);
+    }
 
     // [WQNORM-DIAG] raw grad norms (before clip): first step + every 2000 segments
     bool _wq_diag = (tr->train_step == 0) ||
