@@ -1100,7 +1100,7 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
         uint32_t H_val     = H;
         uint32_t n_shift   = num_lb * mem_len * H_val;
 
-        id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBuffer];
+        id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
         [se setComputePipelineState:ctx->ps_kv_memory_shift];
         [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
@@ -1475,7 +1475,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
     // ------------------------------------------------------------------
     // Build command buffer
     // ------------------------------------------------------------------
-    id<MTLCommandBuffer>         cmd = [ctx->commandQueue commandBuffer];
+    id<MTLCommandBuffer>         cmd = [ctx->commandQueue commandBufferWithUnretainedReferences];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
     // 1-D threadgroup helper (max 64 threads per group, safe on all Apple Silicon)
@@ -1794,7 +1794,7 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
             uint32_t H_val     = ctx->config.hidden_size;
             uint32_t n_shift   = num_lb * mem_len * H_val;
 
-            id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBuffer];
+            id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
             id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
             [se setComputePipelineState:ctx->ps_kv_memory_shift];
             [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
@@ -2095,7 +2095,7 @@ void mps_transformer_memory_shift(MPSTransformerContext* ctx) {
         return;
     }
 
-    id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBuffer];
+    id<MTLCommandBuffer>         sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
     id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
     [se setComputePipelineState:ctx->ps_kv_memory_shift];
     [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
@@ -2697,7 +2697,7 @@ void mps_transformer_execute_segment(
         for (int s = 0; s < n_streams; s++)
             tok[s] = input_tokens[s * seg_len + t];
 
-        id<MTLCommandBuffer> cmd = [ctx->commandQueue commandBuffer];
+        id<MTLCommandBuffer> cmd = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
         encode_decode_step(ctx, enc, ctx->dec_buf_input, ctx->dec_buf_logits, B,
@@ -2724,7 +2724,7 @@ void mps_transformer_execute_segment(
         uint32_t total_len = ctx->kv_total_len;
         uint32_t mem_len   = ctx->kv_memory_len;
         uint32_t n_shift   = num_lb * mem_len * ctx->config.hidden_size;
-        id<MTLCommandBuffer> sc = [ctx->commandQueue commandBuffer];
+        id<MTLCommandBuffer> sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
         [se setComputePipelineState:ctx->ps_kv_memory_shift];
         [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];

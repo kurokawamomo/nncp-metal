@@ -44,6 +44,7 @@ if(USE_METAL)
     find_library(METALPERFORMANCESHADERSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
     find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
     find_library(COREML_FRAMEWORK CoreML REQUIRED)
+    find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 
     # Metal shader sources
     set(METAL_SOURCES
@@ -134,6 +135,7 @@ if(USE_METAL)
         ${METALPERFORMANCESHADERSGRAPH_FRAMEWORK}
         ${FOUNDATION_FRAMEWORK}
         ${COREML_FRAMEWORK}
+        ${ACCELERATE_FRAMEWORK}
     )
 
     target_compile_definitions(nncp PRIVATE USE_METAL=1)

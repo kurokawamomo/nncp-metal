@@ -16,6 +16,7 @@
 #include <unistd.h>
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <Accelerate/Accelerate.h>
 
 #include "neural_bridge.h"
 #include "layer_flow_optimizer.h"
@@ -1390,15 +1391,16 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                         const float unif = 1.0f / (float)vocab_size;
                         for (int k = 0; k < vocab_size; k++) probs[k] = unif;
                     } else {
-                        float max_l = raw[0];
-                        for (int k = 1; k < vocab_size; k++)
-                            if (raw[k] > max_l) max_l = raw[k];
+                        float max_l;
+                        vDSP_maxv(raw, 1, &max_l, vocab_size);
+                        float neg_max = -max_l;
+                        vDSP_vsadd(raw, 1, &neg_max, probs, 1, vocab_size);
                         float sum = 0.0f;
                         for (int k = 0; k < vocab_size; k++) {
-                            probs[k] = expf(raw[k] - max_l);
+                            probs[k] = expf(probs[k]);
                             sum += probs[k];
                         }
-                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                        vDSP_vsdiv(probs, 1, &sum, probs, 1, vocab_size);
                     }
 
                     const uint8_t byte_val = input_data[data_off];
@@ -1764,15 +1766,16 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                         const float unif = 1.0f / (float)vocab_size;
                         for (int k = 0; k < vocab_size; k++) probs[k] = unif;
                     } else {
-                        float max_l = raw[0];
-                        for (int k = 1; k < vocab_size; k++)
-                            if (raw[k] > max_l) max_l = raw[k];
+                        float max_l;
+                        vDSP_maxv(raw, 1, &max_l, vocab_size);
+                        float neg_max = -max_l;
+                        vDSP_vsadd(raw, 1, &neg_max, probs, 1, vocab_size);
                         float sum = 0.0f;
                         for (int k = 0; k < vocab_size; k++) {
-                            probs[k] = expf(raw[k] - max_l);
+                            probs[k] = expf(probs[k]);
                             sum += probs[k];
                         }
-                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                        vDSP_vsdiv(probs, 1, &sum, probs, 1, vocab_size);
                     }
 
                     // Arithmetic decode
@@ -2009,11 +2012,13 @@ size_t neural_bridge_compress_symbols(
                         const float unif = 1.0f / (float)vocab_size;
                         for (int k = 0; k < vocab_size; k++) probs[k] = unif;
                     } else {
-                        float mx = raw[0];
-                        for (int k = 1; k < vocab_size; k++) if (raw[k] > mx) mx = raw[k];
+                        float mx;
+                        vDSP_maxv(raw, 1, &mx, vocab_size);
+                        float neg_mx = -mx;
+                        vDSP_vsadd(raw, 1, &neg_mx, probs, 1, vocab_size);
                         float sum = 0.0f;
-                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(raw[k] - mx); sum += probs[k]; }
-                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(probs[k]); sum += probs[k]; }
+                        vDSP_vsdiv(probs, 1, &sum, probs, 1, vocab_size);
                     }
 
                     const uint16_t tok = tokens[data_off];
@@ -2178,11 +2183,13 @@ size_t neural_bridge_decompress_symbols(
                         const float unif = 1.0f / (float)vocab_size;
                         for (int k = 0; k < vocab_size; k++) probs[k] = unif;
                     } else {
-                        float mx = raw[0];
-                        for (int k = 1; k < vocab_size; k++) if (raw[k] > mx) mx = raw[k];
+                        float mx;
+                        vDSP_maxv(raw, 1, &mx, vocab_size);
+                        float neg_mx = -mx;
+                        vDSP_vsadd(raw, 1, &neg_mx, probs, 1, vocab_size);
                         float sum = 0.0f;
-                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(raw[k] - mx); sum += probs[k]; }
-                        for (int k = 0; k < vocab_size; k++) probs[k] /= sum;
+                        for (int k = 0; k < vocab_size; k++) { probs[k] = expf(probs[k]); sum += probs[k]; }
+                        vDSP_vsdiv(probs, 1, &sum, probs, 1, vocab_size);
                     }
 
                     int sym = read_sym(&decoders[s], probs, vocab_size);

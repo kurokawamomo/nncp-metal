@@ -19,6 +19,7 @@
 #import "online_trainer.h"
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <Accelerate/Accelerate.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -4131,7 +4132,7 @@ void online_trainer_flush(OnlineTrainer* tr) {
             else                tr->train_step         += (uint64_t)N;
             tr->lr = compute_lr(tr);
 
-            id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
+            id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBufferWithUnretainedReferences];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             if (tr->ps_rmsprop) {
                 float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr;
@@ -5696,7 +5697,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     bool metal_bw_ok = false;
     {
         const bool accumulate_weight_grads = !copy_grads;
-        id<MTLCommandBuffer> cmd_buf = [tr->cmdQueue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = [tr->cmdQueue commandBufferWithUnretainedReferences];
         if (cmd_buf && metal_bw_train_step(tr, &wb, cmd_buf, accumulate_weight_grads)) {
             [cmd_buf commit];
             [cmd_buf waitUntilCompleted];
@@ -5787,7 +5788,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 // overwrites; all subsequent layers accumulate. This preserves shared-grad
                 // summation across the 20 layers.
                 const bool is_copy_shared = (copy_grads && i == (int)L - 1);
-                id<MTLCommandBuffer> cb = [tr->cmdQueue commandBuffer];
+                id<MTLCommandBuffer> cb = [tr->cmdQueue commandBufferWithUnretainedReferences];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 id<MTLBlitCommandEncoder> blit = nil;
                 auto get_blit = [&]() -> id<MTLBlitCommandEncoder> {
@@ -5859,7 +5860,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                     std::vector<float> tmp(per_layer_n);
                     [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
                     if (is_copy) memcpy(dst, tmp.data(), per_layer_n * sizeof(float));
-                    else for (size_t j = 0; j < per_layer_n; j++) dst[j] += tmp[j];
+                    else vDSP_vadd(dst, 1, tmp.data(), 1, dst, 1, per_layer_n);
                 };
                 putGrad(tr->grad_q,    res[bg.dw_q],    H * H);
                 putGrad(tr->grad_k,    res[bg.dw_k],    H * H);
@@ -5880,7 +5881,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                     std::vector<float> tmp(n);
                     [((MPSGraphTensorData*)res[bg.db_rel_r]).mpsndarray readBytes:tmp.data() strideBytes:NULL];
                     if (is_copy) memcpy(dst, tmp.data(), n * sizeof(float));
-                    else for (size_t j = 0; j < n; j++) dst[j] += tmp[j];
+                    else vDSP_vadd(dst, 1, tmp.data(), 1, dst, 1, n);
                 }
             }
         }
@@ -6340,7 +6341,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
 
             clip_gradients(tr, tr->grad_clip);
 
-            id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
+            id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBufferWithUnretainedReferences];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             if (tr->ps_rmsprop) {
                 float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr, wd = tr->weight_decay;
@@ -6549,7 +6550,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         readToScratch(tr->ts_grad_rel_r,    tr->sg_grad_rel_r);
         readToScratch(tr->ts_grad_b_rel_r,  tr->sg_grad_b_rel_r);
 
-        id<MTLCommandBuffer> acb = [tr->cmdQueue commandBuffer];
+        id<MTLCommandBuffer> acb = [tr->cmdQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> aenc = [acb computeCommandEncoder];
         auto addGPU = [&](id<MTLBuffer> dst, id<MTLBuffer> src, size_t n) {
             if (!dst || !src) return;
@@ -6582,7 +6583,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             std::vector<float> tmp(n);
             [td.mpsndarray readBytes:tmp.data() strideBytes:NULL];
             float* dst = (float*)[gbuf contents];
-            for (size_t i = 0; i < n; i++) dst[i] += tmp[i];
+            vDSP_vadd(dst, 1, tmp.data(), 1, dst, 1, n);
         };
         accumulateGrad(tr->ts_grad_embed,    tr->grad_embed);
         accumulateGrad(tr->ts_grad_q,        tr->grad_q);
@@ -6664,7 +6665,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
 
         clip_gradients(tr, tr->grad_clip);
 
-        id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
+        id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (tr->ps_rmsprop) {
             float b2 = tr->beta2, ep = tr->opt_eps, lr = tr->lr, wd = tr->weight_decay;
