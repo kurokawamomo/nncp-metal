@@ -737,6 +737,83 @@ kernel void geglu_bw(
 }
 
 
+// geglu_recompute_split: ffn[b, d] = GELU(val[b, d]) * gate[b, d]
+// Inputs/outputs all [B, D] laid out row-major. No packed layout — used when
+// forward saved val and gate as separate buffers (Metal backward path).
+kernel void geglu_recompute_split(
+    device const float* val  [[buffer(0)]], // [B, D]
+    device const float* gate [[buffer(1)]], // [B, D]
+    device float*       ffn  [[buffer(2)]], // [B, D]  ffn = GELU(val) * gate
+    constant uint& D [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;
+    uint b = gid.y;
+    if (d >= D) return;
+    float v = val[b * D + d];
+    const float k0 = 0.7978845608028654f;
+    float v2 = v * v;
+    float th = tanh(k0 * (v + 0.044715f * v * v2));
+    float gelu_v = 0.5f * v * (1.0f + th);
+    ffn[b * D + d] = gelu_v * gate[b * D + d];
+}
+
+// geglu_bw_split: backward for GELU(val)*gate where val/gate are SEPARATE [B,D]
+// buffers. Output is a PACKED [B, 2D] buffer (val-grad at [b,0..D), gate-grad at
+// [b,D..2D)) — matching forward's implicit packed layout so downstream linear_bw
+// treats it as d_ffn1[B, 2D] directly.
+kernel void geglu_bw_split(
+    device const float* grad_y [[buffer(0)]], // [B, D]   d_ffn
+    device const float* val    [[buffer(1)]], // [B, D]
+    device const float* gate   [[buffer(2)]], // [B, D]
+    device float*       d_out  [[buffer(3)]], // [B, 2D] packed (d_val|d_gate)
+    constant uint& D [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;
+    uint b = gid.y;
+    if (d >= D) return;
+    float v = val[b * D + d];
+    float g = gate[b * D + d];
+    float gy = grad_y[b * D + d];
+
+    const float k0 = 0.7978845608028654f;
+    float v2 = v * v;
+    float inner = k0 * (v + 0.044715f * v * v2);
+    float th = tanh(inner);
+    float sech2 = 1.0f - th * th;
+    float gelu_v = 0.5f * v * (1.0f + th);
+    float dinner = k0 * (1.0f + 3.0f * 0.044715f * v2);
+    float gelu_prime = 0.5f * (1.0f + th) + 0.5f * v * sech2 * dinner;
+
+    uint row2 = b * 2u * D;
+    d_out[row2 + d]     = gy * g * gelu_prime; // grad_val
+    d_out[row2 + D + d] = gy * gelu_v;         // grad_gate
+}
+
+// B6b. gelu_bw: plain GELU backward (default profile, no gating)
+//   dx[i] = dy[i] * gelu'(x[i])
+//   gelu'(x) = 0.5*(1+tanh(k*(x+0.044715*x³))) + 0.5*x*sech²(k*(...))*k*(1+3*0.044715*x²)
+// Dispatch: [N, 1, 1], threadgroup [min(N, 256), 1, 1]
+kernel void gelu_bw(
+    device const float* dy [[buffer(0)]],  // [N]
+    device const float* x  [[buffer(1)]],  // [N]
+    device float*       dx [[buffer(2)]],  // [N]
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float xi = x[gid];
+    const float k0 = 0.7978845608028654f; // sqrt(2/pi)
+    float v2 = xi * xi;
+    float inner = k0 * (xi + 0.044715f * xi * v2);
+    float th = tanh(inner);
+    float sech2 = 1.0f - th * th;
+    float dinner = k0 * (1.0f + 3.0f * 0.044715f * v2);
+    float gprime = 0.5f * (1.0f + th) + 0.5f * xi * sech2 * dinner;
+    dx[gid] = dy[gid] * gprime;
+}
+
 /* ========================================================================
  * Backward kernels merged from backward_kernels.metal (Pane2 → M-2 prep)
  *   B11: ce_softmax_fused_bw
@@ -918,7 +995,7 @@ kernel void rel_pe_br_scatter_bw(
 // Corrected version with explicit stride
 kernel void rel_pe_br_scatter_bw_v2(
     device const float*   d_scores   [[buffer(0)]],  // [B, NH, TL] flattened
-    device float*         d_b_rel_r  [[buffer(1)]],  // [NH, TL] output (zero-initialized)
+    device float*         d_b_rel_r  [[buffer(1)]],  // [NH, TL] — ACCUMULATED (+=)
     device const int32_t* bdist      [[buffer(2)]],  // [TL]
     constant uint&        TL         [[buffer(3)]],
     constant uint&        NH         [[buffer(4)]],
@@ -938,7 +1015,9 @@ kernel void rel_pe_br_scatter_bw_v2(
             }
         }
     }
-    d_b_rel_r[h * TL + d] = sum * b_scale;
+    // Accumulate (b_rel_r is tied across all layers → each layer adds its contribution).
+    // Caller must zero-init d_b_rel_r once per BPTT chunk before the first layer's bw.
+    d_b_rel_r[h * TL + d] += sum * b_scale;
 }
 
 /* ========================================================================
@@ -1037,4 +1116,210 @@ kernel void embed_bw_simd(
             d_W_embed[idx] = grad;
         }
     }
+}
+
+// kv_assemble_per_head: build K_full / V_full [B*NH, TL, HD] from
+//   - kv_mem [B*MEM_LEN, H]   (positions [0, MEM_LEN))
+//   - kv_new [B*T, H]         (positions [MEM_LEN, MEM_LEN+T))
+// Both inputs are in [B, *, NH, HD] layout (H = NH*HD); output is per-head
+// contiguous so attention bw GEMMs can address each head with a single offset.
+//
+// Dispatch: threads [HD, TL, B*NH], threadgroup [min(HD,32), 1, 1].
+// TL = MEM_LEN + T.
+kernel void kv_assemble_per_head(
+    device const float* kv_mem   [[buffer(0)]],  // [B*MEM_LEN, H]
+    device const float* kv_new   [[buffer(1)]],  // [B*T, H]
+    device float*       kv_full  [[buffer(2)]],  // [B*NH, TL, HD]
+    constant uint& B       [[buffer(3)]],
+    constant uint& NH      [[buffer(4)]],
+    constant uint& HD      [[buffer(5)]],
+    constant uint& MEM_LEN [[buffer(6)]],
+    constant uint& T       [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint tl  = gid.y;
+    uint bnh = gid.z;
+    uint TL  = MEM_LEN + T;
+    if (hd >= HD || tl >= TL || bnh >= B * NH) return;
+
+    uint b  = bnh / NH;
+    uint nh = bnh % NH;
+    uint H  = NH * HD;
+    float v;
+    if (tl < MEM_LEN) {
+        uint row = b * MEM_LEN + tl;
+        v = kv_mem[row * H + nh * HD + hd];
+    } else {
+        uint row = b * T + (tl - MEM_LEN);
+        v = kv_new[row * H + nh * HD + hd];
+    }
+    kv_full[(bnh * TL + tl) * HD + hd] = v;
+}
+
+// =============================================================================
+// B12. linear_bw_weight_acc: dW[k,n] += sum_m X[m,k] * dY[m,n]
+//   Accumulating version of linear_bw_weight for weight grad across batch elements.
+//   Uses AMX for the GEMM, then threadgroup staging for the read-add-write.
+// Dispatch: threadgroups [N/8, K/8, 1], threads_per_threadgroup [32, 1, 1]
+// Requires K, N multiples of 8; M must be multiple of 8.
+// =============================================================================
+kernel void linear_bw_weight_acc_amx(
+    device const float* X      [[buffer(0)]],  // [M, K]
+    device const float* dY     [[buffer(1)]],  // [M, N]
+    device float*       dW     [[buffer(2)]],  // [K, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint k_start = tgid.y * 8;
+    uint n_start = tgid.x * 8;
+
+    // Compute new contribution via AMX
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    for (uint m = 0; m < M; m += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, X  + m * K + k_start, K, ulong2(0, 0), true);
+        simdgroup_load(b, dY + m * N + n_start, N, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+
+    // Store new contribution to threadgroup memory, then add to device memory
+    threadgroup float tile[64];
+    simdgroup_store(c, tile, 8);
+
+    // Each of 32 threads handles 2 elements from the 8x8 tile
+    for (uint e = lane; e < 64; e += 32) {
+        uint dk = e / 8;
+        uint dn = e % 8;
+        dW[(k_start + dk) * N + (n_start + dn)] += tile[e];
+    }
+}
+
+// =============================================================================
+// B13. reshape_to_multihead: [B*T, SRC_STRIDE] → [B*NH, T, D]
+//   Extracts D elements per head from each row of the source.
+//   src[(b*T+t) * SRC_STRIDE + h*D + d] → dst[(b*NH+h)*T*D + t*D + d]
+//   Used for converting flat [BT, H] tensors to per-head [B*NH, T, HD] layout.
+// Dispatch: [total_elements, 1, 1], threadgroup [256, 1, 1]
+//   where total_elements = B * NH * T * D
+// =============================================================================
+kernel void reshape_to_multihead(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint& B          [[buffer(2)]],
+    constant uint& T_dim      [[buffer(3)]],
+    constant uint& NH         [[buffer(4)]],
+    constant uint& D          [[buffer(5)]],
+    constant uint& SRC_STRIDE [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = B * NH * T_dim * D;
+    if (gid >= total) return;
+
+    uint d = gid % D;
+    uint t = (gid / D) % T_dim;
+    uint h = (gid / (D * T_dim)) % NH;
+    uint b = gid / (D * T_dim * NH);
+
+    dst[gid] = src[(b * T_dim + t) * SRC_STRIDE + h * D + d];
+}
+
+// =============================================================================
+// B14. reshape_from_multihead: [B*NH, T, D] → [B*T, DST_STRIDE]
+//   Inverse of reshape_to_multihead. Scatters per-head data back to flat layout.
+//   src[(b*NH+h)*T*D + t*D + d] → dst[(b*T+t) * DST_STRIDE + h*D + d]
+// Dispatch: [total_elements, 1, 1], threadgroup [256, 1, 1]
+//   where total_elements = B * NH * T * D
+// =============================================================================
+kernel void reshape_from_multihead(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint& B          [[buffer(2)]],
+    constant uint& T_dim      [[buffer(3)]],
+    constant uint& NH         [[buffer(4)]],
+    constant uint& D          [[buffer(5)]],
+    constant uint& DST_STRIDE [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = B * NH * T_dim * D;
+    if (gid >= total) return;
+
+    uint d = gid % D;
+    uint t = (gid / D) % T_dim;
+    uint h = (gid / (D * T_dim)) % NH;
+    uint b = gid / (D * T_dim * NH);
+
+    dst[(b * T_dim + t) * DST_STRIDE + h * D + d] = src[gid];
+}
+
+// =============================================================================
+// B15. reshape_from_multihead_acc: [B*NH, T, D] → accumulate into [B*T, DST_STRIDE]
+//   Same as reshape_from_multihead but uses += instead of =.
+//   Used for adding rel PE Q contribution back to d_Q in flat layout.
+// =============================================================================
+kernel void reshape_from_multihead_acc(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint& B          [[buffer(2)]],
+    constant uint& T_dim      [[buffer(3)]],
+    constant uint& NH         [[buffer(4)]],
+    constant uint& D          [[buffer(5)]],
+    constant uint& DST_STRIDE [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = B * NH * T_dim * D;
+    if (gid >= total) return;
+
+    uint d = gid % D;
+    uint t = (gid / D) % T_dim;
+    uint h = (gid / (D * T_dim)) % NH;
+    uint b = gid / (D * T_dim * NH);
+
+    dst[(b * T_dim + t) * DST_STRIDE + h * D + d] += src[gid];
+}
+
+// =============================================================================
+// B16. extract_new_kv_from_mh_tail: [B*NH, TL, HD] → [B*T, H]
+//   Extracts the last T slots of each bnh row (the "new" portion, tl in [MEM_LEN, MEM_LEN+T)).
+//   Used in attention backward to pull d_K_mh's new-K portion out for the Q/K/V linear backward.
+//   dst[(b*T+t) * H + h*HD + hd] = src[(b*NH+h)*TL*HD + (MEM_LEN+t)*HD + hd]
+// Dispatch: [total=B*T*H, 1, 1], threadgroup [256, 1, 1]
+// =============================================================================
+kernel void extract_new_kv_from_mh_tail(
+    device const float* src [[buffer(0)]], // [B*NH, TL, HD]
+    device float*       dst [[buffer(1)]], // [B*T, H]  (H = NH*HD)
+    constant uint& B       [[buffer(2)]],
+    constant uint& NH      [[buffer(3)]],
+    constant uint& HD      [[buffer(4)]],
+    constant uint& MEM_LEN [[buffer(5)]],
+    constant uint& T       [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint H  = NH * HD;
+    uint total = B * T * H;
+    if (gid >= total) return;
+
+    uint hd = gid % HD;
+    uint h  = (gid / HD) % NH;
+    uint t  = (gid / H)  % T;
+    uint b  = gid / (T * H);
+    uint TL = MEM_LEN + T;
+
+    uint src_idx = ((b * NH + h) * TL + (MEM_LEN + t)) * HD + hd;
+    dst[gid] = src[src_idx];
+}
+
+// B17. scale_buffer: y[i] = x[i] * s
+kernel void scale_buffer(
+    device const float* x [[buffer(0)]],
+    device float*       y [[buffer(1)]],
+    constant float&     s [[buffer(2)]],
+    constant uint&      n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    y[gid] = x[gid] * s;
 }

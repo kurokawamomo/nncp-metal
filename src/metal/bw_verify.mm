@@ -411,6 +411,41 @@ static void run_geglu_bw(Rng& r) {
     record("geglu_bw", out, ref, 5e-5f);
 }
 
+static void run_gelu_bw(Rng& r) {
+    uint N = 2048;
+    std::vector<float> dy(N), x(N), out(N), ref(N);
+    fill_random(dy, r); fill_random(x, r);
+    // CPU reference
+    const float k0 = 0.7978845608028654f;
+    for (uint i = 0; i < N; i++) {
+        float xi = x[i], v2 = xi*xi;
+        float inner = k0 * (xi + 0.044715f * xi * v2);
+        float th = std::tanh(inner);
+        float sech2 = 1.0f - th*th;
+        float dinner = k0 * (1.0f + 3.0f * 0.044715f * v2);
+        float gprime = 0.5f * (1.0f + th) + 0.5f * xi * sech2 * dinner;
+        ref[i] = dy[i] * gprime;
+    }
+
+    id<MTLBuffer> bdy = g_mtl.bufFrom(dy);
+    id<MTLBuffer> bx  = g_mtl.bufFrom(x);
+    id<MTLBuffer> bdx = g_mtl.buf(N);
+    auto pso = g_mtl.pso(@"gelu_bw");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bdy offset:0 atIndex:0];
+    [enc setBuffer:bx  offset:0 atIndex:1];
+    [enc setBuffer:bdx offset:0 atIndex:2];
+    [enc setBytes:&N length:sizeof(uint) atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    g_mtl.readInto(bdx, out);
+    record("gelu_bw", out, ref, 5e-5f);
+}
+
 // ---- 1-layer composed backward (FFN block: X -> Linear1 -> GeGLU -> Linear2) -
 // Forward:
 //   U = X @ W1 + b1    [M, 2F]
@@ -422,6 +457,547 @@ static void run_geglu_bw(Rng& r) {
 //   dU = geglu_bw(dH, U)
 //   dW1 = X^T @ dU, db1 = sum_m dU
 //   dX = dU @ W1^T
+// embed_bw: grad_W_embed[v, h] = embed_scale * sum_{b: tok[b]==v} d_output[b, h]
+// Kernel: embed_bw_simd. Covers both overwrite (accumulate=0) and += (accumulate=1).
+static void run_embed_bw(Rng& r) {
+    const uint B = 64, H = 32, V = 48;
+    std::vector<int32_t> tokens(B);
+    for (uint b = 0; b < B; b++) tokens[b] = (int32_t)(r.next() % V);
+    std::vector<float> d_out(B * H);
+    fill_random(d_out, r);
+    const float embed_scale = std::sqrt((float)H);
+
+    // CPU reference: overwrite semantics
+    std::vector<float> ref_ow((size_t)V * H, 0.0f);
+    for (uint b = 0; b < B; b++) {
+        int32_t tok = tokens[b];
+        if (tok < 0 || (uint)tok >= V) continue;
+        for (uint h = 0; h < H; h++) {
+            ref_ow[(size_t)tok * H + h] += d_out[(size_t)b * H + h] * embed_scale;
+        }
+    }
+    // CPU reference: accumulate (pre-fill with a known pattern, then add)
+    std::vector<float> prior((size_t)V * H);
+    fill_random(prior, r);
+    std::vector<float> ref_acc = prior;
+    for (size_t i = 0; i < ref_acc.size(); i++) ref_acc[i] += ref_ow[i];
+
+    id<MTLBuffer> bdOut = g_mtl.bufFrom(d_out);
+    id<MTLBuffer> bTok  = [g_mtl.dev newBufferWithBytes:tokens.data()
+                                                length:tokens.size()*sizeof(int32_t)
+                                               options:MTLResourceStorageModeShared];
+    auto pso = g_mtl.pso(@"embed_bw_simd");
+
+    // --- Case 1: overwrite ---
+    id<MTLBuffer> bdW_ow = g_mtl.buf((size_t)V * H);
+    // Seed bdW_ow with prior to confirm overwrite actually clobbers.
+    memcpy([bdW_ow contents], prior.data(), prior.size() * sizeof(float));
+    {
+        id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bdOut offset:0 atIndex:0];
+        [enc setBuffer:bTok  offset:0 atIndex:1];
+        [enc setBuffer:bdW_ow offset:0 atIndex:2];
+        uint Bn=B, Hn=H, Vn=V, acc=0;
+        [enc setBytes:&Bn length:4 atIndex:3];
+        [enc setBytes:&Hn length:4 atIndex:4];
+        [enc setBytes:&Vn length:4 atIndex:5];
+        [enc setBytes:&embed_scale length:4 atIndex:6];
+        [enc setBytes:&acc length:4 atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(H*32, V, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, std::min<uint>(V, 8u), 1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+    }
+    std::vector<float> g_ow((size_t)V * H);
+    g_mtl.readInto(bdW_ow, g_ow);
+    record("embed_bw.overwrite", g_ow, ref_ow, 1e-4f);
+
+    // --- Case 2: accumulate ---
+    id<MTLBuffer> bdW_acc = g_mtl.buf((size_t)V * H);
+    memcpy([bdW_acc contents], prior.data(), prior.size() * sizeof(float));
+    {
+        id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bdOut offset:0 atIndex:0];
+        [enc setBuffer:bTok  offset:0 atIndex:1];
+        [enc setBuffer:bdW_acc offset:0 atIndex:2];
+        uint Bn=B, Hn=H, Vn=V, acc=1;
+        [enc setBytes:&Bn length:4 atIndex:3];
+        [enc setBytes:&Hn length:4 atIndex:4];
+        [enc setBytes:&Vn length:4 atIndex:5];
+        [enc setBytes:&embed_scale length:4 atIndex:6];
+        [enc setBytes:&acc length:4 atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(H*32, V, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, std::min<uint>(V, 8u), 1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+    }
+    std::vector<float> g_acc((size_t)V * H);
+    g_mtl.readInto(bdW_acc, g_acc);
+    record("embed_bw.accumulate", g_acc, ref_acc, 1e-4f);
+}
+
+// ---- Phase M-2b Part A: K/V recompute + attention per-head GEMM helpers ----
+// These mirror the dispatch helpers added in online_trainer.mm. They are
+// re-implemented inline here (no shared header) so the standalone bw_verify
+// binary stays self-contained.
+
+// CPU references --------------------------------------------------------------
+static void cpu_kv_assemble(const float* kv_mem, const float* kv_new,
+                            float* out, uint B, uint NH, uint HD,
+                            uint MEM_LEN, uint T) {
+    uint H  = NH * HD;
+    uint TL = MEM_LEN + T;
+    for (uint b = 0; b < B; b++)
+        for (uint nh = 0; nh < NH; nh++)
+            for (uint tl = 0; tl < TL; tl++)
+                for (uint hd = 0; hd < HD; hd++) {
+                    uint bnh = b * NH + nh;
+                    float v;
+                    if (tl < MEM_LEN) {
+                        v = kv_mem[(b * MEM_LEN + tl) * H + nh * HD + hd];
+                    } else {
+                        v = kv_new[(b * T + (tl - MEM_LEN)) * H + nh * HD + hd];
+                    }
+                    out[(bnh * TL + tl) * HD + hd] = v;
+                }
+}
+
+static void cpu_linear_fwd(const float* X, const float* W, float* Y,
+                           uint M, uint K, uint N) {
+    for (uint m = 0; m < M; m++)
+        for (uint n = 0; n < N; n++) {
+            float s = 0.0f;
+            for (uint k = 0; k < K; k++) s += X[m*K+k] * W[k*N+n];
+            Y[m*N+n] = s;
+        }
+}
+
+// d_Q[t,hd] = sum_tl d_scores[t,tl] * K[tl,hd]   (per head)
+// d_K[tl,hd] = sum_t d_scores[t,tl] * Q[t,hd]
+static void cpu_attn_qkt_bw(const float* d_scores, const float* K, const float* Q,
+                            float* d_Q, float* d_K,
+                            uint BNH, uint T, uint TL, uint HD) {
+    for (uint h = 0; h < BNH; h++) {
+        const float* ds = d_scores + h*T*TL;
+        const float* kk = K + h*TL*HD;
+        const float* qq = Q + h*T*HD;
+        float* dq = d_Q + h*T*HD;
+        float* dk = d_K + h*TL*HD;
+        for (uint t = 0; t < T; t++)
+            for (uint hd = 0; hd < HD; hd++) {
+                float s = 0.0f;
+                for (uint tl = 0; tl < TL; tl++) s += ds[t*TL+tl] * kk[tl*HD+hd];
+                dq[t*HD+hd] = s;
+            }
+        for (uint tl = 0; tl < TL; tl++)
+            for (uint hd = 0; hd < HD; hd++) {
+                float s = 0.0f;
+                for (uint t = 0; t < T; t++) s += ds[t*TL+tl] * qq[t*HD+hd];
+                dk[tl*HD+hd] = s;
+            }
+    }
+}
+
+// d_V[tl,hd]    = sum_t attn_prob[t,tl] * d_attn_out[t,hd]
+// d_scores[t,tl] = sum_hd d_attn_out[t,hd] * V[tl,hd]
+static void cpu_attn_val_bw(const float* d_attn_out, const float* attn_prob,
+                            const float* V, float* d_V, float* d_scores,
+                            uint BNH, uint T, uint TL, uint HD) {
+    for (uint h = 0; h < BNH; h++) {
+        const float* dao = d_attn_out + h*T*HD;
+        const float* ap  = attn_prob  + h*T*TL;
+        const float* vv  = V + h*TL*HD;
+        float* dv = d_V + h*TL*HD;
+        float* ds = d_scores + h*T*TL;
+        for (uint tl = 0; tl < TL; tl++)
+            for (uint hd = 0; hd < HD; hd++) {
+                float s = 0.0f;
+                for (uint t = 0; t < T; t++) s += ap[t*TL+tl] * dao[t*HD+hd];
+                dv[tl*HD+hd] = s;
+            }
+        for (uint t = 0; t < T; t++)
+            for (uint tl = 0; tl < TL; tl++) {
+                float s = 0.0f;
+                for (uint hd = 0; hd < HD; hd++) s += dao[t*HD+hd] * vv[tl*HD+hd];
+                ds[t*TL+tl] = s;
+            }
+    }
+}
+
+// Tests -----------------------------------------------------------------------
+static void run_kv_recompute(Rng& r) {
+    // Mini realistic-shape: B=2, NH=4, HD=8, MEM_LEN=8, T=8 → TL=16, H=32
+    const uint B=2, NH=4, HD=8, MEM_LEN=8, T=8;
+    const uint H = NH*HD, TL = MEM_LEN+T, BT = B*T, BNH = B*NH;
+    std::vector<float> x_ln1(BT*H), w(H*H), kv_mem(B*MEM_LEN*H);
+    std::vector<float> zero_bias(H, 0.0f);
+    fill_random(x_ln1, r); fill_random(w, r); fill_random(kv_mem, r);
+
+    // CPU: K_new = x_ln1 @ w; assemble
+    std::vector<float> k_new(BT*H), ref(BNH*TL*HD);
+    cpu_linear_fwd(x_ln1.data(), w.data(), k_new.data(), BT, H, H);
+    cpu_kv_assemble(kv_mem.data(), k_new.data(), ref.data(), B, NH, HD, MEM_LEN, T);
+
+    // GPU
+    auto ps_lin   = g_mtl.pso(@"transformer_linear_amx");
+    auto ps_asm   = g_mtl.pso(@"kv_assemble_per_head");
+    id<MTLBuffer> b_xln1 = g_mtl.bufFrom(x_ln1);
+    id<MTLBuffer> b_w    = g_mtl.bufFrom(w);
+    id<MTLBuffer> b_mem  = g_mtl.bufFrom(kv_mem);
+    id<MTLBuffer> b_zb   = g_mtl.bufFrom(zero_bias);
+    id<MTLBuffer> b_knew = g_mtl.buf(BT*H);
+    id<MTLBuffer> b_full = g_mtl.buf(BNH*TL*HD);
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    // Stage 1: K_new = x_ln1 @ w
+    [enc setComputePipelineState:ps_lin];
+    [enc setBuffer:b_xln1 offset:0 atIndex:0];
+    [enc setBuffer:b_w    offset:0 atIndex:1];
+    [enc setBuffer:b_zb   offset:0 atIndex:2];
+    [enc setBuffer:b_knew offset:0 atIndex:3];
+    uint Hu=H;
+    [enc setBytes:&Hu length:4 atIndex:4];
+    [enc setBytes:&Hu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(H/8, BT/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    // Stage 2: assemble
+    [enc setComputePipelineState:ps_asm];
+    [enc setBuffer:b_mem  offset:0 atIndex:0];
+    [enc setBuffer:b_knew offset:0 atIndex:1];
+    [enc setBuffer:b_full offset:0 atIndex:2];
+    uint Bu=B, NHu=NH, HDu=HD, ML=MEM_LEN, Tu=T;
+    [enc setBytes:&Bu  length:4 atIndex:3];
+    [enc setBytes:&NHu length:4 atIndex:4];
+    [enc setBytes:&HDu length:4 atIndex:5];
+    [enc setBytes:&ML  length:4 atIndex:6];
+    [enc setBytes:&Tu  length:4 atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(HD, TL, BNH) threadsPerThreadgroup:MTLSizeMake(std::min<uint>(HD,32),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> out(BNH*TL*HD);
+    g_mtl.readInto(b_full, out);
+    record("kv_recompute", out, ref, 1e-4f);
+}
+
+static void run_attn_qkt_bw(Rng& r) {
+    // BPTT-realistic shapes: B=1, NH=8, T=8, TL=16, HD=8 (all 8-aligned, small for fast CPU ref)
+    const uint B=1, NH=8, T=8, TL=16, HD=8, BNH=B*NH;
+    std::vector<float> d_scores(BNH*T*TL), K(BNH*TL*HD), Q(BNH*T*HD);
+    std::vector<float> zero_bias(HD, 0.0f);
+    fill_random(d_scores, r); fill_random(K, r); fill_random(Q, r);
+    std::vector<float> ref_dQ(BNH*T*HD), ref_dK(BNH*TL*HD);
+    cpu_attn_qkt_bw(d_scores.data(), K.data(), Q.data(),
+                    ref_dQ.data(), ref_dK.data(), BNH, T, TL, HD);
+
+    auto ps_lin  = g_mtl.pso(@"transformer_linear_amx");
+    auto ps_bw_w = g_mtl.pso(@"linear_bw_weight_amx");
+    id<MTLBuffer> b_ds = g_mtl.bufFrom(d_scores);
+    id<MTLBuffer> b_K  = g_mtl.bufFrom(K);
+    id<MTLBuffer> b_Q  = g_mtl.bufFrom(Q);
+    id<MTLBuffer> b_zb = g_mtl.bufFrom(zero_bias);
+    id<MTLBuffer> b_dQ = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dK = g_mtl.buf(BNH*TL*HD);
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    const uint per_qhd = T*HD, per_khd = TL*HD, per_st = T*TL;
+    for (uint h = 0; h < BNH; h++) {
+        NSUInteger os = (NSUInteger)h*per_st*sizeof(float);
+        NSUInteger ok = (NSUInteger)h*per_khd*sizeof(float);
+        NSUInteger oq = (NSUInteger)h*per_qhd*sizeof(float);
+        // d_Q
+        [enc setComputePipelineState:ps_lin];
+        [enc setBuffer:b_ds offset:os atIndex:0];
+        [enc setBuffer:b_K  offset:ok atIndex:1];
+        [enc setBuffer:b_zb offset:0  atIndex:2];
+        [enc setBuffer:b_dQ offset:oq atIndex:3];
+        uint TLu=TL, HDu=HD, Tu=T;
+        [enc setBytes:&TLu length:4 atIndex:4];
+        [enc setBytes:&HDu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        // d_K
+        [enc setComputePipelineState:ps_bw_w];
+        [enc setBuffer:b_ds offset:os atIndex:0];
+        [enc setBuffer:b_Q  offset:oq atIndex:1];
+        [enc setBuffer:b_dK offset:ok atIndex:2];
+        [enc setBytes:&Tu  length:4 atIndex:3];
+        [enc setBytes:&TLu length:4 atIndex:4];
+        [enc setBytes:&HDu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    }
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQ(BNH*T*HD), g_dK(BNH*TL*HD);
+    g_mtl.readInto(b_dQ, g_dQ); g_mtl.readInto(b_dK, g_dK);
+    record("attn_qkt_bw.dQ", g_dQ, ref_dQ, 1e-4f);
+    record("attn_qkt_bw.dK", g_dK, ref_dK, 1e-4f);
+}
+
+static void run_attn_val_bw(Rng& r) {
+    const uint B=1, NH=8, T=8, TL=16, HD=8, BNH=B*NH;
+    std::vector<float> d_attn_out(BNH*T*HD), attn_prob(BNH*T*TL), V(BNH*TL*HD);
+    fill_random(d_attn_out, r); fill_random(attn_prob, r); fill_random(V, r);
+    std::vector<float> ref_dV(BNH*TL*HD), ref_dS(BNH*T*TL);
+    cpu_attn_val_bw(d_attn_out.data(), attn_prob.data(), V.data(),
+                    ref_dV.data(), ref_dS.data(), BNH, T, TL, HD);
+
+    auto ps_bw_in = g_mtl.pso(@"linear_bw_input_amx");
+    auto ps_bw_w  = g_mtl.pso(@"linear_bw_weight_amx");
+    id<MTLBuffer> b_dao = g_mtl.bufFrom(d_attn_out);
+    id<MTLBuffer> b_ap  = g_mtl.bufFrom(attn_prob);
+    id<MTLBuffer> b_V   = g_mtl.bufFrom(V);
+    id<MTLBuffer> b_dV  = g_mtl.buf(BNH*TL*HD);
+    id<MTLBuffer> b_dS  = g_mtl.buf(BNH*T*TL);
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    const uint per_qhd = T*HD, per_vhd = TL*HD, per_st = T*TL;
+    for (uint h = 0; h < BNH; h++) {
+        NSUInteger oo = (NSUInteger)h*per_qhd*sizeof(float);
+        NSUInteger ov = (NSUInteger)h*per_vhd*sizeof(float);
+        NSUInteger os = (NSUInteger)h*per_st *sizeof(float);
+        // d_V = attn_prob^T @ d_attn_out  (linear_bw_weight)
+        [enc setComputePipelineState:ps_bw_w];
+        [enc setBuffer:b_ap  offset:os atIndex:0];
+        [enc setBuffer:b_dao offset:oo atIndex:1];
+        [enc setBuffer:b_dV  offset:ov atIndex:2];
+        uint Tu=T, TLu=TL, HDu=HD;
+        [enc setBytes:&Tu  length:4 atIndex:3];
+        [enc setBytes:&TLu length:4 atIndex:4];
+        [enc setBytes:&HDu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        // d_scores = d_attn_out @ V^T  (linear_bw_input: dY=d_attn_out M=T,N=HD; W=V K=TL,N=HD; dX=d_scores[T,TL])
+        [enc setComputePipelineState:ps_bw_in];
+        [enc setBuffer:b_dao offset:oo atIndex:0];
+        [enc setBuffer:b_V   offset:ov atIndex:1];
+        [enc setBuffer:b_dS  offset:os atIndex:2];
+        [enc setBytes:&Tu  length:4 atIndex:3];
+        [enc setBytes:&HDu length:4 atIndex:4];
+        [enc setBytes:&TLu length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(TL/8, T/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    }
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dV(BNH*TL*HD), g_dS(BNH*T*TL);
+    g_mtl.readInto(b_dV, g_dV); g_mtl.readInto(b_dS, g_dS);
+    record("attn_val_bw.dV",     g_dV, ref_dV, 1e-4f);
+    record("attn_val_bw.dScores", g_dS, ref_dS, 1e-4f);
+}
+
+// ---- Phase M-2b Part B: Reshape + Rel-PE Q-grad tests ----
+
+// CPU reference: reshape_to_multihead [B*T, SRC_STRIDE] → [B*NH, T, D]
+static void cpu_reshape_to_mh(const float* src, float* dst,
+                               uint B, uint T, uint NH, uint D, uint SRC_STRIDE) {
+    for (uint b = 0; b < B; b++)
+        for (uint h = 0; h < NH; h++)
+            for (uint t = 0; t < T; t++)
+                for (uint d = 0; d < D; d++)
+                    dst[((b*NH+h)*T+t)*D+d] = src[(b*T+t)*SRC_STRIDE + h*D + d];
+}
+
+// CPU reference: reshape_from_multihead [B*NH, T, D] → [B*T, DST_STRIDE]
+static void cpu_reshape_from_mh(const float* src, float* dst,
+                                 uint B, uint T, uint NH, uint D, uint DST_STRIDE) {
+    for (uint b = 0; b < B; b++)
+        for (uint h = 0; h < NH; h++)
+            for (uint t = 0; t < T; t++)
+                for (uint d = 0; d < D; d++)
+                    dst[(b*T+t)*DST_STRIDE + h*D + d] = src[((b*NH+h)*T+t)*D+d];
+}
+
+// CPU reference: reshape_from_multihead_acc (+=)
+static void cpu_reshape_from_mh_acc(const float* src, float* dst,
+                                     uint B, uint T, uint NH, uint D, uint DST_STRIDE) {
+    for (uint b = 0; b < B; b++)
+        for (uint h = 0; h < NH; h++)
+            for (uint t = 0; t < T; t++)
+                for (uint d = 0; d < D; d++)
+                    dst[(b*T+t)*DST_STRIDE + h*D + d] += src[((b*NH+h)*T+t)*D+d];
+}
+
+static void run_reshape_to_multihead(Rng& r) {
+    const uint B=2, T=8, NH=4, HD=8, H=NH*HD;
+    std::vector<float> src(B*T*H), ref(B*NH*T*HD), out(B*NH*T*HD);
+    fill_random(src, r);
+    cpu_reshape_to_mh(src.data(), ref.data(), B, T, NH, HD, H);
+
+    auto pso = g_mtl.pso(@"reshape_to_multihead");
+    id<MTLBuffer> b_src = g_mtl.bufFrom(src);
+    id<MTLBuffer> b_dst = g_mtl.buf(B*NH*T*HD);
+    uint total = B*NH*T*HD;
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_src offset:0 atIndex:0];
+    [enc setBuffer:b_dst offset:0 atIndex:1];
+    uint Bu=B, Tu=T, NHu=NH, Du=HD, Su=H;
+    [enc setBytes:&Bu length:4 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3];
+    [enc setBytes:&NHu length:4 atIndex:4];
+    [enc setBytes:&Du  length:4 atIndex:5];
+    [enc setBytes:&Su  length:4 atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(total,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(total,256u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    g_mtl.readInto(b_dst, out);
+    record("reshape_to_mh", out, ref, 0.0f);
+}
+
+static void run_reshape_roundtrip(Rng& r) {
+    const uint B=2, T=8, NH=4, HD=8, H=NH*HD;
+    std::vector<float> src(B*T*H), mh(B*NH*T*HD), out(B*T*H);
+    fill_random(src, r);
+
+    auto ps_to   = g_mtl.pso(@"reshape_to_multihead");
+    auto ps_from = g_mtl.pso(@"reshape_from_multihead");
+    id<MTLBuffer> b_src = g_mtl.bufFrom(src);
+    id<MTLBuffer> b_mh  = g_mtl.buf(B*NH*T*HD);
+    id<MTLBuffer> b_dst = g_mtl.buf(B*T*H);
+    uint total = B*NH*T*HD;
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    // to_mh
+    [enc setComputePipelineState:ps_to];
+    [enc setBuffer:b_src offset:0 atIndex:0];
+    [enc setBuffer:b_mh  offset:0 atIndex:1];
+    uint Bu=B, Tu=T, NHu=NH, Du=HD, Hu=H;
+    [enc setBytes:&Bu  length:4 atIndex:2];
+    [enc setBytes:&Tu  length:4 atIndex:3];
+    [enc setBytes:&NHu length:4 atIndex:4];
+    [enc setBytes:&Du  length:4 atIndex:5];
+    [enc setBytes:&Hu  length:4 atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(total,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(total,256u),1,1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    // from_mh
+    [enc setComputePipelineState:ps_from];
+    [enc setBuffer:b_mh  offset:0 atIndex:0];
+    [enc setBuffer:b_dst offset:0 atIndex:1];
+    [enc setBytes:&Bu  length:4 atIndex:2];
+    [enc setBytes:&Tu  length:4 atIndex:3];
+    [enc setBytes:&NHu length:4 atIndex:4];
+    [enc setBytes:&Du  length:4 atIndex:5];
+    [enc setBytes:&Hu  length:4 atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(total,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(total,256u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    g_mtl.readInto(b_dst, out);
+    record("reshape_roundtrip", out, src, 0.0f);
+}
+
+// CPU reference: rel_pe_q_grad
+// d_Q_rel[bnh, t, :HD] = d_q_rel_raw[bnh, t, :D_POS] @ W_rel_r[h, :HD, :D_POS]^T
+// d_W_rel_r[h, :, :] += Q_saved[bnh, t, :HD]^T @ d_q_rel_raw[bnh, t, :D_POS]
+static void cpu_rel_pe_q_grad(const float* Q_mh, const float* d_q_rel_mh,
+                               const float* W_r, float* d_Q_rel, float* d_W_r,
+                               uint B, uint NH, uint T, uint HD, uint D_POS) {
+    memset(d_W_r, 0, NH * HD * D_POS * sizeof(float));
+    for (uint b = 0; b < B; b++) {
+        for (uint h = 0; h < NH; h++) {
+            uint bnh = b * NH + h;
+            for (uint t = 0; t < T; t++) {
+                for (uint hd = 0; hd < HD; hd++) {
+                    float s = 0.0f;
+                    for (uint dp = 0; dp < D_POS; dp++)
+                        s += d_q_rel_mh[(bnh*T+t)*D_POS+dp] * W_r[(h*HD+hd)*D_POS+dp];
+                    d_Q_rel[(bnh*T+t)*HD+hd] = s;
+                }
+            }
+            for (uint hd = 0; hd < HD; hd++) {
+                for (uint dp = 0; dp < D_POS; dp++) {
+                    float s = 0.0f;
+                    for (uint t = 0; t < T; t++)
+                        s += Q_mh[(bnh*T+t)*HD+hd] * d_q_rel_mh[(bnh*T+t)*D_POS+dp];
+                    d_W_r[(h*HD+hd)*D_POS+dp] += s;
+                }
+            }
+        }
+    }
+}
+
+static void run_rel_pe_q_grad(Rng& r) {
+    // Use 8-aligned dimensions for AMX compatibility
+    const uint B=2, NH=4, T=8, HD=8, D_POS=16, BNH=B*NH;
+    std::vector<float> Q_mh(BNH*T*HD), d_qrel_mh(BNH*T*D_POS), W_r(NH*HD*D_POS);
+    fill_random(Q_mh, r); fill_random(d_qrel_mh, r); fill_random(W_r, r);
+
+    // CPU reference
+    std::vector<float> ref_dQ(BNH*T*HD), ref_dWr(NH*HD*D_POS);
+    cpu_rel_pe_q_grad(Q_mh.data(), d_qrel_mh.data(), W_r.data(),
+                      ref_dQ.data(), ref_dWr.data(), B, NH, T, HD, D_POS);
+
+    // GPU
+    auto ps_bw_in  = g_mtl.pso(@"linear_bw_input_amx");
+    auto ps_bw_acc = g_mtl.pso(@"linear_bw_weight_acc_amx");
+    id<MTLBuffer> b_Q   = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dr  = g_mtl.bufFrom(d_qrel_mh);
+    id<MTLBuffer> b_Wr  = g_mtl.bufFrom(W_r);
+    id<MTLBuffer> b_dQ  = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dWr = g_mtl.buf(NH*HD*D_POS);
+    // Zero-init d_W_rel_r
+    memset([b_dWr contents], 0, NH*HD*D_POS*sizeof(float));
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    const uint M = T;
+    const NSUInteger head_dq = T * HD * sizeof(float);
+    const NSUInteger head_dr = T * D_POS * sizeof(float);
+    const NSUInteger head_wr = HD * D_POS * sizeof(float);
+
+    for (uint b = 0; b < B; b++) {
+        for (uint h = 0; h < NH; h++) {
+            NSUInteger bnh = b * NH + h;
+            NSUInteger dr_off = bnh * head_dr;
+            NSUInteger wr_off = h * head_wr;
+            NSUInteger dq_off = bnh * head_dq;
+            NSUInteger q_off  = bnh * head_dq;
+
+            // d_Q_rel = d_q_rel_raw @ W_r^T
+            [enc setComputePipelineState:ps_bw_in];
+            [enc setBuffer:b_dr offset:dr_off atIndex:0];
+            [enc setBuffer:b_Wr offset:wr_off atIndex:1];
+            [enc setBuffer:b_dQ offset:dq_off atIndex:2];
+            uint Mu=M, Nu=D_POS, Ku=HD;
+            [enc setBytes:&Mu length:4 atIndex:3];
+            [enc setBytes:&Nu length:4 atIndex:4];
+            [enc setBytes:&Ku length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+
+            // d_W_r[h] += Q[bnh]^T @ d_q_rel[bnh]
+            [enc setComputePipelineState:ps_bw_acc];
+            [enc setBuffer:b_Q  offset:q_off  atIndex:0];
+            [enc setBuffer:b_dr offset:dr_off atIndex:1];
+            [enc setBuffer:b_dWr offset:wr_off atIndex:2];
+            uint Mu2=M, Ku2=HD, Nu2=D_POS;
+            [enc setBytes:&Mu2 length:4 atIndex:3];
+            [enc setBytes:&Ku2 length:4 atIndex:4];
+            [enc setBytes:&Nu2 length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(D_POS/8, HD/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+    }
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQ(BNH*T*HD), g_dWr(NH*HD*D_POS);
+    g_mtl.readInto(b_dQ, g_dQ);
+    g_mtl.readInto(b_dWr, g_dWr);
+    record("rel_pe_q_grad.dQ",  g_dQ, ref_dQ, 1e-4f);
+    record("rel_pe_q_grad.dWr", g_dWr, ref_dWr, 1e-4f);
+}
+
 static void run_layer_fused(Rng& r) {
     uint M = 32, K = 48, F = 64, N = 32;
     // W1: [K, 2F], W2: [F, N]
@@ -625,7 +1201,15 @@ int main(int argc, char** argv) {
         run_rmsnorm_bw(r);
         run_softmax_bw(r);
         run_geglu_bw(r);
+        run_gelu_bw(r);
+        run_embed_bw(r);
         run_layer_fused(r);
+        run_kv_recompute(r);
+        run_attn_qkt_bw(r);
+        run_attn_val_bw(r);
+        run_reshape_to_multihead(r);
+        run_reshape_roundtrip(r);
+        run_rel_pe_q_grad(r);
 
         int fail = 0;
         for (auto& r : g_results) if (!r.ok) fail++;
