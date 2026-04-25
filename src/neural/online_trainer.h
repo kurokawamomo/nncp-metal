@@ -87,6 +87,16 @@ bool online_trainer_train_segment_batch(OnlineTrainer* trainer,
  */
 void online_trainer_latch_kv_memory(OnlineTrainer* trainer);
 
+/**
+ * Mark trainer as in retrain mode.
+ * When enabled, LR schedule uses an independent counter (retrain_train_step)
+ * instead of the main train_step — matching original nncp.c retrain_block
+ * behavior with has_retrain_lr=TRUE.
+ *
+ * Call with true before entering the retrain loop, and with false after it.
+ */
+void online_trainer_set_retrain(OnlineTrainer* trainer, bool is_retrain);
+
 #ifdef __cplusplus
 }
 #endif

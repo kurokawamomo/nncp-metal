@@ -838,6 +838,8 @@ struct OnlineTrainer {
 
     // LR schedule state
     uint64_t train_step;       // cumulative sample count (not reset per session)
+    uint64_t retrain_train_step; // independent LR counter for retrain phase (original nncp: s->retrain_train_step)
+    bool     is_retrain;       // when true, LR/step use retrain_train_step instead of train_step
     float    lr_init;           // initial LR (passed-in value, e.g. 1e-4)
     float    lr_min;            // floor LR    (= lr_init / 3)
     float    lr_power;          // 0.0=linear only, 0.5=inverse-sqrt decay after lr_decay_steps
@@ -3686,7 +3688,10 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
 // ---------------------------------------------------------------------------
 
 static float compute_lr(OnlineTrainer* tr) {
-    float t      = (float)tr->train_step;
+    // Use independent counter during retrain (mirrors original nncp.c:
+    // has_retrain_lr ? retrain_train_step : train_step).
+    const uint64_t step_count = tr->is_retrain ? tr->retrain_train_step : tr->train_step;
+    float t      = (float)step_count;
     float warmup = (float)tr->lr_warmup_steps;
     float decay  = (float)tr->lr_decay_steps;
 
@@ -4093,7 +4098,8 @@ void online_trainer_flush(OnlineTrainer* tr) {
         if (tr->ps_rmsprop || tr->ps_sgd) {
             // Update LR schedule: count N samples, then compute new LR
             clip_gradients(tr, tr->grad_clip);
-            tr->train_step += (uint64_t)N;
+            if (tr->is_retrain) tr->retrain_train_step += (uint64_t)N;
+            else                tr->train_step         += (uint64_t)N;
             tr->lr = compute_lr(tr);
 
             id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBuffer];
@@ -6292,12 +6298,15 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         }
 
         if (tr->ps_rmsprop || tr->ps_sgd) {
-            tr->train_step += 1ULL;
+            if (tr->is_retrain) tr->retrain_train_step += 1ULL;
+            else                tr->train_step         += 1ULL;
             tr->lr = compute_lr(tr);
 
-            if ((tr->train_step % 160) == 0 && !isatty(STDERR_FILENO)) {
-                fprintf(stderr, "[LR-DEBUG] step=%llu lr=%.2e loss=%.4f\n",
-                        (unsigned long long)tr->train_step, tr->lr, avg_loss);
+            const uint64_t _eff_step = tr->is_retrain ? tr->retrain_train_step : tr->train_step;
+            if ((_eff_step % 160) == 0 && !isatty(STDERR_FILENO)) {
+                fprintf(stderr, "[LR-DEBUG] %sstep=%llu lr=%.2e loss=%.4f\n",
+                        tr->is_retrain ? "retrain " : "",
+                        (unsigned long long)_eff_step, tr->lr, avg_loss);
             }
 
             clip_gradients(tr, tr->grad_clip);
@@ -6555,16 +6564,21 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
-        tr->train_step += 1ULL;  // +1 per segment (= n_streams * seg_len bytes), matching original nncp.c
+        // +1 per segment (= n_streams * seg_len bytes), matching original nncp.c.
+        // Retrain uses its own counter (mirrors s->retrain_train_step in original).
+        if (tr->is_retrain) tr->retrain_train_step += 1ULL;
+        else                tr->train_step         += 1ULL;
         tr->lr = compute_lr(tr);
 
-        if ((tr->train_step % 160) == 0 && !isatty(STDERR_FILENO)) {
+        const uint64_t _eff_step = tr->is_retrain ? tr->retrain_train_step : tr->train_step;
+        if ((_eff_step % 160) == 0 && !isatty(STDERR_FILENO)) {
             MPSGraphTensorData* lossData = results[tr->ts_loss];
             if (lossData) {
                 float loss_val = 0.0f;
                 [lossData.mpsndarray readBytes:&loss_val strideBytes:NULL];
-                fprintf(stderr, "[LR-DEBUG] step=%llu lr=%.2e loss=%.4f\n",
-                        (unsigned long long)tr->train_step, tr->lr, loss_val);
+                fprintf(stderr, "[LR-DEBUG] %sstep=%llu lr=%.2e loss=%.4f\n",
+                        tr->is_retrain ? "retrain " : "",
+                        (unsigned long long)_eff_step, tr->lr, loss_val);
             }
         }
 
@@ -6733,6 +6747,13 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
 
     // Also reset KV cache so the next session starts clean
     mps_transformer_reset_kv_cache(tr->ctx);
+}
+
+void online_trainer_set_retrain(OnlineTrainer* tr, bool is_retrain) {
+    if (!tr) return;
+    tr->is_retrain = is_retrain;
+    // Refresh current LR so first step in the new mode uses the correct schedule.
+    tr->lr = compute_lr(tr);
 }
 
 void online_trainer_destroy(OnlineTrainer* tr) {

@@ -1247,7 +1247,16 @@ static MPSTransformerContext* get_shared_mps_ctx() {
 #define NUM_STREAMS  (g_nncp_profile.num_streams)
 #define SEG_LEN      (g_nncp_profile.seg_len)
 #define MEM_LEN      (g_nncp_profile.mem_len)
-#define BLOCK_LEN    500000  // lookahead block size (original default)
+static size_t g_block_len = 0;
+static inline size_t get_block_len() {
+    if (g_block_len == 0) {
+        const char* e = getenv("NNCP_BLOCK_LEN");
+        g_block_len = (e && atoi(e) > 0) ? (size_t)atoi(e) : 500000;
+        if (g_block_len != 500000) fprintf(stderr, "[CFG] NNCP_BLOCK_LEN=%zu\n", g_block_len);
+    }
+    return g_block_len;
+}
+#define BLOCK_LEN    get_block_len()
 
 static mach_timebase_info_data_t g_tb = {};
 
@@ -1429,8 +1438,9 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
 
         // ---- Retrain: re-train on accumulated past data (enwik8 profile) ----
         // Original nncp: retrain_period=1 (every block), retrain_len=15M
+        // Ours: 7.5M (A2 optimization — halves retrain cost; effect measurement).
         if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
-            static const size_t RETRAIN_BUF_SIZE = 15000000; // 15M bytes
+            static const size_t RETRAIN_BUF_SIZE = 7500000; // 7.5M bytes (was 15M)
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;
@@ -1459,6 +1469,9 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                 // Reset KV cache for retrain (fresh context)
                 mps_transformer_reset_kv_cache(mps_ctx);
 
+                // Switch LR counter to retrain_train_step (C1: original nncp alignment).
+                online_trainer_set_retrain(g_online_trainer, true);
+
                 int32_t* rt_inputs  = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
                 int32_t* rt_targets = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
 
@@ -1468,10 +1481,19 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                     return retrain_buf[pos];
                 };
 
+                uint64_t rt_t0 = mach_absolute_time();
+                size_t rt_seg_count = 0;
                 size_t rt_pos = 0;
+                static int rt_step = -1;
+                if (rt_step < 0) {
+                    const char* e = getenv("NNCP_RETRAIN_STEP");
+                    // Default 1 = original nncp parity. Set 2 for -60% retrain time
+                    // with +0.0014% bpc (verified in a1-multiblock-verify.md).
+                    rt_step = (e && atoi(e) > 0) ? atoi(e) : 1;
+                    if (rt_step != 1) fprintf(stderr, "[RETRAIN] NNCP_RETRAIN_STEP=%d\n", rt_step);
+                }
+                const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step;
                 while (rt_pos + rt_seg_len <= rt_stride) {
-                    // Build segment: input[s,t] = byte at position rt_stride*s + rt_pos + t - 1
-                    //                 target[s,t] = byte at position rt_stride*s + rt_pos + t
                     for (int s = 0; s < rt_n_streams; s++) {
                         for (int t = 0; t < rt_seg_len; t++) {
                             size_t abs = (size_t)s * rt_stride + rt_pos + (size_t)t;
@@ -1483,13 +1505,14 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                     if (g_online_trainer)
                         online_trainer_latch_kv_memory(g_online_trainer);
 
-                    // Forward pass (fills KV cache) — we don't need logits, but segment training
-                    // does forward+backward+update in one call
                     online_trainer_train_segment_batch(g_online_trainer,
                         rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
 
-                    rt_pos += rt_seg_len;
+                    rt_pos += rt_pos_inc;
+                    rt_seg_count++;
                 }
+                uint64_t rt_t1 = mach_absolute_time();
+                double rt_ms = (double)(rt_t1 - rt_t0) * g_tb.numer / g_tb.denom * 1e-6;
 
                 free(rt_inputs);
                 free(rt_targets);
@@ -1497,8 +1520,12 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                 // Reset KV cache after retrain (next block starts fresh)
                 mps_transformer_reset_kv_cache(mps_ctx);
 
-                fprintf(stderr, "[RETRAIN] block=%zu buf_len=%zu segs=%zu\n",
-                        block_num, retrain_buf_len, rt_pos / rt_seg_len);
+                // Restore main LR counter (C1).
+                online_trainer_set_retrain(g_online_trainer, false);
+
+                fprintf(stderr, "[RETRAIN] block=%zu buf_len=%zu segs=%zu total=%.1fms avg=%.1fms/seg\n",
+                        block_num, retrain_buf_len, rt_seg_count,
+                        rt_ms, rt_seg_count > 0 ? rt_ms / (double)rt_seg_count : 0.0);
             }
         }
 
@@ -1797,7 +1824,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
 
         // ---- Retrain (decompress side, must mirror compress) ----
         if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
-            static const size_t RETRAIN_BUF_SIZE = 15000000;
+            static const size_t RETRAIN_BUF_SIZE = 7500000; // must match compress side (A2)
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;
@@ -1821,6 +1848,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
             const size_t rt_stride = retrain_buf_len / (size_t)rt_n_streams;
             if (rt_stride >= (size_t)rt_seg_len) {
                 mps_transformer_reset_kv_cache(mps_ctx);
+                online_trainer_set_retrain(g_online_trainer, true);
 
                 int32_t* rt_inputs  = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
                 int32_t* rt_targets = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
@@ -1831,6 +1859,12 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                 };
 
                 size_t rt_pos = 0;
+                static int rt_step2 = -1;
+                if (rt_step2 < 0) {
+                    const char* e = getenv("NNCP_RETRAIN_STEP");
+                    rt_step2 = (e && atoi(e) > 0) ? atoi(e) : 1;
+                }
+                const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step2;
                 while (rt_pos + rt_seg_len <= rt_stride) {
                     for (int s = 0; s < rt_n_streams; s++) {
                         for (int t = 0; t < rt_seg_len; t++) {
@@ -1843,12 +1877,13 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                         online_trainer_latch_kv_memory(g_online_trainer);
                     online_trainer_train_segment_batch(g_online_trainer,
                         rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
-                    rt_pos += rt_seg_len;
+                    rt_pos += rt_pos_inc;
                 }
 
                 free(rt_inputs);
                 free(rt_targets);
                 mps_transformer_reset_kv_cache(mps_ctx);
+                online_trainer_set_retrain(g_online_trainer, false);
             }
         }
 
