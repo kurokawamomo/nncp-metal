@@ -5693,9 +5693,20 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 if (tr->pl_fwd.t_x_mid)     [fwd_targets addObject:tr->pl_fwd.t_x_mid];
             }
 #endif
+#if NNCP_METAL_BW
+            // NNCP_METAL_BW: synchronous — dump_inter reads res dict below
             NSDictionary* res = [tr->pl_fwd.graph runWithFeeds:feeds
                 targetTensors:fwd_targets targetOperations:nil];
             copyToBuffer(tr->pl_h[i + 1], res[tr->pl_fwd.x_out]);
+#else
+            // Phase A: bind pl_h[i+1] directly; runWithMTLCommandQueue submits async
+            NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
+            fwd_out[tr->pl_fwd.x_out] = floatTD(tr->pl_h[i + 1], shape_h);
+            [tr->pl_fwd.graph runWithMTLCommandQueue:tr->cmdQueue
+                                               feeds:feeds
+                                    targetOperations:nil
+                                   resultsDictionary:fwd_out];
+#endif
 
 #if NNCP_METAL_BW
             if (dump_inter && i < SEG_MAX_LAYERS) {
@@ -5742,6 +5753,13 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
 #endif
         }
     }
+#if !NNCP_METAL_BW
+    {   // Phase A: drain cmdQueue before loss backward reads pl_h[L]
+        id<MTLCommandBuffer> fence_fwd = [tr->cmdQueue commandBuffer];
+        [fence_fwd commit];
+        [fence_fwd waitUntilCompleted];
+    }
+#endif
 
     // ---- Loss backward: LN_FINAL + CE ----
     float loss_val = 0.0f;
@@ -5787,7 +5805,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     }
     if (!metal_bw_ok)
 #endif
-    // Phase M-Readback: GPU-resident backward result accumulation.
+    { // Phase M-Readback: GPU-resident backward result accumulation.
     // Bind scratch MTLBuffers as result destinations via resultsDictionary so MPSGraph
     // writes results directly into them (no CPU readBytes). Then dispatch element_add
     // or memcpy on cmdQueue to fold scratch into tr->grad_* at layer offset.
@@ -5869,7 +5887,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 // overwrites; all subsequent layers accumulate. This preserves shared-grad
                 // summation across the 20 layers.
                 const bool is_copy_shared = (copy_grads && i == (int)L - 1);
-                id<MTLCommandBuffer> cb = [tr->cmdQueue commandBufferWithUnretainedReferences];
+                id<MTLCommandBuffer> cb = [tr->cmdQueue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 id<MTLBlitCommandEncoder> blit = nil;
                 auto get_blit = [&]() -> id<MTLBlitCommandEncoder> {
@@ -5930,7 +5948,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                                       (size_t)tr->NH * tr->ext_len, 0, is_copy_shared);
                 if (blit) [blit endEncoding]; else [enc endEncoding];
                 [cb commit];
-                [cb waitUntilCompleted];
             } else {
                 // CPU fallback (original path).
                 copyToBuffer(tr->pl_dh, res[bg.grad_in]);
@@ -5967,6 +5984,13 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             }
         }
     }
+    if (use_gpu_readback) {
+        // Phase D: drain cmdQueue after all backward blits commit
+        id<MTLCommandBuffer> fence_bwd = [tr->cmdQueue commandBuffer];
+        [fence_bwd commit];
+        [fence_bwd waitUntilCompleted];
+    }
+    } // end Metal BW fallback block
 
     // ---- Embed gradient (CPU) ----
     // d(embed)/d(w_embed) = one_hot^T × dh × embed_scale
@@ -6418,6 +6442,12 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                 fprintf(stderr, "[LR-DEBUG] %sstep=%llu lr=%.2e loss=%.4f\n",
                         tr->is_retrain ? "retrain " : "",
                         (unsigned long long)_eff_step, tr->lr, avg_loss);
+            }
+            {
+                static int s_loss_step = -1;
+                if (s_loss_step < 0) s_loss_step = !!getenv("NNCP_LOSS_STEP");
+                if (s_loss_step) fprintf(stderr, "[LOSS] step=%llu loss=%.8f\n",
+                        (unsigned long long)_eff_step, avg_loss);
             }
 
             clip_gradients(tr, tr->grad_clip);
