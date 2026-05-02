@@ -85,9 +85,9 @@ The Transformer uses Transformer-XL style KV-cache memory (mem\_len=32 + seg\_le
 
 | File | Role |
 |------|------|
-| `src/neural/integration/neural_bridge_lossless_cuda.mm` | Compress / decompress main loop |
-| `src/neural/mps_optimized/mps_transformer_graph.mm` | MPSGraph inference + KV-cache decode |
-| `src/neural/training/online_trainer.mm` | Causal segment training graph (B=1, T=32→64) |
+| `src/neural/neural_bridge_lossless_cuda.mm` | Compress / decompress main loop |
+| `src/neural/mps_transformer_graph.mm` | MPSGraph inference + KV-cache decode |
+| `src/neural/online_trainer.mm` | Causal segment training graph (B=1, T=32→64) |
 | `src/metal/compute/neural_net.metal` | Metal kernels (KV-cache attention, RMSProp, relative PE) |
 
 ## Original NNCP

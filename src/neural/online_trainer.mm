@@ -2689,12 +2689,13 @@ static MPSGraphTensor* matmul_fp16(MPSGraph* g,
 // BT=1024 GEMM. Gradient flow: cast(FP32→BF16) → matmul → cast(BF16→FP32).
 // MPSGraph autodiff propagates FP32 grads through cast backward nodes.
 // Bit-exact: compress/decompress both drive the same path → same rounding.
-// Default ON for enwik8 (H=1024); disable via NNCP_BF16_TRAIN=0.
+// Default OFF: A+D measurement (e40e683) shows BF16=1 → train +30%, decode +73% regression.
+// Enable via NNCP_BF16_TRAIN=1 for benchmarking only.
 static bool nncp_bf16_train_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
         const char* e = getenv("NNCP_BF16_TRAIN");
-        cached = (e && e[0] == '0') ? 0 : 1;  // default ON
+        cached = (e && e[0] == '1') ? 1 : 0;  // default OFF
     }
     return cached != 0;
 }
