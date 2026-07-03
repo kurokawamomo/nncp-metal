@@ -773,7 +773,7 @@ kernel void linear_bw_weight_amx(
     simdgroup_store(c, dW + k_start * N + n_start, N);
 }
 
-// B3. linear_bw_bias: db[n] = sum_m dY[m, n]
+// B3. linear_bw_bias: db[n] = sum_m dY[m, n]  (overwrite)
 // Dispatch: [N*32, 1, 1]  — 32 lanes per output element
 kernel void linear_bw_bias(
     device const float* dY [[buffer(0)]],  // [M, N]
@@ -790,6 +790,27 @@ kernel void linear_bw_bias(
         partial += dY[m * N + n];
     float sum = simd_sum(partial);
     if (lane == 0) db[n] = sum;
+}
+
+// B3b. linear_bw_bias_acc: db[n] += sum_m dY[m, n]  (accumulate — same contract
+// as linear_bw_weight_acc_amx: caller zeroes the destination on the first BPTT
+// chunk, this kernel adds every chunk's own contribution on top).
+// Dispatch: [N*32, 1, 1]  — 32 lanes per output element
+kernel void linear_bw_bias_acc(
+    device const float* dY [[buffer(0)]],  // [M, N]
+    device float*       db [[buffer(1)]],  // [N]
+    constant uint& M [[buffer(2)]],
+    constant uint& N [[buffer(3)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint n = gid / 32;
+    if (n >= N) return;
+    float partial = 0.0f;
+    for (uint m = lane; m < M; m += 32)
+        partial += dY[m * N + n];
+    float sum = simd_sum(partial);
+    if (lane == 0) db[n] += sum;
 }
 
 // B4. rmsnorm_bw: RMSNorm(x) = x * inv_rms * gamma   (no mean subtraction, no beta)
@@ -1186,6 +1207,281 @@ kernel void rel_pe_br_scatter_bw_v2(
     // Accumulate (b_rel_r is tied across all layers → each layer adds its contribution).
     // Caller must zero-init d_b_rel_r once per BPTT chunk before the first layer's bw.
     d_b_rel_r[h * TL + d] += sum * b_scale;
+}
+
+/* ========================================================================
+ * B8b/B9b: Batched variants of rel_pe_q_scatter_bw / rel_pe_br_scatter_bw_v2.
+ *
+ * The non-batched kernels above are correct but were driven by a
+ * B_NH*T-times (resp. B*NH*T-times) CPU-side Objective-C `for` loop, one
+ * dispatch per (bnh, ti) [resp. (b, h, ti)] row — see
+ * metal-bw-speed-static-analysis.md §3/§8 for the dispatch-count analysis.
+ * These batched kernels fold the (ti, bnh) [resp. ti/t/b reduction] into the
+ * GPU grid / an in-kernel loop, so the whole layer's contribution is one
+ * dispatch instead of thousands. Existing (non-batched) kernels are kept
+ * unmodified for bw_verify regression coverage and rollback.
+ * ======================================================================== */
+
+// rel_pe_q_scatter_bw_batched: same math as rel_pe_q_scatter_bw, batched over
+// (d_pos, ti, bnh) via a 3D grid — output d_raw_all is a plain overwrite (no
+// cross-thread accumulation), so this follows the same "one thread per output
+// element" pattern as kv_assemble_per_head.
+// Dispatch: threads [D_POS, T, B_NH], threadgroup [min(D_POS,32), 1, 1].
+kernel void rel_pe_q_scatter_bw_batched(
+    device const float*   d_shifted_all [[buffer(0)]], // [B_NH, T, TL]
+    device float*         d_raw_all     [[buffer(1)]], // [B_NH, T, D_POS] (output, overwrite)
+    device const int32_t* qdist         [[buffer(2)]], // [T, TL]
+    constant uint&         TL           [[buffer(3)]],
+    constant uint&         D_POS        [[buffer(4)]],
+    constant uint&         T            [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint d   = gid.x;
+    uint ti  = gid.y;
+    uint bnh = gid.z;
+    if (d >= D_POS || ti >= T) return;   // bnh bound enforced by dispatch grid width
+
+    device const int32_t* qd = qdist + (size_t)ti * TL;
+    device const float*   ds = d_shifted_all + ((size_t)bnh * T + ti) * TL;
+    float sum = 0.0f;
+    for (uint t = 0; t < TL; t++) {
+        if ((uint)qd[t] == d) sum += ds[t];
+    }
+    d_raw_all[((size_t)bnh * T + ti) * D_POS + d] = sum;
+}
+
+// rel_pe_br_scatter_bw_batched: same math as rel_pe_br_scatter_bw_v2, batched
+// over (d, h) via a 2D grid; the (ti, t, b) reduction stays a serial in-kernel
+// loop because the output d_b_rel_r[h,d] is accumulated across all of them —
+// parallelizing that reduction across threads would need atomics, which this
+// project avoids in favor of deterministic (scatter-free) reductions (see
+// embed_bw / w_rel_r backward using the same oneHot-style deterministic
+// pattern). GPU-side total work is unchanged from the non-batched version;
+// only the CPU-side dispatch count drops (B*NH*T dispatches → 1).
+// Dispatch: threads [TL, NH, 1], threadgroup [min(TL,32), 1, 1].
+kernel void rel_pe_br_scatter_bw_batched(
+    device const float*   d_scores  [[buffer(0)]], // [B, NH, T, TL]
+    device float*         d_b_rel_r [[buffer(1)]], // [NH, TL] accumulate (+=)
+    device const int32_t* bdist     [[buffer(2)]], // [T, TL]
+    constant uint&         TL       [[buffer(3)]],
+    constant uint&         NH       [[buffer(4)]],
+    constant uint&         B        [[buffer(5)]],
+    constant uint&         T        [[buffer(6)]],
+    constant float&        b_scale  [[buffer(7)]],  // sqrt(H)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;  // target d_pos index in b_rel_r
+    uint h = gid.y;  // head index
+    if (d >= TL || h >= NH) return;
+
+    float sum = 0.0f;
+    for (uint ti = 0; ti < T; ti++) {
+        device const int32_t* bd_row = bdist + (size_t)ti * TL;
+        for (uint t = 0; t < TL; t++) {
+            if ((uint)bd_row[t] == d) {
+                for (uint b = 0; b < B; b++) {
+                    sum += d_scores[(((size_t)b * NH + h) * T + ti) * TL + t];
+                }
+            }
+        }
+    }
+    d_b_rel_r[h * TL + d] += sum * b_scale;
+}
+
+/* ========================================================================
+ * B9c: Batched (3D-grid) attention-backward kernels.
+ *
+ * online_trainer.mm previously drove these ops via CPU-side Objective-C
+ * `for (h = 0; h < B_NH; h++)` loops that called the generic
+ * transformer_linear_amx / linear_bw_input_amx / linear_bw_weight_amx
+ * kernels once per head — see metal-bw-speed-static-analysis.md §3/§8 for
+ * the dispatch-count analysis (attn_qkt_bw and attn_val_bw: 2*B_NH
+ * dispatches each; rel_pe_q_grad: 2*B_NH dispatches + a per-iteration
+ * memoryBarrierWithScope; the pre-O-proj attn_out recompute inlined in
+ * metal_bw_layer: B_NH dispatches).
+ *
+ * All buffers below use the project's existing per-head-contiguous layout:
+ * [B_NH, T, HD] / [B_NH, TL, HD] / [B_NH, T, TL] (B_NH = B*NH), matching
+ * k_full/v_full/q_mh/d_scores/attn_prob as already allocated in
+ * M2BwContext. Every kernel here writes each output element from exactly
+ * one thread (no cross-thread accumulation) EXCEPT
+ * rel_pe_q_grad_dWrel_batched, whose output (d_W_rel_r) is shared across
+ * (b, t) for a fixed head — that one keeps the (b, t) reduction serial
+ * inside the thread body, the same no-atomics discipline as
+ * rel_pe_br_scatter_bw_batched above.
+ * ======================================================================== */
+
+// d_Q[bnh,t,hd] = sum_tl d_scores[bnh,t,tl] * K_full[bnh,tl,hd]
+// Dispatch: threads [HD, T, B_NH], threadgroup [min(HD,32), 1, 1]
+kernel void attn_qkt_bw_dQ_batched(
+    device const float* d_scores [[buffer(0)]], // [B_NH, T, TL]
+    device const float* K_full   [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       d_Q      [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint t   = gid.y;
+    uint bnh = gid.z;
+    if (hd >= HD || t >= T) return;
+
+    device const float* ds = d_scores + ((size_t)bnh * T + t) * TL;
+    device const float* kf = K_full + (size_t)bnh * TL * HD;
+    float sum = 0.0f;
+    for (uint tl = 0; tl < TL; tl++) sum += ds[tl] * kf[tl * HD + hd];
+    d_Q[((size_t)bnh * T + t) * HD + hd] = sum;
+}
+
+// d_K[bnh,tl,hd] = sum_t d_scores[bnh,t,tl] * Q_mh[bnh,t,hd]
+// Dispatch: threads [HD, TL, B_NH], threadgroup [min(HD,32), 1, 1]
+kernel void attn_qkt_bw_dK_batched(
+    device const float* d_scores [[buffer(0)]], // [B_NH, T, TL]
+    device const float* Q_mh     [[buffer(1)]], // [B_NH, T, HD]
+    device float*       d_K      [[buffer(2)]], // [B_NH, TL, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint tl  = gid.y;
+    uint bnh = gid.z;
+    if (hd >= HD || tl >= TL) return;
+
+    device const float* dsb = d_scores + (size_t)bnh * T * TL;
+    device const float* qb  = Q_mh + (size_t)bnh * T * HD;
+    float sum = 0.0f;
+    for (uint t = 0; t < T; t++) sum += dsb[t * TL + tl] * qb[t * HD + hd];
+    d_K[((size_t)bnh * TL + tl) * HD + hd] = sum;
+}
+
+// d_V[bnh,tl,hd] = sum_t attn_prob[bnh,t,tl] * d_attn_out[bnh,t,hd]
+// Dispatch: threads [HD, TL, B_NH], threadgroup [min(HD,32), 1, 1]
+kernel void attn_val_bw_dV_batched(
+    device const float* attn_prob  [[buffer(0)]], // [B_NH, T, TL]
+    device const float* d_attn_out [[buffer(1)]], // [B_NH, T, HD]
+    device float*       d_V        [[buffer(2)]], // [B_NH, TL, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint tl  = gid.y;
+    uint bnh = gid.z;
+    if (hd >= HD || tl >= TL) return;
+
+    device const float* pb = attn_prob + (size_t)bnh * T * TL;
+    device const float* db = d_attn_out + (size_t)bnh * T * HD;
+    float sum = 0.0f;
+    for (uint t = 0; t < T; t++) sum += pb[t * TL + tl] * db[t * HD + hd];
+    d_V[((size_t)bnh * TL + tl) * HD + hd] = sum;
+}
+
+// d_scores[bnh,t,tl] = sum_hd d_attn_out[bnh,t,hd] * V_full[bnh,tl,hd]
+// Dispatch: threads [TL, T, B_NH], threadgroup [min(TL,32), 1, 1]
+kernel void attn_val_bw_dScores_batched(
+    device const float* d_attn_out [[buffer(0)]], // [B_NH, T, HD]
+    device const float* V_full     [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       d_scores   [[buffer(2)]], // [B_NH, T, TL] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& TL [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint tl  = gid.x;
+    uint t   = gid.y;
+    uint bnh = gid.z;
+    if (tl >= TL || t >= T) return;
+
+    device const float* db = d_attn_out + ((size_t)bnh * T + t) * HD;
+    device const float* vf = V_full + (size_t)bnh * TL * HD + (size_t)tl * HD;
+    float sum = 0.0f;
+    for (uint hd = 0; hd < HD; hd++) sum += db[hd] * vf[hd];
+    d_scores[((size_t)bnh * T + t) * TL + tl] = sum;
+}
+
+// d_Q_rel[bnh,t,hd] = sum_dp d_q_rel_raw[bnh,t,dp] * W_rel_r[h,hd,dp]   (h = bnh % NH)
+// Dispatch: threads [HD, T, B_NH], threadgroup [min(HD,32), 1, 1]
+kernel void rel_pe_q_grad_dQrel_batched(
+    device const float* d_q_rel_raw [[buffer(0)]], // [B_NH, T, D_POS]
+    device const float* W_rel_r     [[buffer(1)]], // [NH, HD, D_POS]
+    device float*       d_Q_rel     [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T     [[buffer(3)]],
+    constant uint& HD    [[buffer(4)]],
+    constant uint& D_POS [[buffer(5)]],
+    constant uint& NH    [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint t   = gid.y;
+    uint bnh = gid.z;
+    if (hd >= HD || t >= T) return;
+    uint h = bnh % NH;
+
+    device const float* dr = d_q_rel_raw + ((size_t)bnh * T + t) * D_POS;
+    device const float* wr = W_rel_r + ((size_t)h * HD + hd) * D_POS;
+    float sum = 0.0f;
+    for (uint dp = 0; dp < D_POS; dp++) sum += dr[dp] * wr[dp];
+    d_Q_rel[((size_t)bnh * T + t) * HD + hd] = sum;
+}
+
+// d_W_rel_r[h,hd,dp] += sum_{b,t} Q_mh[b*NH+h,t,hd] * d_q_rel_raw[b*NH+h,t,dp]
+// Dispatch: threads [D_POS, HD, NH], threadgroup [min(D_POS,32), 1, 1]
+// Accumulate output (shared across b,t for fixed head) → serial in-kernel
+// reduction, no atomics (see file-header note above).
+kernel void rel_pe_q_grad_dWrel_batched(
+    device const float* Q_mh        [[buffer(0)]], // [B_NH, T, HD]
+    device const float* d_q_rel_raw [[buffer(1)]], // [B_NH, T, D_POS]
+    device float*       d_W_rel_r   [[buffer(2)]], // [NH, HD, D_POS] accumulate (+=)
+    constant uint& T     [[buffer(3)]],
+    constant uint& HD    [[buffer(4)]],
+    constant uint& D_POS [[buffer(5)]],
+    constant uint& NH    [[buffer(6)]],
+    constant uint& B     [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint dp = gid.x;
+    uint hd = gid.y;
+    uint h  = gid.z;
+    if (dp >= D_POS || hd >= HD || h >= NH) return;
+
+    float sum = 0.0f;
+    for (uint b = 0; b < B; b++) {
+        uint bnh = b * NH + h;
+        device const float* qb = Q_mh + (size_t)bnh * T * HD;
+        device const float* dr = d_q_rel_raw + (size_t)bnh * T * D_POS;
+        for (uint t = 0; t < T; t++) sum += qb[t * HD + hd] * dr[t * D_POS + dp];
+    }
+    d_W_rel_r[((size_t)h * HD + hd) * D_POS + dp] += sum;
+}
+
+// attn_pre_Wo[bnh,t,hd] = sum_tl attn_prob[bnh,t,tl] * V_full[bnh,tl,hd]
+// Pre-O-proj attention output recompute (forward math: attn_prob @ V), used
+// by metal_bw_layer to obtain grad_o's input since the saved forward
+// intermediate is POST-O-proj.
+// Dispatch: threads [HD, T, B_NH], threadgroup [min(HD,32), 1, 1]
+kernel void attn_out_preO_recompute_batched(
+    device const float* attn_prob [[buffer(0)]], // [B_NH, T, TL]
+    device const float* V_full    [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       attn_pre  [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint hd  = gid.x;
+    uint t   = gid.y;
+    uint bnh = gid.z;
+    if (hd >= HD || t >= T) return;
+
+    device const float* pb = attn_prob + ((size_t)bnh * T + t) * TL;
+    device const float* vf = V_full + (size_t)bnh * TL * HD;
+    float sum = 0.0f;
+    for (uint tl = 0; tl < TL; tl++) sum += pb[tl] * vf[tl * HD + hd];
+    attn_pre[((size_t)bnh * T + t) * HD + hd] = sum;
 }
 
 /* ========================================================================

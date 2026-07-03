@@ -265,7 +265,8 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_ce_softmax_fused_bw;
     id<MTLComputePipelineState> ps_linear_bw_input;     // linear_bw_input_amx
     id<MTLComputePipelineState> ps_linear_bw_weight;    // linear_bw_weight_amx
-    id<MTLComputePipelineState> ps_linear_bw_bias;      // linear_bw_bias
+    id<MTLComputePipelineState> ps_linear_bw_bias;      // linear_bw_bias (overwrite)
+    id<MTLComputePipelineState> ps_linear_bw_bias_acc;  // linear_bw_bias_acc (+=)
     id<MTLComputePipelineState> ps_rmsnorm_bw_x;
     id<MTLComputePipelineState> ps_rmsnorm_bw_gamma;
     id<MTLComputePipelineState> ps_softmax_bw;
@@ -278,6 +279,15 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_embed_bw;
     id<MTLComputePipelineState> ps_rel_pe_q_bw;
     id<MTLComputePipelineState> ps_rel_pe_br_bw;
+    id<MTLComputePipelineState> ps_rel_pe_q_bw_batched;   // rel_pe_q_scatter_bw_batched (3D grid)
+    id<MTLComputePipelineState> ps_rel_pe_br_bw_batched;  // rel_pe_br_scatter_bw_batched (2D grid)
+    id<MTLComputePipelineState> ps_attn_qkt_bw_dQ_batched;      // attn_qkt_bw_dQ_batched
+    id<MTLComputePipelineState> ps_attn_qkt_bw_dK_batched;      // attn_qkt_bw_dK_batched
+    id<MTLComputePipelineState> ps_attn_val_bw_dV_batched;      // attn_val_bw_dV_batched
+    id<MTLComputePipelineState> ps_attn_val_bw_dScores_batched; // attn_val_bw_dScores_batched
+    id<MTLComputePipelineState> ps_rel_pe_q_grad_dQrel_batched; // rel_pe_q_grad_dQrel_batched
+    id<MTLComputePipelineState> ps_rel_pe_q_grad_dWrel_batched; // rel_pe_q_grad_dWrel_batched
+    id<MTLComputePipelineState> ps_attn_out_preO_recompute_batched; // attn_out_preO_recompute_batched
     id<MTLComputePipelineState> ps_linear_bw_weight_acc;   // linear_bw_weight_acc_amx
     id<MTLComputePipelineState> ps_reshape_to_mh;          // reshape_to_multihead
     id<MTLComputePipelineState> ps_reshape_from_mh;        // reshape_from_multihead
@@ -404,6 +414,7 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_linear_bw_input    = load(@"linear_bw_input_amx");
     m2->ps_linear_bw_weight   = load(@"linear_bw_weight_amx");
     m2->ps_linear_bw_bias     = load(@"linear_bw_bias");
+    m2->ps_linear_bw_bias_acc = load(@"linear_bw_bias_acc");
     m2->ps_rmsnorm_bw_x       = load(@"rmsnorm_bw_x");
     m2->ps_rmsnorm_bw_gamma   = load(@"rmsnorm_bw_gamma");
     m2->ps_softmax_bw         = load(@"softmax_bw");
@@ -416,6 +427,15 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_embed_bw           = load(@"embed_bw");
     m2->ps_rel_pe_q_bw        = load(@"rel_pe_q_scatter_bw");
     m2->ps_rel_pe_br_bw       = load(@"rel_pe_br_scatter_bw_v2");
+    m2->ps_rel_pe_q_bw_batched  = load(@"rel_pe_q_scatter_bw_batched");
+    m2->ps_rel_pe_br_bw_batched = load(@"rel_pe_br_scatter_bw_batched");
+    m2->ps_attn_qkt_bw_dQ_batched          = load(@"attn_qkt_bw_dQ_batched");
+    m2->ps_attn_qkt_bw_dK_batched          = load(@"attn_qkt_bw_dK_batched");
+    m2->ps_attn_val_bw_dV_batched          = load(@"attn_val_bw_dV_batched");
+    m2->ps_attn_val_bw_dScores_batched     = load(@"attn_val_bw_dScores_batched");
+    m2->ps_rel_pe_q_grad_dQrel_batched     = load(@"rel_pe_q_grad_dQrel_batched");
+    m2->ps_rel_pe_q_grad_dWrel_batched     = load(@"rel_pe_q_grad_dWrel_batched");
+    m2->ps_attn_out_preO_recompute_batched = load(@"attn_out_preO_recompute_batched");
     m2->ps_linear_bw_weight_acc = load(@"linear_bw_weight_acc_amx");
     m2->ps_reshape_to_mh      = load(@"reshape_to_multihead");
     m2->ps_reshape_from_mh    = load(@"reshape_from_multihead");
@@ -2948,7 +2968,6 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_q name:nil];
     MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_k name:nil];
     MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_v name:nil];
-    if (out_intermediates) { out_intermediates->t_Q_saved = q; }
 
     // Multi-head reshape: [BT, H] → [B, NH, T, HD]
     auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
@@ -2958,6 +2977,35 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* q_mh = toMH(q);
     MPSGraphTensor* k_mh = toMH(k);
     MPSGraphTensor* v_mh = toMH(v);
+    if (out_intermediates) {
+        // Bug fix (2026-07-03): dump q un-permuted FROM q_mh, not the raw `q` node.
+        // FWD_DUMP v1/v2 both showed t_Q_saved diverging from the CPU reference by
+        // ~1.5e-2 at layer0 (exploding at layer1+) while t_attn_prob — built from
+        // this SAME q via q_mh, to a nontrivial nonlinear (QK^T + rel-PE + softmax)
+        // formula — matched the CPU reference to ~9e-7. Switching the dump fetch
+        // mechanism (targetTensors: → resultsDictionary:, v1→v2) did not change the
+        // observed values at all, which rules out a readback/scratch-reuse bug and
+        // means the mismatch is intrinsic to how MPSGraph materializes the raw `q`
+        // node when it is ALSO requested as a bare output on this reused,
+        // repeatedly-invoked (20x per BPTT chunk) graph — i.e. `q` as a standalone
+        // output and `q` as consumed internally by q_mh's reshape are apparently not
+        // guaranteed to be numerically identical here. Dumping q_mh reshaped back to
+        // [BT,H] instead guarantees the saved buffer is the exact value chain that
+        // feeds the verified-correct attention computation — this is not just a
+        // diagnostic fix: `Q_saved[i]` also feeds metal_bw_layer's backward (via
+        // reshape_to_mh(Q_saved[i]) → q_mh scratch), so if raw `q` really was
+        // diverging from the true forward Q, backward gradients would have been
+        // computed from the wrong Q too.
+        MPSGraphTensor* q_from_mh = [g transposeTensor:q_mh dimension:1 withDimension:2 name:nil]; // [B,T,NH,HD]
+        q_from_mh = [g reshapeTensor:q_from_mh withShape:@[@(B * T), @(NH * HD)] name:nil]; // [BT, H]
+        // Defense-in-depth: force a distinct materialization for this dump-only
+        // output so MPSGraph's memory planner cannot alias its storage with a
+        // same-shape ([BT,H]) sibling tensor elsewhere in this repeatedly-invoked
+        // graph (x_mid/attn/res1/... are all [BT,H] too). identityWithTensor: is
+        // computationally a no-op but is its own graph node with its own output
+        // allocation, unlike a bare re-request of an existing tensor as a target.
+        out_intermediates->t_Q_saved = [g identityWithTensor:q_from_mh name:nil];
+    }
 
     // KV memory: [B*MEM, H] → [B, NH, MEM, HD]
     auto memToMH = [&](MPSGraphTensor* m) -> MPSGraphTensor* {
@@ -3003,7 +3051,11 @@ static MPSGraphTensor* build_single_layer(
     attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil];
     attn = [g reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];
     attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o name:nil];
-    if (out_intermediates) { out_intermediates->t_attn_out = attn; }
+    // Defense-in-depth: same rationale as t_Q_saved above — `attn` is [BT,H],
+    // the same shape as x_mid/res1/x_ln1/... in this graph, and is also fed
+    // forward into the residual add below, so it is a live, non-terminal
+    // tensor at the point we also request it as a dump output.
+    if (out_intermediates) { out_intermediates->t_attn_out = [g identityWithTensor:attn name:nil]; }
 
     // Residual #1
     MPSGraphTensor* res1 = [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil];
@@ -3022,8 +3074,13 @@ static MPSGraphTensor* build_single_layer(
         MPSGraphTensor* fv = [g sliceTensor:fp dimension:1 start:0 length:(NSInteger)F name:nil];
         MPSGraphTensor* fg = [g sliceTensor:fp dimension:1 start:(NSInteger)F length:(NSInteger)F name:nil];
         if (out_intermediates) {
-            out_intermediates->t_geglu_val  = fv;
-            out_intermediates->t_geglu_gate = fg;
+            // Defense-in-depth: same rationale as t_Q_saved/t_attn_out above —
+            // fv/fg are [BT,F] slices of fp, each also fed forward (fv into
+            // tr_gelu(), fg into the final multiply below), so both are live,
+            // non-terminal, same-shape-as-each-other tensors at the point we
+            // also request them as dump outputs.
+            out_intermediates->t_geglu_val  = [g identityWithTensor:fv name:nil];
+            out_intermediates->t_geglu_gate = [g identityWithTensor:fg name:nil];
         }
         ff = [g multiplicationWithPrimaryTensor:tr_gelu(g, fv) secondaryTensor:fg name:nil];
     } else {
@@ -4576,6 +4633,171 @@ static void dispatch_rel_pe_br_bw_all_rows(id<MTLComputeCommandEncoder> enc,
     }
 }
 
+// dispatch_rel_pe_q_bw_batched / dispatch_rel_pe_br_bw_batched: single-dispatch
+// replacements for dispatch_rel_pe_q_bw_all_rows / dispatch_rel_pe_br_bw_all_rows
+// (metal-bw-speed-static-analysis.md §8). Wired into metal_bw_layer's
+// production call site (steps (c)/(f) below) after bw_verify confirmed
+// bit-exact parity (max_abs=0, max_rel=0) with the non-batched kernels.
+// The non-batched kernels/helpers are kept for bw_verify regression coverage
+// and rollback.
+static void dispatch_rel_pe_q_bw_batched(id<MTLComputeCommandEncoder> enc,
+                                         id<MTLComputePipelineState> pso,
+                                         id<MTLBuffer> d_shifted_all, // [B_NH, T, TL]
+                                         id<MTLBuffer> d_raw_all,     // [B_NH, T, D_POS]
+                                         id<MTLBuffer> qdist_all,     // [T, TL] int32
+                                         uint32_t TL, uint32_t D_POS,
+                                         uint32_t B_NH, uint32_t T) {
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:d_shifted_all offset:0 atIndex:0];
+    [enc setBuffer:d_raw_all     offset:0 atIndex:1];
+    [enc setBuffer:qdist_all     offset:0 atIndex:2];
+    [enc setBytes:&TL    length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&D_POS length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&T     length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(D_POS, T, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(D_POS, 32u), 1, 1)];
+}
+
+static void dispatch_rel_pe_br_bw_batched(id<MTLComputeCommandEncoder> enc,
+                                          id<MTLComputePipelineState> pso,
+                                          id<MTLBuffer> d_scores_all, // [B, NH, T, TL]
+                                          id<MTLBuffer> d_b_rel_r,    // [NH, TL]
+                                          id<MTLBuffer> bdist_all,    // [T, TL] int32
+                                          uint32_t TL, uint32_t NH, uint32_t B,
+                                          uint32_t T, float b_scale) {
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:d_scores_all offset:0 atIndex:0];
+    [enc setBuffer:d_b_rel_r    offset:0 atIndex:1];
+    [enc setBuffer:bdist_all    offset:0 atIndex:2];
+    [enc setBytes:&TL      length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&NH      length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&B       length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&T       length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&b_scale length:sizeof(float)    atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(TL, NH, 1)
+        threadsPerThreadgroup:MTLSizeMake(MIN(TL, 32u), 1, 1)];
+}
+
+// dispatch_attn_qkt_bw_batched / dispatch_attn_val_bw_batched /
+// dispatch_rel_pe_q_grad_batched / dispatch_attn_out_preO_recompute_batched:
+// single-dispatch-pair (or single-dispatch) replacements for the B_NH-times
+// (or B*NH-times) looped dispatch_attn_qkt_bw / dispatch_attn_val_bw /
+// dispatch_rel_pe_q_grad / metal_bw_layer's inline pre-O-proj recompute loop
+// (metal-bw-speed-static-analysis.md §8). Not yet wired into metal_bw_layer's
+// production call site — kept as opt-in helpers until bw_verify confirms
+// rel_err < 1e-4 parity with the non-batched versions.
+
+static void dispatch_attn_qkt_bw_batched(id<MTLComputeCommandEncoder> enc,
+                                         id<MTLComputePipelineState> pso_dQ,
+                                         id<MTLComputePipelineState> pso_dK,
+                                         id<MTLBuffer> d_scores, // [B_NH, T, TL]
+                                         id<MTLBuffer> K_full,   // [B_NH, TL, HD]
+                                         id<MTLBuffer> Q_mh,     // [B_NH, T, HD]
+                                         id<MTLBuffer> d_Q,      // [B_NH, T, HD] out
+                                         id<MTLBuffer> d_K,      // [B_NH, TL, HD] out
+                                         uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso_dQ];
+    [enc setBuffer:d_scores offset:0 atIndex:0];
+    [enc setBuffer:K_full   offset:0 atIndex:1];
+    [enc setBuffer:d_Q      offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, T, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
+
+    [enc setComputePipelineState:pso_dK];
+    [enc setBuffer:d_scores offset:0 atIndex:0];
+    [enc setBuffer:Q_mh     offset:0 atIndex:1];
+    [enc setBuffer:d_K      offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, TL, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
+}
+
+static void dispatch_attn_val_bw_batched(id<MTLComputeCommandEncoder> enc,
+                                         id<MTLComputePipelineState> pso_dV,
+                                         id<MTLComputePipelineState> pso_dScores,
+                                         id<MTLBuffer> d_attn_out, // [B_NH, T, HD]
+                                         id<MTLBuffer> attn_prob,  // [B_NH, T, TL]
+                                         id<MTLBuffer> V_full,     // [B_NH, TL, HD]
+                                         id<MTLBuffer> d_V,        // [B_NH, TL, HD] out
+                                         id<MTLBuffer> d_scores,   // [B_NH, T, TL] out
+                                         uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso_dV];
+    [enc setBuffer:attn_prob  offset:0 atIndex:0];
+    [enc setBuffer:d_attn_out offset:0 atIndex:1];
+    [enc setBuffer:d_V        offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, TL, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
+
+    [enc setComputePipelineState:pso_dScores];
+    [enc setBuffer:d_attn_out offset:0 atIndex:0];
+    [enc setBuffer:V_full     offset:0 atIndex:1];
+    [enc setBuffer:d_scores   offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(TL, T, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(TL, 32u), 1, 1)];
+}
+
+static void dispatch_rel_pe_q_grad_batched(id<MTLComputeCommandEncoder> enc,
+                                           id<MTLComputePipelineState> pso_dQrel,
+                                           id<MTLComputePipelineState> pso_dWrel,
+                                           id<MTLBuffer> Q_mh,          // [B_NH, T, HD]
+                                           id<MTLBuffer> d_q_rel_raw,   // [B_NH, T, D_POS]
+                                           id<MTLBuffer> W_rel_r, NSUInteger w_rel_r_off,     // [NH, HD, D_POS]
+                                           id<MTLBuffer> d_Q_rel,       // [B_NH, T, HD] out
+                                           id<MTLBuffer> d_W_rel_r, NSUInteger d_W_rel_r_off, // [NH, HD, D_POS] accumulate
+                                           uint32_t B, uint32_t NH, uint32_t T, uint32_t HD, uint32_t D_POS) {
+    const uint32_t B_NH = B * NH;
+    [enc setComputePipelineState:pso_dQrel];
+    [enc setBuffer:d_q_rel_raw offset:0            atIndex:0];
+    [enc setBuffer:W_rel_r     offset:w_rel_r_off   atIndex:1];
+    [enc setBuffer:d_Q_rel     offset:0             atIndex:2];
+    [enc setBytes:&T     length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD    length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&D_POS length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&NH    length:sizeof(uint32_t) atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(HD, T, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
+
+    [enc setComputePipelineState:pso_dWrel];
+    [enc setBuffer:Q_mh        offset:0              atIndex:0];
+    [enc setBuffer:d_q_rel_raw offset:0              atIndex:1];
+    [enc setBuffer:d_W_rel_r   offset:d_W_rel_r_off  atIndex:2];
+    [enc setBytes:&T     length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD    length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&D_POS length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&NH    length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&B     length:sizeof(uint32_t) atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(D_POS, HD, NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(D_POS, 32u), 1, 1)];
+}
+
+static void dispatch_attn_out_preO_recompute_batched(id<MTLComputeCommandEncoder> enc,
+                                                      id<MTLComputePipelineState> pso,
+                                                      id<MTLBuffer> attn_prob, // [B_NH, T, TL]
+                                                      id<MTLBuffer> V_full,    // [B_NH, TL, HD]
+                                                      id<MTLBuffer> attn_pre,  // [B_NH, T, HD] out
+                                                      uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:attn_prob offset:0 atIndex:0];
+    [enc setBuffer:V_full    offset:0 atIndex:1];
+    [enc setBuffer:attn_pre  offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, T, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
+}
+
 // dispatch_element_add: out[i] = a[i] + b[i] (with optional in-place if out aliases a)
 static void dispatch_element_add(id<MTLComputeCommandEncoder> enc,
                                   id<MTLComputePipelineState> pso,
@@ -5034,10 +5256,14 @@ static bool metal_bw_layer(OnlineTrainer* tr,
 
     // Required PSOs
     if (!m2->ps_linear_bw_input || !m2->ps_linear_bw_weight || !m2->ps_linear_bw_weight_acc ||
-        !m2->ps_linear_bw_bias || !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma ||
+        !m2->ps_linear_bw_bias || !m2->ps_linear_bw_bias_acc || !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma ||
         !m2->ps_softmax_bw || !m2->ps_geglu_bw_split || !m2->ps_geglu_recomp_split ||
         !m2->ps_element_add || !m2->ps_scale_buffer || !m2->ps_extract_new_kv_tail ||
-        !m2->ps_rel_pe_q_bw || !m2->ps_rel_pe_br_bw ||
+        !m2->ps_rel_pe_q_bw_batched || !m2->ps_rel_pe_br_bw_batched ||
+        !m2->ps_attn_qkt_bw_dQ_batched || !m2->ps_attn_qkt_bw_dK_batched ||
+        !m2->ps_attn_val_bw_dV_batched || !m2->ps_attn_val_bw_dScores_batched ||
+        !m2->ps_rel_pe_q_grad_dQrel_batched || !m2->ps_rel_pe_q_grad_dWrel_batched ||
+        !m2->ps_attn_out_preO_recompute_batched ||
         !m2->ps_linear_amx || !m2->ps_kv_assemble ||
         !m2->ps_reshape_to_mh || !m2->ps_reshape_from_mh || !m2->ps_reshape_from_mh_acc) {
         return false;
@@ -5112,7 +5338,14 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                                     m2->geglu_val[i], m2->geglu_gate[i], m2->ffn_recomp,
                                     BT, F);
     barrier();
-    dispatch_bias_bw(enc, m2->ps_linear_bw_bias,
+    // Bug fix (2026-07-03): grad_b_ffn2 must accumulate across BPTT chunks
+    // (same contract as grad_ffn2 via linear_bw_weight_acc, see comment above:
+    // "grad_b_ffn2[i] += sum_m pl_dh"), but linear_bw_bias overwrites
+    // (db[n] = sum) — using it here silently discarded any earlier chunk's
+    // contribution on every chunk after the first. linear_bw_bias_acc (+=)
+    // matches the caller-zeroes-first-chunk contract every other grad_* buffer
+    // in this function already follows.
+    dispatch_bias_bw(enc, m2->ps_linear_bw_bias_acc,
                      tr->pl_dh, 0,
                      tr->grad_b_ffn2, ofs.b_h,
                      BT, H);
@@ -5139,8 +5372,9 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                              m2->d_geglu, m2->geglu_val[i], m2->geglu_gate[i],
                              m2->d_ffn1, BT, F);
     barrier();
-    // grad_b_ffn1[i] += sum_m d_ffn_pre  (N=2F)
-    dispatch_bias_bw(enc, m2->ps_linear_bw_bias,
+    // grad_b_ffn1[i] += sum_m d_ffn_pre  (N=2F). Same accumulate-contract fix
+    // as grad_b_ffn2 above — linear_bw_bias_acc, not linear_bw_bias.
+    dispatch_bias_bw(enc, m2->ps_linear_bw_bias_acc,
                      m2->d_ffn1, 0,
                      tr->grad_b_ffn1, ofs.b_ffn1,
                      BT, 2u * F);
@@ -5220,11 +5454,13 @@ static bool metal_bw_layer(OnlineTrainer* tr,
 
     // ------------------------------------------------------------------
     // (3) Attention backward.
+    //     Recompute K_full, V_full (dispatch_kv_recompute, per projection) —
+    //       done first: the pre-O-proj attn_out recompute below reads V_full,
+    //       so V_full must be freshened for layer i before that read.
     //     d_attn_out_flat = d_x_mid      (identity through O-proj output residual)
     //     grad_o[i] += attn_out^T @ d_x_mid
     //     d_attn_out_preO = d_x_mid @ W_o^T
     //     reshape_to_mh: d_attn_out_preO [BT,H] → d_attn_out_mh [BNH, T, HD]
-    //     Recompute K_full, V_full (dispatch_kv_recompute, per projection)
     //     reshape_to_mh Q_saved → q_mh [BNH, T, HD]
     //     (a) attn_val_bw: d_V_mh [BNH, TL, HD], d_scores [BNH, T, TL] = f(d_attn_out_mh, attn_prob, V)
     //     (b) softmax_bw: d_scores ← softmax_bw(d_scores, attn_prob)
@@ -5238,65 +5474,12 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     //     Linear bw: grad_q/k/v += x_ln1^T @ d_Q_flat / d_K_new / d_V_new;
     //                d_x_ln1 = d_Q_flat @ W_q^T + d_K_new @ W_k^T + d_V_new @ W_v^T
     // ------------------------------------------------------------------
-    // Forward saved attn_out = POST-O-proj (see t_attn_out comment at L213). We need
-    // PRE-O-proj for grad_o. Recompute it via attn_prob @ V_full per head.
-    // attn_pre_Wo_mh [BNH, T, HD] = attn_prob [BNH, T, TL] @ V_full [BNH, TL, HD]
-    // We write per-head slices into a [BT, H] contiguous flat layout by using
-    // d_q_rel_mh (same size BT*H floats) as a [BNH,T,HD] scratch, then reshape.
-    {
-        const uint32_t ph_st = T * TL;
-        const uint32_t ph_vh = TL * HD;
-        const uint32_t ph_qh = T * HD;
-        for (uint32_t h = 0; h < B_NH; h++) {
-            NSUInteger off_s = (NSUInteger)h * ph_st * sizeof(float);
-            NSUInteger off_v = (NSUInteger)h * ph_vh * sizeof(float);
-            NSUInteger off_q = (NSUInteger)h * ph_qh * sizeof(float);
-            // transformer_linear_amx: out[M,N] = in[M,K] @ W[K,N] + bias[N]
-            // Here: M=T, K=TL, N=HD
-            [enc setComputePipelineState:m2->ps_linear_amx];
-            [enc setBuffer:m2->attn_prob[i] offset:off_s atIndex:0];
-            [enc setBuffer:m2->v_full       offset:off_v atIndex:1];
-            [enc setBuffer:m2->zero_bias    offset:0     atIndex:2];
-            [enc setBuffer:m2->d_q_rel_mh   offset:off_q atIndex:3]; // scratch: [BNH,T,HD]
-            uint32_t Kloc = TL, Nloc = HD;
-            [enc setBytes:&Kloc length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Nloc length:sizeof(uint32_t) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(HD / 8, T / 8, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        }
-        barrier();
-        // reshape_from_mh: [BNH, T, HD] → [BT, H], overwriting attn_out[i]
-        dispatch_reshape_from_mh(enc, m2->ps_reshape_from_mh,
-                                  m2->d_q_rel_mh, m2->attn_out[i],
-                                  B, T, NH, HD, H);
-        barrier();
-    }
-    // grad_o[i] += attn_out_pre^T @ d_x_mid   (K=H, N=H, M=BT)
-    [enc setComputePipelineState:m2->ps_linear_bw_weight_acc];
-    [enc setBuffer:m2->attn_out[i] offset:0         atIndex:0];
-    [enc setBuffer:m2->d_x_mid     offset:0         atIndex:1];
-    [enc setBuffer:tr->grad_o      offset:ofs.w_qkv atIndex:2];
-    { uint32_t M = BT, K = H, N = H;
-      [enc setBytes:&M length:sizeof(uint32_t) atIndex:3];
-      [enc setBytes:&K length:sizeof(uint32_t) atIndex:4];
-      [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
-      [enc dispatchThreadgroups:MTLSizeMake(N / 8, K / 8, 1)
-          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
-    // d_attn_out_preO = d_x_mid @ W_o^T   (dY=[BT,H], W=[H,H], dX=[BT,H])
-    dispatch_linear_bw_input(enc, m2->ps_linear_bw_input,
-                             m2->d_x_mid, 0,
-                             wb->attn_out, ofs.w_qkv,
-                             m2->d_attn_out, 0,
-                             BT, H, H);
-    barrier();
-
-    // reshape d_attn_out [BT, H] → d_attn_out_mh [BNH, T, HD]
-    dispatch_reshape_to_mh(enc, m2->ps_reshape_to_mh,
-                            m2->d_attn_out, m2->d_attn_out_mh,
-                            B, T, NH, HD, H);
-
     // ---- K/V recompute per-layer (inlined because dispatch_kv_recompute doesn't
     //       support weight buffer offsets; we need per-layer slicing). ----
+    // NOTE: moved ahead of the pre-O-proj attn_out recompute below — that block
+    // reads m2->v_full, which this block is what freshens it for layer i. v_full
+    // is a single shared (non-per-layer) buffer; running the read before this
+    // write left it holding the previous layer's V (stale-read bug, fixed here).
     // K_new = x_ln1 [BT,H] @ W_k_slice [H,H] + 0 bias
     {
         const uint32_t Hloc = H;
@@ -5349,18 +5532,68 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         barrier();
     }
 
+    // Forward saved attn_out = POST-O-proj (see t_attn_out comment at L213). We need
+    // PRE-O-proj for grad_o. Recompute it via attn_prob @ V_full per head.
+    // attn_pre_Wo_mh [BNH, T, HD] = attn_prob [BNH, T, TL] @ V_full [BNH, TL, HD]
+    // We write per-head slices into a [BT, H] contiguous flat layout by using
+    // d_q_rel_mh (same size BT*H floats) as a [BNH,T,HD] scratch, then reshape.
+    {
+        // Batched (single-dispatch) replacement for the B_NH-times looped
+        // per-head transformer_linear_amx dispatch — see
+        // metal-bw-speed-static-analysis.md §8.4/§8.5. bw_verify:
+        // attn_out_preO_recompute_batched bit-exact vs the non-batched loop
+        // (max_abs=0, max_rel=0).
+        dispatch_attn_out_preO_recompute_batched(enc, m2->ps_attn_out_preO_recompute_batched,
+                                                  m2->attn_prob[i], m2->v_full,
+                                                  m2->d_q_rel_mh, // scratch: [BNH,T,HD]
+                                                  B_NH, T, TL, HD);
+        barrier();
+        // reshape_from_mh: [BNH, T, HD] → [BT, H], overwriting attn_out[i]
+        dispatch_reshape_from_mh(enc, m2->ps_reshape_from_mh,
+                                  m2->d_q_rel_mh, m2->attn_out[i],
+                                  B, T, NH, HD, H);
+        barrier();
+    }
+    // grad_o[i] += attn_out_pre^T @ d_x_mid   (K=H, N=H, M=BT)
+    [enc setComputePipelineState:m2->ps_linear_bw_weight_acc];
+    [enc setBuffer:m2->attn_out[i] offset:0         atIndex:0];
+    [enc setBuffer:m2->d_x_mid     offset:0         atIndex:1];
+    [enc setBuffer:tr->grad_o      offset:ofs.w_qkv atIndex:2];
+    { uint32_t M = BT, K = H, N = H;
+      [enc setBytes:&M length:sizeof(uint32_t) atIndex:3];
+      [enc setBytes:&K length:sizeof(uint32_t) atIndex:4];
+      [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(N / 8, K / 8, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+    // d_attn_out_preO = d_x_mid @ W_o^T   (dY=[BT,H], W=[H,H], dX=[BT,H])
+    dispatch_linear_bw_input(enc, m2->ps_linear_bw_input,
+                             m2->d_x_mid, 0,
+                             wb->attn_out, ofs.w_qkv,
+                             m2->d_attn_out, 0,
+                             BT, H, H);
+    barrier();
+
+    // reshape d_attn_out [BT, H] → d_attn_out_mh [BNH, T, HD]
+    dispatch_reshape_to_mh(enc, m2->ps_reshape_to_mh,
+                            m2->d_attn_out, m2->d_attn_out_mh,
+                            B, T, NH, HD, H);
+
     // Reshape Q_saved [BT, H] → q_mh [BNH, T, HD]
     dispatch_reshape_to_mh(enc, m2->ps_reshape_to_mh,
                             m2->Q_saved[i], m2->q_mh,
                             B, T, NH, HD, H);
     barrier();
 
-    // (a) attn_val_bw → d_V_mh + d_scores
-    dispatch_attn_val_bw(enc,
-                          m2->ps_linear_bw_input, m2->ps_linear_bw_weight,
+    // (a) attn_val_bw → d_V_mh + d_scores. Batched (single-dispatch-pair)
+    // replacement for the B_NH-times looped dispatch_attn_val_bw — see
+    // metal-bw-speed-static-analysis.md §8.4/§8.5. bw_verify:
+    // attn_val_bw_dV/dScores_batched bit-exact vs the non-batched loop
+    // (max_abs=0, max_rel=0).
+    dispatch_attn_val_bw_batched(enc,
+                          m2->ps_attn_val_bw_dV_batched, m2->ps_attn_val_bw_dScores_batched,
                           m2->d_attn_out_mh, m2->attn_prob[i], m2->v_full,
                           m2->d_v_mh, m2->d_scores,
-                          B, NH, T, TL, HD);
+                          B_NH, T, TL, HD);
     barrier();
 
     // (b) softmax_bw: d_scores ← softmax_bw(d_scores, attn_prob) row-wise over TL
@@ -5372,9 +5605,13 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // (c) rel_pe_br_bw accumulates grad_b_rel_r with b_scale=sqrt(H) (original scale)
     //     Must run BEFORE we scale d_scores by 1/sqrt(HD).
     if (tr->grad_b_rel_r) {
-        dispatch_rel_pe_br_bw_all_rows(enc, m2->ps_rel_pe_br_bw,
-                                        m2->d_scores, tr->grad_b_rel_r, m2->bdist_buf,
-                                        TL, NH, B, T, sqrtf((float)H));
+        // Batched (single-dispatch) replacement for the B*NH*T-times looped
+        // dispatch_rel_pe_br_bw_all_rows — see metal-bw-speed-static-analysis.md
+        // §8.3/§8.5. bw_verify: rel_pe_br_scatter_bw_batched bit-exact vs the
+        // non-batched kernel (max_abs=0, max_rel=0).
+        dispatch_rel_pe_br_bw_batched(enc, m2->ps_rel_pe_br_bw_batched,
+                                       m2->d_scores, tr->grad_b_rel_r, m2->bdist_buf,
+                                       TL, NH, B, T, sqrtf((float)H));
         barrier();
     }
 
@@ -5387,22 +5624,35 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         barrier();
     }
 
-    // (e) attn_qkt_bw → d_Q_mh_qk (stored in d_q_mh), d_K_mh
-    dispatch_attn_qkt_bw(enc,
-                          m2->ps_linear_amx, m2->ps_linear_bw_weight,
+    // (e) attn_qkt_bw → d_Q_mh_qk (stored in d_q_mh), d_K_mh. Batched
+    // (single-dispatch-pair) replacement for the B_NH-times looped
+    // dispatch_attn_qkt_bw — see metal-bw-speed-static-analysis.md
+    // §8.4/§8.5. bw_verify: attn_qkt_bw_dQ/dK_batched bit-exact vs the
+    // non-batched loop (max_abs=0, max_rel=0).
+    dispatch_attn_qkt_bw_batched(enc,
+                          m2->ps_attn_qkt_bw_dQ_batched, m2->ps_attn_qkt_bw_dK_batched,
                           m2->d_scores, m2->k_full, m2->q_mh,
-                          m2->d_q_mh, m2->d_k_mh, m2->zero_bias,
-                          B, NH, T, TL, HD);
+                          m2->d_q_mh, m2->d_k_mh,
+                          B_NH, T, TL, HD);
     barrier();
 
-    // (f) rel_pe_q_bw: d_q_rel_raw [BNH, T, D_POS] from d_scores scatter
-    dispatch_rel_pe_q_bw_all_rows(enc, m2->ps_rel_pe_q_bw,
-                                    m2->d_scores, m2->d_q_rel_raw, m2->qdist_buf,
-                                    TL, D_POS, B_NH, T);
+    // (f) rel_pe_q_bw: d_q_rel_raw [BNH, T, D_POS] from d_scores scatter.
+    // Batched (single-dispatch) replacement for the B_NH*T-times looped
+    // dispatch_rel_pe_q_bw_all_rows — see metal-bw-speed-static-analysis.md
+    // §8.2/§8.5. bw_verify: rel_pe_q_scatter_bw_batched bit-exact vs the
+    // non-batched kernel (max_abs=0, max_rel=0).
+    dispatch_rel_pe_q_bw_batched(enc, m2->ps_rel_pe_q_bw_batched,
+                                  m2->d_scores, m2->d_q_rel_raw, m2->qdist_buf,
+                                  TL, D_POS, B_NH, T);
     barrier();
 
-    // (g) rel_pe_q_grad: d_Q_rel_mh (overwrite) + grad_W_rel_r[i] accumulate
-    dispatch_rel_pe_q_grad(enc, m2->ps_linear_bw_input, m2->ps_linear_bw_weight_acc,
+    // (g) rel_pe_q_grad: d_Q_rel_mh (overwrite) + grad_W_rel_r[i] accumulate.
+    // Batched (single-dispatch-pair) replacement for the B*NH-times looped
+    // dispatch_rel_pe_q_grad (which also issued a memoryBarrierWithScope per
+    // iteration) — see metal-bw-speed-static-analysis.md §8.4/§8.5.
+    // bw_verify: rel_pe_q_grad_dQrel/dWrel_batched bit-exact vs the
+    // non-batched loop (max_abs=0, max_rel=0).
+    dispatch_rel_pe_q_grad_batched(enc, m2->ps_rel_pe_q_grad_dQrel_batched, m2->ps_rel_pe_q_grad_dWrel_batched,
                             m2->q_mh, m2->d_q_rel_raw,
                             wb->w_rel_r_all ? wb->w_rel_r_all : wb->w_rel_r, ofs.w_relr,
                             m2->d_q_rel_mh,
@@ -5518,6 +5768,318 @@ static bool metal_bw_layer(OnlineTrainer* tr,
 }
 #endif // NNCP_METAL_BW
 
+// ---------------------------------------------------------------------------
+// Phase B verify: NNCP_BW_VERIFY_L1=1 runtime opt-in (layer L-1 isolation).
+// See ~/Codes/architect/nncp-implimentation-report/phase-b-metal-bw-layer-design.md
+// Textually included so it can see metal_bw_layer / M2WeightOffsets / OnlineTrainer
+// without header changes. Zero cost unless NNCP_BW_VERIFY_L1 is set.
+// ---------------------------------------------------------------------------
+#if NNCP_METAL_BW
+#include "online_trainer_verify_l1.inc"
+#endif // NNCP_METAL_BW
+
+// ---------------------------------------------------------------------------
+// Phase A verify: NNCP_FWD_DUMP=1 runtime opt-in.
+// CPU-recomputes the 8 forward intermediates that build_single_layer() exposes
+// via PerLayerFwdGraph (t_x_ln1, t_Q_saved, t_attn_prob, t_attn_out, t_x_mid,
+// t_x_ln2, t_geglu_val/t_geglu_gate) plus the layer's final output, and
+// compares against the values already dumped into M2BwContext by the
+// dump_inter block below (GPU/MPSGraph path). Mirrors build_single_layer()
+// (L2906-3043) exactly — any formula drift there must be mirrored here too.
+// Zero cost unless NNCP_FWD_DUMP is set: gated at the single call site.
+// ---------------------------------------------------------------------------
+#if NNCP_METAL_BW
+static bool nncp_fwd_dump_verify_enabled() {
+    static int v = -1;
+    if (v < 0) v = getenv("NNCP_FWD_DUMP") ? 1 : 0;
+    return v != 0;
+}
+
+// Bug fix (2026-07-03, metric hypothesis): the original `denom = max(|ref|, 1e-6)`
+// floor is far too small. For zero-crossing tensors (q ~ N(0, small var) at init,
+// GELU's near-zero region for geglu_val, linear residual outputs) a handful of
+// elements sit within FP32-rounding distance of 0. FP32 summation is not
+// associative, so a K=1024-term reduction done via CPU (this file's double-
+// accumulated `matmulHH`) vs GPU (MPSGraph's own reduction-tree/warp order) will
+// legitimately differ by ~1e-6..1e-5 ABSOLUTE — completely normal FP32 noise —
+// but dividing that by a denom near 1e-6 for a near-zero ref element inflates the
+// relative error to >>1e-4, tripping FAIL on an otherwise-correct tensor. This is
+// consistent with every prior observation: (a) the FAIL values were bit-identical
+// across v1 (targetTensors:)/v2 (resultsDictionary:)/clean rebuild — a real formula
+// or fetch bug would not reproduce to the exact same float bits build-over-build
+// this reliably, but a deterministic FP32 reduction-order difference would;
+// (b) attn_prob (softmax output, bounded away from the exact zero-crossing that
+// bites q/geglu/linear-residual tensors) and x_ln1 (RMSNorm output, scaled by a
+// nonzero gamma) PASS, while zero-crossing tensors (q, geglu_val/gate, and
+// attn_out/x_mid which inherit near-zero residual entries) FAIL.
+// Report both a max_abs diagnostic and an eps-floored relative error
+// (eps=1e-3, i.e. treat |ref|<1e-3 elements by absolute rather than relative
+// tolerance) so a genuine formula/wiring bug (large absolute error on a
+// meaningfully-sized element) can still be distinguished from this near-zero
+// relative-error artifact.
+static void fwd_dump_max_err(const float* ref, const float* got, size_t n,
+                             float* out_max_abs, float* out_max_rel_eps) {
+    const float eps = 1e-3f;
+    float max_abs = 0.0f, max_rel_eps = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float diff = fabsf(ref[i] - got[i]);
+        if (diff > max_abs) max_abs = diff;
+        float denom = fmaxf(fabsf(ref[i]), eps);
+        float rel   = diff / denom;
+        if (rel > max_rel_eps) max_rel_eps = rel;
+    }
+    *out_max_abs     = max_abs;
+    *out_max_rel_eps = max_rel_eps;
+}
+
+static void fwd_dump_check(uint32_t layer, const char* name,
+                           const float* ref, const float* got, size_t n) {
+    float max_abs = 0.0f, max_rel_eps = 0.0f;
+    fwd_dump_max_err(ref, got, n, &max_abs, &max_rel_eps);
+    // PASS/FAIL now gated on the eps-floored relative error, not the raw one —
+    // near-zero elements no longer dominate the verdict.
+    fprintf(stderr, "[FWD_DUMP] layer=%u %-20s N=%-8zu max_abs=%.3e max_rel_eps1e-3=%.3e  %s\n",
+            layer, name, n, max_abs, max_rel_eps, max_rel_eps < 1e-3f ? "PASS" : "FAIL");
+}
+
+// CPU reference recompute of one transformer layer's forward intermediates,
+// verified against the MPSGraph-computed values already memcpy'd into `m2`
+// by the dump_inter block in run_per_layer_bptt_chunk().
+static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWeightBuffers* wb,
+                                      uint32_t layer, M2BwContext* m2,
+                                      int B, int T, uint32_t H, uint32_t NH, uint32_t HD,
+                                      uint32_t F, uint32_t D_POS, int MEM_LEN, int EXT_LEN,
+                                      bool is_enwik8, size_t FFN1_MULT)
+{
+    const int BT = B * T;
+    const float eps   = 1e-5f;
+    const float scale = 1.0f / sqrtf((float)HD);
+    const size_t ffn1_dim = FFN1_MULT * F;
+
+    const float* x     = (const float*)[tr->pl_h[layer] contents];
+    const float* w_q   = (const float*)[wb->attn_q   contents] + (size_t)layer * H * H;
+    const float* w_k   = (const float*)[wb->attn_k   contents] + (size_t)layer * H * H;
+    const float* w_v   = (const float*)[wb->attn_v   contents] + (size_t)layer * H * H;
+    const float* w_o   = (const float*)[wb->attn_out contents] + (size_t)layer * H * H;
+    const float* w_ffn1= (const float*)[wb->ffn1     contents] + (size_t)layer * H * ffn1_dim;
+    const float* w_ffn2= (const float*)[wb->ffn2     contents] + (size_t)layer * F * H;
+    const float* b_ffn1= (const float*)[wb->b_ffn1   contents] + (size_t)layer * ffn1_dim;
+    const float* b_ffn2= (const float*)[wb->b_ffn2   contents] + (size_t)layer * H;
+    const float* wln   = (const float*)[wb->ln       contents] + (size_t)layer * 4 * H;
+    const float* gam1 = wln, *bet1 = wln + H, *gam2 = wln + 2*H, *bet2 = wln + 3*H;
+    const float* w_rel_r = (is_enwik8 && wb->w_rel_r_all)
+        ? (const float*)[wb->w_rel_r_all contents] + (size_t)layer * NH * HD * D_POS
+        : (const float*)[wb->w_rel_r contents];
+    const float* b_rel_r = (const float*)[wb->b_rel_r contents]; // [NH, EXT_LEN] (per-chunk shape, see shape_br)
+    const float* kv_k = (layer < (uint32_t)SEG_MAX_LAYERS && tr->kv_mem_buf_k[layer])
+        ? (const float*)[tr->kv_mem_buf_k[layer] contents] : nullptr;
+    const float* kv_v = (layer < (uint32_t)SEG_MAX_LAYERS && tr->kv_mem_buf_v[layer])
+        ? (const float*)[tr->kv_mem_buf_v[layer] contents] : nullptr;
+
+    auto matmulHH = [&](const std::vector<float>& in, const float* w, std::vector<float>& out) {
+        for (int r = 0; r < BT; r++) {
+            const float* xr = &in[(size_t)r * H];
+            float* outr = &out[(size_t)r * H];
+            for (uint32_t n = 0; n < H; n++) {
+                double s = 0.0;
+                for (uint32_t kk = 0; kk < H; kk++) s += (double)xr[kk] * w[(size_t)kk * H + n];
+                outr[n] = (float)s;
+            }
+        }
+    };
+
+    // 1) x_ln1 = RMSNorm(x, gam1) for enwik8, else identity.
+    std::vector<float> x_ln1((size_t)BT * H);
+    if (is_enwik8) {
+        for (int r = 0; r < BT; r++) {
+            const float* xr = x + (size_t)r * H;
+            double s = 0.0;
+            for (uint32_t c = 0; c < H; c++) s += (double)xr[c] * xr[c];
+            float inv = 1.0f / sqrtf((float)(s / H) + eps);
+            for (uint32_t c = 0; c < H; c++) x_ln1[(size_t)r * H + c] = xr[c] * inv * gam1[c];
+        }
+    } else {
+        std::copy(x, x + (size_t)BT * H, x_ln1.begin());
+    }
+
+    // 2) Q/K/V projections.
+    std::vector<float> q((size_t)BT * H), k((size_t)BT * H), v((size_t)BT * H);
+    matmulHH(x_ln1, w_q, q);
+    matmulHH(x_ln1, w_k, k);
+    matmulHH(x_ln1, w_v, v);
+
+    // 3) Attention: scores = scale*(Q@K^T) + scale*(Q@w_rel_r gathered by q-dist)
+    //               + sqrt(H)*(b_rel_r gathered by b-dist) + causal_mask; softmax; @V.
+    // NOTE (2026-07-03, metric-hypothesis investigation): this block consumes the
+    // CPU-side `q`/`k`/`v` vectors computed above (matmulHH(x_ln1, w_*, ...)) —
+    // NOT the GPU-dumped m2->Q_saved[layer] buffer. So attn_prob's ~9e-7 match
+    // against the GPU's real attn_prob output does NOT depend on, and is not
+    // evidence about, whether q.data() matches m2->Q_saved[layer] — those are two
+    // independent comparisons against two different GPU outputs (attn_prob vs
+    // Q_saved), sharing only the CPU-side `q` as a common input. A genuine formula
+    // bug in `q`'s CPU reference would show up in the q-vs-Q_saved comparison
+    // directly; it would only show up in the attn_prob comparison indirectly, and
+    // only to the extent Q actually influences the softmax output there (which can
+    // be small when the sqrt(H)*b_rel_r bias term dominates the logits early in
+    // training). See fwd_dump_max_err above for the (more likely, per the FAIL
+    // values being bit-identical across v1/v2/clean rebuild) near-zero relative
+    // error explanation for the q-vs-Q_saved FAIL specifically.
+    std::vector<float> attn_prob((size_t)B * NH * T * EXT_LEN);
+    std::vector<float> attn((size_t)BT * H, 0.0f); // pre-O-proj
+    std::vector<float> scores(EXT_LEN);
+    for (int b = 0; b < B; b++) {
+        for (uint32_t nh = 0; nh < NH; nh++) {
+            for (int t = 0; t < T; t++) {
+                const float* qrow = &q[(size_t)(b * T + t) * H + nh * HD];
+                for (int kx = 0; kx < EXT_LEN; kx++) {
+                    const float* krow = (kx < MEM_LEN)
+                        ? (kv_k ? kv_k + (size_t)(b * MEM_LEN + kx) * H + nh * HD : nullptr)
+                        : &k[(size_t)(b * T + (kx - MEM_LEN)) * H + nh * HD];
+                    double dot = 0.0;
+                    if (krow) for (uint32_t hd = 0; hd < HD; hd++) dot += (double)qrow[hd] * krow[hd];
+                    float raw = scale * (float)dot;
+
+                    int d  = MEM_LEN + t - kx;
+                    int qd = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+                    double qrel = 0.0;
+                    for (uint32_t hd = 0; hd < HD; hd++)
+                        qrel += (double)qrow[hd] * w_rel_r[((size_t)nh * HD + hd) * D_POS + qd];
+                    raw += scale * (float)qrel;
+
+                    int bd = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
+                    raw += sqrtf((float)H) * b_rel_r[(size_t)nh * EXT_LEN + bd];
+
+                    if (kx - MEM_LEN > t) raw += -1e9f;
+                    scores[kx] = raw;
+                }
+                float mx = scores[0];
+                for (int kx = 1; kx < EXT_LEN; kx++) if (scores[kx] > mx) mx = scores[kx];
+                double sum = 0.0;
+                for (int kx = 0; kx < EXT_LEN; kx++) { scores[kx] = expf(scores[kx] - mx); sum += scores[kx]; }
+                for (int kx = 0; kx < EXT_LEN; kx++) scores[kx] = (float)(scores[kx] / sum);
+                float* prob_dst = &attn_prob[(((size_t)b * NH + nh) * T + t) * EXT_LEN];
+                std::copy(scores.begin(), scores.end(), prob_dst);
+
+                float* attn_dst = &attn[(size_t)(b * T + t) * H + nh * HD];
+                for (uint32_t hd = 0; hd < HD; hd++) {
+                    double s = 0.0;
+                    for (int kx = 0; kx < EXT_LEN; kx++) {
+                        float vv = (kx < MEM_LEN)
+                            ? (kv_v ? kv_v[(size_t)(b * MEM_LEN + kx) * H + nh * HD + hd] : 0.0f)
+                            : v[(size_t)(b * T + (kx - MEM_LEN)) * H + nh * HD + hd];
+                        s += (double)scores[kx] * vv;
+                    }
+                    attn_dst[hd] = (float)s;
+                }
+            }
+        }
+    }
+    std::vector<float> attn_out((size_t)BT * H);
+    matmulHH(attn, w_o, attn_out); // no bias on O-proj (build_single_layer L3002-3005)
+
+    // 4) Residual #1 (+ optional post-LN for default profile).
+    std::vector<float> res1((size_t)BT * H);
+    for (size_t i2 = 0; i2 < (size_t)BT * H; i2++) res1[i2] = x[i2] + attn_out[i2];
+    std::vector<float> x_mid((size_t)BT * H);
+    if (is_enwik8) {
+        x_mid = res1;
+    } else {
+        for (int r = 0; r < BT; r++) {
+            const float* xr = &res1[(size_t)r * H];
+            double mean = 0.0; for (uint32_t c = 0; c < H; c++) mean += xr[c]; mean /= H;
+            double var = 0.0; for (uint32_t c = 0; c < H; c++) { double d = xr[c] - mean; var += d * d; } var /= H;
+            float inv = 1.0f / sqrtf((float)var + eps);
+            for (uint32_t c = 0; c < H; c++)
+                x_mid[(size_t)r * H + c] = (float)((xr[c] - mean) * inv) * gam1[c] + bet1[c];
+        }
+    }
+
+    // 5) Pre-LN 2 (+FFN).
+    std::vector<float> x_ln2((size_t)BT * H);
+    if (is_enwik8) {
+        for (int r = 0; r < BT; r++) {
+            const float* xr = &x_mid[(size_t)r * H];
+            double s = 0.0;
+            for (uint32_t c = 0; c < H; c++) s += (double)xr[c] * xr[c];
+            float inv = 1.0f / sqrtf((float)(s / H) + eps);
+            for (uint32_t c = 0; c < H; c++) x_ln2[(size_t)r * H + c] = xr[c] * inv * gam2[c];
+        }
+    } else {
+        x_ln2 = x_mid;
+    }
+
+    std::vector<float> fp((size_t)BT * ffn1_dim);
+    for (int r = 0; r < BT; r++) {
+        const float* xr = &x_ln2[(size_t)r * H];
+        float* outr = &fp[(size_t)r * ffn1_dim];
+        for (size_t n = 0; n < ffn1_dim; n++) {
+            double s = b_ffn1[n];
+            for (uint32_t kk = 0; kk < H; kk++) s += (double)xr[kk] * w_ffn1[(size_t)kk * ffn1_dim + n];
+            outr[n] = (float)s;
+        }
+    }
+
+    auto gelu = [](float xv) -> float {
+        const float k0 = 0.79788456f, k1 = 0.044715f;
+        float x3 = xv * xv * xv;
+        return 0.5f * xv * (1.0f + tanhf(k0 * (xv + k1 * x3)));
+    };
+    std::vector<float> geglu_val((size_t)BT * F), geglu_gate;
+    std::vector<float> ff((size_t)BT * F);
+    if (is_enwik8) {
+        geglu_gate.resize((size_t)BT * F);
+        for (int r = 0; r < BT; r++) {
+            for (uint32_t d = 0; d < F; d++) {
+                float fv = fp[(size_t)r * ffn1_dim + d];
+                float fg = fp[(size_t)r * ffn1_dim + F + d];
+                geglu_val[(size_t)r * F + d]  = fv;
+                geglu_gate[(size_t)r * F + d] = fg;
+                ff[(size_t)r * F + d] = gelu(fv) * fg;
+            }
+        }
+    } else {
+        std::copy(fp.begin(), fp.end(), geglu_val.begin()); // ffn1_dim==F here
+        for (size_t i2 = 0; i2 < (size_t)BT * F; i2++) ff[i2] = gelu(fp[i2]);
+    }
+
+    std::vector<float> ffn2_out((size_t)BT * H);
+    for (int r = 0; r < BT; r++) {
+        const float* fr = &ff[(size_t)r * F];
+        float* outr = &ffn2_out[(size_t)r * H];
+        for (uint32_t n = 0; n < H; n++) {
+            double s = b_ffn2[n];
+            for (uint32_t kk = 0; kk < F; kk++) s += (double)fr[kk] * w_ffn2[(size_t)kk * H + n];
+            outr[n] = (float)s;
+        }
+    }
+    std::vector<float> res2((size_t)BT * H), final_out((size_t)BT * H);
+    for (size_t i2 = 0; i2 < (size_t)BT * H; i2++) res2[i2] = x_mid[i2] + ffn2_out[i2];
+    if (is_enwik8) {
+        final_out = res2;
+    } else {
+        for (int r = 0; r < BT; r++) {
+            const float* xr = &res2[(size_t)r * H];
+            double mean = 0.0; for (uint32_t c = 0; c < H; c++) mean += xr[c]; mean /= H;
+            double var = 0.0; for (uint32_t c = 0; c < H; c++) { double d = xr[c] - mean; var += d * d; } var /= H;
+            float inv = 1.0f / sqrtf((float)var + eps);
+            for (uint32_t c = 0; c < H; c++)
+                final_out[(size_t)r * H + c] = (float)((xr[c] - mean) * inv) * gam2[c] + bet2[c];
+        }
+    }
+
+    fwd_dump_check(layer, "x_ln1",     x_ln1.data(),     (const float*)[m2->x_ln1[layer] contents],     (size_t)BT * H);
+    fwd_dump_check(layer, "q",         q.data(),         (const float*)[m2->Q_saved[layer] contents],   (size_t)BT * H);
+    fwd_dump_check(layer, "attn_prob", attn_prob.data(), (const float*)[m2->attn_prob[layer] contents], (size_t)B * NH * T * EXT_LEN);
+    fwd_dump_check(layer, "attn_out",  attn_out.data(),  (const float*)[m2->attn_out[layer] contents],  (size_t)BT * H);
+    fwd_dump_check(layer, "x_mid",     x_mid.data(),     (const float*)[m2->x_mid[layer] contents],     (size_t)BT * H);
+    fwd_dump_check(layer, "x_ln2",     x_ln2.data(),     (const float*)[m2->x_ln2[layer] contents],     (size_t)BT * H);
+    fwd_dump_check(layer, "geglu_val", geglu_val.data(), (const float*)[m2->geglu_val[layer] contents], (size_t)BT * F);
+    if (is_enwik8)
+        fwd_dump_check(layer, "geglu_gate", geglu_gate.data(), (const float*)[m2->geglu_gate[layer] contents], (size_t)BT * F);
+    fwd_dump_check(layer, "final_out(x_out)", final_out.data(), (const float*)[tr->pl_h[layer + 1] contents], (size_t)BT * H);
+}
+#endif // NNCP_METAL_BW
+
 static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const MPSTransformerWeightBuffers& wb,
     const int32_t* seg_inputs, const int32_t* seg_targets,
@@ -5593,6 +6155,10 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     };
 
     NSArray<NSNumber*>* shape_h   = @[@(BT), @(H)];
+#if NNCP_METAL_BW
+    NSArray<NSNumber*>* shape_attn_prob_dump = @[@(B), @(tr->NH), @(T_CHUNK), @(EXT_LEN)];
+    NSArray<NSNumber*>* shape_ff_dump        = @[@(BT), @(F)];
+#endif
     NSArray<NSNumber*>* shape_wq  = @[@(H), @(H)];
     NSArray<NSNumber*>* shape_wf1 = @[@(H), @(FFN1_MULT * F)];
     NSArray<NSNumber*>* shape_wf2 = @[@(F), @(H)];
@@ -5628,7 +6194,20 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         size_t delta = byte_off - aligned_off;
         if (delta == 0) {
             size_t aligned_len = ((byte_len + page - 1) / page) * page;
-            view = [tr->device newBufferWithBytesNoCopy:base
+            // Bug fix (2026-07-03): this was `newBufferWithBytesNoCopy:base` —
+            // always wrapping byte 0 of the underlying weight buffer regardless of
+            // `layer`, since `aligned_off` was computed but never added to the
+            // pointer. Every per-layer weight slice with a page-aligned byte offset
+            // (true for w_q/w_k/w_v/w_o/w_ffn1/w_ffn2/b_ffn1/b_ffn2/w_ln/w_rel_r —
+            // all their per-layer sizes are page-size multiples for enwik8's H=1024)
+            // silently fed layer 0's weights to every layer >= 1 in the forward
+            // graph. This matches the FWD_DUMP v4 signature exactly: layer0 all-PASS
+            // (byte_off=0, so the bug was a no-op there); layer1's q real FAIL
+            // (w_q differs meaningfully layer-to-layer, randomly initialized) while
+            // x_ln1 still PASSED (RMSNorm gamma is initialized to a layer-invariant
+            // constant, e.g. 1.0, at step 0 — so "layer0's gamma" and "layer1's
+            // gamma" are bit-identical this early, masking the bug for w_ln only).
+            view = [tr->device newBufferWithBytesNoCopy:(base + aligned_off)
                                                  length:aligned_len
                                                 options:MTLResourceStorageModeShared
                                             deallocator:nil];
@@ -5679,26 +6258,78 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
             buildLayerFeeds(feeds, tr->pl_fwd, i, tr->pl_h[i]);
 
-            NSMutableArray<MPSGraphTensor*>* fwd_targets =
-                [NSMutableArray arrayWithObject:tr->pl_fwd.x_out];
 #if NNCP_METAL_BW
-            // Phase M-2b Step 2: also fetch saved intermediates for backward.
+            // Bug fix (2026-07-03, FWD_DUMP signature: layer0 x_ln1/attn_prob PASS
+            // but q/attn_out/geglu FAIL, layer1+ q FAIL explodes to 2.8e+5):
+            // `runWithFeeds:targetTensors:` (previously used here) hands back
+            // MPSGraphTensorData backed by graph-internal scratch storage. For a
+            // non-terminal intermediate whose only consumer is a zero-compute
+            // reshape (t_Q_saved's sole use is toMH()'s reshape into q_mh —
+            // build_single_layer L2966-2976), MPSGraph's memory planner is free to
+            // recycle that scratch for a later same-shape [BT,H] tensor in the SAME
+            // graph execution (x_mid/attn/res1/... are all [BT,H]); by the time we
+            // read `res[...]` back the buffer no longer holds that intermediate's
+            // value. This matches the observed signature exactly: t_x_ln1 and
+            // t_attn_prob are real multi-consumer / uniquely-shaped ([B,NH,T,EXT])
+            // compute outputs and matched the CPU reference to ~1e-6/1e-7, while
+            // t_Q_saved/t_attn_out/t_geglu_* are pass-through-adjacent or
+            // reused-shape and diverged, with the corruption compounding layer over
+            // layer. Phase C independently confirmed the real x_out/loss chain is
+            // healthy (step=1 loss matches MPSGraph exactly, [WQNORM] grads all
+            // finite/nonzero) — i.e. this was a dump-harness artifact, not a model
+            // bug, exactly as suspected ("参照系混在バグ").
+            //
+            // Fix: bind every requested target directly to a caller-owned MTLBuffer
+            // via resultsDictionary (same pattern the non-METAL_BW branch below
+            // already uses for x_out), forcing MPSGraph to write straight into our
+            // persistent buffers instead of leaving results in reusable scratch.
+            NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
+            fwd_out[tr->pl_fwd.x_out] = floatTD(tr->pl_h[i + 1], shape_h);
             if (dump_inter && i < SEG_MAX_LAYERS) {
-                if (tr->pl_fwd.t_x_ln1)     [fwd_targets addObject:tr->pl_fwd.t_x_ln1];
-                if (tr->pl_fwd.t_Q_saved)   [fwd_targets addObject:tr->pl_fwd.t_Q_saved];
-                if (tr->pl_fwd.t_attn_prob) [fwd_targets addObject:tr->pl_fwd.t_attn_prob];
-                if (tr->pl_fwd.t_attn_out)  [fwd_targets addObject:tr->pl_fwd.t_attn_out];
-                if (tr->pl_fwd.t_geglu_val) [fwd_targets addObject:tr->pl_fwd.t_geglu_val];
-                if (tr->pl_fwd.t_geglu_gate)[fwd_targets addObject:tr->pl_fwd.t_geglu_gate];
-                if (tr->pl_fwd.t_x_ln2)     [fwd_targets addObject:tr->pl_fwd.t_x_ln2];
-                if (tr->pl_fwd.t_x_mid)     [fwd_targets addObject:tr->pl_fwd.t_x_mid];
+                // Decisive-verification marker (2026-07-03, temporary — remove once
+                // the live dump site is confirmed): the q_from_mh fix (build_single_
+                // layer, "FWD_DUMP_SITE=BUILD" marker there) produced zero change in
+                // FAIL values across v1/v2/clean-rebuild, which is only consistent
+                // with this site (online_trainer.mm dump_inter, "SITE=RUNTIME_A")
+                // NOT being the code path that actually populates the Q_saved buffer
+                // the CPU-verify comparison reads. Fires once per process (layer 0,
+                // first call) so a single NNCP_FWD_DUMP=1 run settles whether this
+                // site is live at all.
+                static bool s_site_a_logged = false;
+                if (!s_site_a_logged && i == 0) {
+                    s_site_a_logged = true;
+                    NSLog(@"[FWD_DUMP_SITE=RUNTIME_A] online_trainer.mm dump_inter block IS executing. "
+                          @"t_Q_saved=%p m2_dump->Q_saved[0]=%p dump_inter=%d",
+                          (void*)tr->pl_fwd.t_Q_saved, (void*)m2_dump->Q_saved[0], dump_inter);
+                }
+                if (tr->pl_fwd.t_x_ln1     && m2_dump->x_ln1[i])
+                    fwd_out[tr->pl_fwd.t_x_ln1]      = floatTD(m2_dump->x_ln1[i],     shape_h);
+                if (tr->pl_fwd.t_Q_saved   && m2_dump->Q_saved[i])
+                    fwd_out[tr->pl_fwd.t_Q_saved]    = floatTD(m2_dump->Q_saved[i],   shape_h);
+                if (tr->pl_fwd.t_attn_prob && m2_dump->attn_prob[i])
+                    fwd_out[tr->pl_fwd.t_attn_prob]  = floatTD(m2_dump->attn_prob[i], shape_attn_prob_dump);
+                if (tr->pl_fwd.t_attn_out  && m2_dump->attn_out[i])
+                    fwd_out[tr->pl_fwd.t_attn_out]   = floatTD(m2_dump->attn_out[i],  shape_h);
+                if (tr->pl_fwd.t_geglu_val && m2_dump->geglu_val[i])
+                    fwd_out[tr->pl_fwd.t_geglu_val]  = floatTD(m2_dump->geglu_val[i], shape_ff_dump);
+                if (tr->pl_fwd.t_geglu_gate&& m2_dump->geglu_gate[i])
+                    fwd_out[tr->pl_fwd.t_geglu_gate] = floatTD(m2_dump->geglu_gate[i],shape_ff_dump);
+                if (tr->pl_fwd.t_x_ln2     && m2_dump->x_ln2[i])
+                    fwd_out[tr->pl_fwd.t_x_ln2]      = floatTD(m2_dump->x_ln2[i],     shape_h);
+                if (tr->pl_fwd.t_x_mid     && m2_dump->x_mid[i])
+                    fwd_out[tr->pl_fwd.t_x_mid]      = floatTD(m2_dump->x_mid[i],     shape_h);
             }
-#endif
-#if NNCP_METAL_BW
-            // NNCP_METAL_BW: synchronous — dump_inter reads res dict below
-            NSDictionary* res = [tr->pl_fwd.graph runWithFeeds:feeds
-                targetTensors:fwd_targets targetOperations:nil];
-            copyToBuffer(tr->pl_h[i + 1], res[tr->pl_fwd.x_out]);
+            [tr->pl_fwd.graph runWithMTLCommandQueue:tr->cmdQueue
+                                               feeds:feeds
+                                    targetOperations:nil
+                                   resultsDictionary:fwd_out];
+            {
+                // Drain: fill_inv_std / fwd_dump_cpu_verify_layer below need these
+                // buffers CPU-readable synchronously, right after this dispatch.
+                id<MTLCommandBuffer> fwd_fence = [tr->cmdQueue commandBuffer];
+                [fwd_fence commit];
+                [fwd_fence waitUntilCompleted];
+            }
 #else
             // Phase A: bind pl_h[i+1] directly; runWithMTLCommandQueue submits async
             NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
@@ -5711,23 +6342,8 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
 
 #if NNCP_METAL_BW
             if (dump_inter && i < SEG_MAX_LAYERS) {
-                // Memcpy intermediates into M2BwContext per-layer buffers.
-                if (tr->pl_fwd.t_x_ln1     && m2_dump->x_ln1[i])
-                    copyToBuffer(m2_dump->x_ln1[i],     res[tr->pl_fwd.t_x_ln1]);
-                if (tr->pl_fwd.t_Q_saved   && m2_dump->Q_saved[i])
-                    copyToBuffer(m2_dump->Q_saved[i],   res[tr->pl_fwd.t_Q_saved]);
-                if (tr->pl_fwd.t_attn_prob && m2_dump->attn_prob[i])
-                    copyToBuffer(m2_dump->attn_prob[i], res[tr->pl_fwd.t_attn_prob]);
-                if (tr->pl_fwd.t_attn_out  && m2_dump->attn_out[i])
-                    copyToBuffer(m2_dump->attn_out[i],  res[tr->pl_fwd.t_attn_out]);
-                if (tr->pl_fwd.t_geglu_val && m2_dump->geglu_val[i])
-                    copyToBuffer(m2_dump->geglu_val[i], res[tr->pl_fwd.t_geglu_val]);
-                if (tr->pl_fwd.t_geglu_gate&& m2_dump->geglu_gate[i])
-                    copyToBuffer(m2_dump->geglu_gate[i],res[tr->pl_fwd.t_geglu_gate]);
-                if (tr->pl_fwd.t_x_ln2     && m2_dump->x_ln2[i])
-                    copyToBuffer(m2_dump->x_ln2[i],     res[tr->pl_fwd.t_x_ln2]);
-                if (tr->pl_fwd.t_x_mid     && m2_dump->x_mid[i])
-                    copyToBuffer(m2_dump->x_mid[i],     res[tr->pl_fwd.t_x_mid]);
+                // Intermediates were written directly into m2_dump->*[i] above via
+                // resultsDictionary — nothing to copy here anymore.
 
                 // CPU-recompute inv_std1[i] / inv_std2[i] from PRE-LN inputs.
                 // rmsnorm_bw_x kernel expects inv_rms of the pre-LN input, so:
@@ -5750,6 +6366,15 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 };
                 fill_inv_std(tr->pl_h[i],        m2_dump->inv_std1[i]);
                 fill_inv_std(m2_dump->x_mid[i],  m2_dump->inv_std2[i]);
+
+                // NNCP_FWD_DUMP=1: CPU-recompute this layer's intermediates and
+                // compare against the values just dumped above. Opt-in, off by
+                // default; adds no cost unless the env var is set.
+                if (nncp_fwd_dump_verify_enabled()) {
+                    fwd_dump_cpu_verify_layer(tr, &wb, i, m2_dump,
+                        B, T_CHUNK, H, tr->NH, tr->HD, F, tr->d_pos,
+                        MEM_LEN, EXT_LEN, is_enwik8, FFN1_MULT);
+                }
             }
 #endif
         }
@@ -5792,13 +6417,30 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         putGrad(tr->grad_b_out,    res[lg.db_out]);
     }
 
+#if NNCP_METAL_BW
+    // Phase B verify: run metal_bw_layer(L-1) against a shadow tr *before* the
+    // MPSGraph reference loop below mutates tr->pl_dh, using tr->pl_dh's current
+    // (pristine, post-loss-bw) value as input. See online_trainer_verify_l1.inc.
+    // accumulate_weight_grads must mirror this chunk's copy_grads state — see
+    // the bug-fix comment on nncp_bw_verify_l1_run_shadow's definition: the
+    // MPSGraph reference accumulates across BPTT chunks within a segment
+    // exactly like the production path, so the shadow must too.
+    if (dump_inter && nncp_bw_verify_l1_enabled()) {
+        nncp_bw_verify_l1_run_shadow(tr, &wb, L - 1, is_enwik8, (uint32_t)FFN1_MULT, /*accumulate_weight_grads=*/!copy_grads);
+    }
+#endif
+
     // ---- Backward pass: 20 layers (reversed) ----
 #if NNCP_METAL_BW
     bool metal_bw_ok = false;
     {
         const bool accumulate_weight_grads = !copy_grads;
         id<MTLCommandBuffer> cmd_buf = [tr->cmdQueue commandBufferWithUnretainedReferences];
-        if (cmd_buf && metal_bw_train_step(tr, &wb, cmd_buf, accumulate_weight_grads)) {
+        // Verify mode always runs the MPSGraph reference path below (never the fast
+        // full-Metal path) so layer L-1's reference value is available to compare
+        // against the shadow run above.
+        if (!nncp_bw_verify_l1_enabled() &&
+            cmd_buf && metal_bw_train_step(tr, &wb, cmd_buf, accumulate_weight_grads)) {
             [cmd_buf commit];
             [cmd_buf waitUntilCompleted];
             metal_bw_ok = true;
@@ -5983,6 +6625,21 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                     else vDSP_vadd(dst, 1, tmp.data(), 1, dst, 1, n);
                 }
             }
+#if NNCP_METAL_BW
+            // Phase B verify: capture the just-written reference for layer L-1 before
+            // the next iteration (layer L-2) overwrites tr->pl_dh / adds into the
+            // shared tr->grad_b_rel_r. See online_trainer_verify_l1.inc.
+            if (nncp_bw_verify_l1_enabled() && i == (int)L - 1) {
+                if (use_gpu_readback) {
+                    // GPU-resident path commits async; force completion before CPU read.
+                    id<MTLCommandBuffer> vfence = [tr->cmdQueue commandBuffer];
+                    [vfence commit];
+                    [vfence waitUntilCompleted];
+                }
+                nncp_bw_verify_l1_capture_reference(tr, (uint32_t)i, is_enwik8, (uint32_t)FFN1_MULT);
+                nncp_bw_verify_l1_report(tr, (uint32_t)i, is_enwik8, (uint32_t)FFN1_MULT, /*accumulate_weight_grads=*/!copy_grads);
+            }
+#endif
         }
     }
     if (use_gpu_readback) {
