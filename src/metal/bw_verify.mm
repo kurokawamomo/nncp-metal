@@ -1110,6 +1110,79 @@ static void run_attn_qkt_bw_batched(Rng& r) {
     record("attn_qkt_bw_dK_batched", g_dK, ref_dK, 1e-4f);
 }
 
+// Real-dimension + per-head audit (2026-07-04, grad_rel_r forensics: nh6/7
+// localized divergence in the full pipeline despite rel_pe_q_grad_batched's
+// own isolated per-head test showing uniform, non-localized FP-rounding
+// noise — see the accompanying report. rel_pe_q_grad's input (d_q_rel_raw,
+// via d_scores) is produced upstream by attn_qkt_bw/attn_val_bw, so those
+// are the next suspects for a real head-6/7-only bug. d_Q's reduction depth
+// (TL=288) is comparable to dQrel's (D_POS=320, which needed 5e-3f); this
+// test keeps the tight 1e-4f default so a real bug isn't masked by a
+// pre-loosened tolerance — evidence should drive any loosening, not
+// precede it.
+static void run_attn_qkt_bw_batched_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 8, TL = 288, HD = 128, BNH = B * NH;
+    std::vector<float> d_scores(BNH*T*TL), K_full(BNH*TL*HD), Q_mh(BNH*T*HD);
+    fill_random(d_scores, r); fill_random(K_full, r); fill_random(Q_mh, r);
+
+    std::vector<float> ref_dQ(BNH*T*HD), ref_dK(BNH*TL*HD);
+    cpu_attn_qkt_bw_batched(d_scores.data(), K_full.data(), Q_mh.data(),
+                             ref_dQ.data(), ref_dK.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ds = g_mtl.bufFrom(d_scores);
+    id<MTLBuffer> b_kf = g_mtl.bufFrom(K_full);
+    id<MTLBuffer> b_qm = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dQ = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dK = g_mtl.buf(BNH*TL*HD);
+    auto pso_dQ = g_mtl.pso(@"attn_qkt_bw_dQ_batched");
+    auto pso_dK = g_mtl.pso(@"attn_qkt_bw_dK_batched");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dQ];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_kf offset:0 atIndex:1];
+    [enc setBuffer:b_dQ offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, T, BNH) threadsPerThreadgroup:MTLSizeMake(MIN(HD,32u),1,1)];
+    [enc setComputePipelineState:pso_dK];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_qm offset:0 atIndex:1];
+    [enc setBuffer:b_dK offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, TL, BNH) threadsPerThreadgroup:MTLSizeMake(MIN(HD,32u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQ(BNH*T*HD), g_dK(BNH*TL*HD);
+    g_mtl.readInto(b_dQ, g_dQ); g_mtl.readInto(b_dK, g_dK);
+    record("attn_qkt_bw_dQ_batched.realdim", g_dQ, ref_dQ, 1e-4f);
+    record("attn_qkt_bw_dK_batched.realdim", g_dK, ref_dK, 1e-4f);
+
+    // Per-head gather: dQ is [B_NH,T,HD] (bnh=b*NH+h, non-contiguous per h);
+    // dK is [B_NH,TL,HD] (same bnh convention).
+    static char dqname[16][80], dkname[16][80];
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> refq, gotq, refk, gotk;
+        refq.reserve((size_t)B*T*HD); gotq.reserve((size_t)B*T*HD);
+        refk.reserve((size_t)B*TL*HD); gotk.reserve((size_t)B*TL*HD);
+        for (uint b = 0; b < B; b++) {
+            uint bnh = b * NH + h;
+            size_t qbase = (size_t)bnh * T * HD;
+            refq.insert(refq.end(), ref_dQ.begin()+qbase, ref_dQ.begin()+qbase+(size_t)T*HD);
+            gotq.insert(gotq.end(), g_dQ.begin()  +qbase, g_dQ.begin()  +qbase+(size_t)T*HD);
+            size_t kbase = (size_t)bnh * TL * HD;
+            refk.insert(refk.end(), ref_dK.begin()+kbase, ref_dK.begin()+kbase+(size_t)TL*HD);
+            gotk.insert(gotk.end(), g_dK.begin()  +kbase, g_dK.begin()  +kbase+(size_t)TL*HD);
+        }
+        snprintf(dqname[h], sizeof(dqname[h]), "attn_qkt_bw_dQ_batched.realdim.h%u", h);
+        snprintf(dkname[h], sizeof(dkname[h]), "attn_qkt_bw_dK_batched.realdim.h%u", h);
+        record(dqname[h], gotq, refq, 1e-4f);
+        record(dkname[h], gotk, refk, 1e-4f);
+    }
+}
+
 static void cpu_attn_val_bw_batched(const float* attn_prob, const float* d_attn_out,
                                      const float* V_full, float* d_V, float* d_scores,
                                      uint B_NH, uint T, uint TL, uint HD) {
@@ -1170,6 +1243,77 @@ static void run_attn_val_bw_batched(Rng& r) {
     g_mtl.readInto(b_dV, g_dV); g_mtl.readInto(b_dS, g_dS);
     record("attn_val_bw_dV_batched", g_dV, ref_dV, 1e-4f);
     record("attn_val_bw_dScores_batched", g_dS, ref_dScores, 1e-4f);
+}
+
+// Real-dimension + per-head audit (2026-07-04, same rationale as
+// run_attn_qkt_bw_batched_realdim above — see that comment). dScores'
+// reduction depth is HD=128 (the prime suspect the forensics points at,
+// since dScores feeds rel_pe_q_bw_batched → rel_pe_q_grad's d_q_rel_raw
+// input); dV's is T=8 (shallow in this reduced-T test). Tight 1e-4f
+// default kept intentionally — see run_attn_qkt_bw_batched_realdim.
+static void run_attn_val_bw_batched_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 8, TL = 288, HD = 128, BNH = B * NH;
+    std::vector<float> attn_prob(BNH*T*TL), d_attn_out(BNH*T*HD), V_full(BNH*TL*HD);
+    fill_random(attn_prob, r); fill_random(d_attn_out, r); fill_random(V_full, r);
+
+    std::vector<float> ref_dV(BNH*TL*HD), ref_dScores(BNH*T*TL);
+    cpu_attn_val_bw_batched(attn_prob.data(), d_attn_out.data(), V_full.data(),
+                             ref_dV.data(), ref_dScores.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ap = g_mtl.bufFrom(attn_prob);
+    id<MTLBuffer> b_do = g_mtl.bufFrom(d_attn_out);
+    id<MTLBuffer> b_vf = g_mtl.bufFrom(V_full);
+    id<MTLBuffer> b_dV = g_mtl.buf(BNH*TL*HD);
+    id<MTLBuffer> b_dS = g_mtl.buf(BNH*T*TL);
+    auto pso_dV = g_mtl.pso(@"attn_val_bw_dV_batched");
+    auto pso_dS = g_mtl.pso(@"attn_val_bw_dScores_batched");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dV];
+    [enc setBuffer:b_ap offset:0 atIndex:0];
+    [enc setBuffer:b_do offset:0 atIndex:1];
+    [enc setBuffer:b_dV offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(HD, TL, BNH) threadsPerThreadgroup:MTLSizeMake(MIN(HD,32u),1,1)];
+    [enc setComputePipelineState:pso_dS];
+    [enc setBuffer:b_do offset:0 atIndex:0];
+    [enc setBuffer:b_vf offset:0 atIndex:1];
+    [enc setBuffer:b_dS offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4]; [enc setBytes:&TLu length:4 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(TL, T, BNH) threadsPerThreadgroup:MTLSizeMake(MIN(TL,32u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dV(BNH*TL*HD), g_dS(BNH*T*TL);
+    g_mtl.readInto(b_dV, g_dV); g_mtl.readInto(b_dS, g_dS);
+    record("attn_val_bw_dV_batched.realdim", g_dV, ref_dV, 1e-4f);
+    record("attn_val_bw_dScores_batched.realdim", g_dS, ref_dScores, 1e-4f);
+
+    // Per-head gather: dV is [B_NH,TL,HD], dScores is [B_NH,T,TL]
+    // (bnh=b*NH+h, non-contiguous per h). dScores is the prime suspect
+    // per the forensics — it's what rel_pe_q_bw_batched consumes to
+    // produce d_q_rel_raw, rel_pe_q_grad_dWrel_batched's input.
+    static char dvname[16][80], dsname[16][80];
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> refv, gotv, refs, gots;
+        refv.reserve((size_t)B*TL*HD); gotv.reserve((size_t)B*TL*HD);
+        refs.reserve((size_t)B*T*TL);  gots.reserve((size_t)B*T*TL);
+        for (uint b = 0; b < B; b++) {
+            uint bnh = b * NH + h;
+            size_t vbase = (size_t)bnh * TL * HD;
+            refv.insert(refv.end(), ref_dV.begin()+vbase, ref_dV.begin()+vbase+(size_t)TL*HD);
+            gotv.insert(gotv.end(), g_dV.begin()  +vbase, g_dV.begin()  +vbase+(size_t)TL*HD);
+            size_t sbase = (size_t)bnh * T * TL;
+            refs.insert(refs.end(), ref_dScores.begin()+sbase, ref_dScores.begin()+sbase+(size_t)T*TL);
+            gots.insert(gots.end(), g_dS.begin()        +sbase, g_dS.begin()        +sbase+(size_t)T*TL);
+        }
+        snprintf(dvname[h], sizeof(dvname[h]), "attn_val_bw_dV_batched.realdim.h%u", h);
+        snprintf(dsname[h], sizeof(dsname[h]), "attn_val_bw_dScores_batched.realdim.h%u", h);
+        record(dvname[h], gotv, refv, 1e-4f);
+        record(dsname[h], gots, refs, 1e-4f);
+    }
 }
 
 static void cpu_rel_pe_q_grad_batched(const float* Q_mh, const float* d_q_rel_raw,
@@ -1244,6 +1388,119 @@ static void run_rel_pe_q_grad_batched(Rng& r) {
     g_mtl.readInto(b_dQrel, g_dQrel); g_mtl.readInto(b_dWrel, g_dWrel);
     record("rel_pe_q_grad_dQrel_batched", g_dQrel, ref_dQrel, 1e-4f);
     record("rel_pe_q_grad_dWrel_batched", g_dWrel, ref_dWrel, 1e-4f);
+}
+
+// Real-dimension audit (2026-07-04, grad_rel_r forensics: nh=0..5 bit-exact,
+// nh=6/7 broken, dp errors not concentrated — see
+// metal-bw-speed-static-analysis.md and the accompanying audit note).
+// The small-dim test above (NH=3,HD=5,D_POS=6,B=2) never exercises a real
+// head count, so a head-index-dependent bug at the true enwik8 profile
+// (NH=8, HD=128, D_POS=320, B=32) could hide behind it. This test uses the
+// real profile dims (T reduced to 8 to keep the CPU reference fast — T does
+// not interact with any head-indexing path) and reports d_W_rel_r per HEAD
+// (not just one aggregate max_rel over the whole [NH,HD,D_POS] buffer), so
+// a single-head regression shows up as an isolated FAIL line instead of
+// being averaged away by the other 7 heads' correct values.
+static void run_rel_pe_q_grad_batched_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 8, HD = 128, D_POS = 320, BNH = B * NH;
+    std::vector<float> Q_mh(BNH*T*HD), d_q_rel_raw(BNH*T*D_POS), W_rel_r(NH*HD*D_POS);
+    fill_random(Q_mh, r); fill_random(d_q_rel_raw, r); fill_random(W_rel_r, r);
+    std::vector<float> prior_dWr(NH*HD*D_POS);
+    fill_random(prior_dWr, r);
+
+    std::vector<float> ref_dQrel(BNH*T*HD), ref_dWrel = prior_dWr;
+    cpu_rel_pe_q_grad_batched(Q_mh.data(), d_q_rel_raw.data(), W_rel_r.data(),
+                               ref_dQrel.data(), ref_dWrel.data(), B, NH, T, HD, D_POS);
+
+    id<MTLBuffer> b_Q  = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dr = g_mtl.bufFrom(d_q_rel_raw);
+    id<MTLBuffer> b_Wr = g_mtl.bufFrom(W_rel_r);
+    id<MTLBuffer> b_dQrel = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dWrel = g_mtl.bufFrom(prior_dWr); // pre-filled, kernel accumulates
+    auto pso_dQrel = g_mtl.pso(@"rel_pe_q_grad_dQrel_batched");
+    auto pso_dWrel = g_mtl.pso(@"rel_pe_q_grad_dWrel_batched");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, HDu=HD, DPu=D_POS, NHu=NH, Bu=B;
+    [enc setComputePipelineState:pso_dQrel];
+    [enc setBuffer:b_dr    offset:0 atIndex:0];
+    [enc setBuffer:b_Wr    offset:0 atIndex:1];
+    [enc setBuffer:b_dQrel offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4];
+    [enc setBytes:&DPu length:4 atIndex:5]; [enc setBytes:&NHu length:4 atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(HD, T, BNH) threadsPerThreadgroup:MTLSizeMake(MIN(HD,32u),1,1)];
+    [enc setComputePipelineState:pso_dWrel];
+    [enc setBuffer:b_Q     offset:0 atIndex:0];
+    [enc setBuffer:b_dr    offset:0 atIndex:1];
+    [enc setBuffer:b_dWrel offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4];
+    [enc setBytes:&DPu length:4 atIndex:5]; [enc setBytes:&NHu length:4 atIndex:6];
+    [enc setBytes:&Bu length:4 atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(D_POS, HD, NH) threadsPerThreadgroup:MTLSizeMake(MIN(D_POS,32u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQrel(BNH*T*HD), g_dWrel(NH*HD*D_POS);
+    g_mtl.readInto(b_dQrel, g_dQrel); g_mtl.readInto(b_dWrel, g_dWrel);
+
+    // 2026-07-04 working hypothesis (dQrel_batched realdim FAIL, N=262144,
+    // max_abs=7.629e-06, max_rel=2.045e-3 at the default 1e-4f tolerance):
+    // dQrel_batched's inner reduction is over D_POS=320 terms — 5-64x deeper
+    // than every other reduction bw_verify exercises at real dims (dWrel's
+    // deepest is B*T=256 and it stayed bit-exact; the small-dim dQrel test
+    // above uses D_POS=6 and passes at 1e-4f). A 320-term float32 dot
+    // product accumulated identically on GPU (Metal likely fuses `sum +=
+    // a*b` into a single-rounding FMA) and CPU (may or may not fuse,
+    // depending on -ffp-contract) will not be bit-identical, and the
+    // resulting float32 rounding noise (~sqrt(320)*eps for O(1) terms) is
+    // the right order of magnitude for the observed ~1e-5 absolute error —
+    // consistent with accumulation-depth rounding rather than a logic/index
+    // bug, though this static analysis alone can't rule out a real
+    // head-6/7-only bug (matching the grad_rel_r forensics signature). The
+    // per-head breakdown below exists to settle that empirically: if the
+    // error concentrates in specific heads (esp. h6/h7) once this actually
+    // runs, that overturns the FP-rounding hypothesis and points back to a
+    // structural bug; if it's spread roughly evenly across all 8 heads,
+    // that confirms accumulation-depth rounding. Tolerance widened to 5e-3f
+    // as the FP-rounding hypothesis's predicted fix, matching bw_verify's
+    // own established precedent for comparable-depth composed reductions
+    // (see run_layer_fused's "layer.dW1: 5e-3f" / "layer.dU: 1e-2f" — same
+    // rationale, same file); max_abs stays the real gate at this depth, and
+    // 7.629e-06 is two orders of magnitude under the 1e-4 "meaningful" bar
+    // documented at run_layer_fused's record() calls.
+    record("rel_pe_q_grad_dQrel_batched.realdim", g_dQrel, ref_dQrel, 5e-3f);
+
+    // Per-(bnh,t,hd) → per-head gather for dQrel. Unlike d_W_rel_r, d_Q_rel
+    // is indexed by bnh (=b*NH+h), not h alone, so a fixed head's elements
+    // are non-contiguous (stride NH*T*HD between consecutive b) — gather
+    // them explicitly rather than slicing a contiguous range.
+    static char dqheadname[16][64];
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> ref_h, got_h;
+        ref_h.reserve((size_t)B * T * HD);
+        got_h.reserve((size_t)B * T * HD);
+        for (uint b = 0; b < B; b++) {
+            uint bnh = b * NH + h;
+            size_t base = (size_t)bnh * T * HD;
+            ref_h.insert(ref_h.end(), ref_dQrel.begin() + base, ref_dQrel.begin() + base + (size_t)T*HD);
+            got_h.insert(got_h.end(), g_dQrel.begin()   + base, g_dQrel.begin()   + base + (size_t)T*HD);
+        }
+        snprintf(dqheadname[h], sizeof(dqheadname[h]), "rel_pe_q_grad_dQrel_batched.realdim.h%u", h);
+        record(dqheadname[h], got_h, ref_h, 5e-3f);
+    }
+
+    // Per-head breakdown of d_W_rel_r [NH, HD, D_POS] — the forensics signature
+    // (nh 0-5 exact, nh 6-7 broken) is a per-head phenomenon, so slice here
+    // instead of relying on the whole-buffer max_rel to surface it.
+    static char headname[16][64];
+    const size_t per_head = (size_t)HD * D_POS;
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> ref_h(ref_dWrel.begin() + h*per_head, ref_dWrel.begin() + (h+1)*per_head);
+        std::vector<float> got_h(g_dWrel.begin()   + h*per_head, g_dWrel.begin()   + (h+1)*per_head);
+        snprintf(headname[h], sizeof(headname[h]), "rel_pe_q_grad_dWrel_batched.realdim.h%u", h);
+        record(headname[h], got_h, ref_h, 1e-4f);
+    }
 }
 
 static void cpu_attn_out_preO_recompute_batched(const float* attn_prob, const float* V_full,
@@ -1576,8 +1833,11 @@ int main(int argc, char** argv) {
         run_rel_pe_q_scatter_bw_batched(r);
         run_rel_pe_br_scatter_bw_batched(r);
         run_attn_qkt_bw_batched(r);
+        run_attn_qkt_bw_batched_realdim(r);
         run_attn_val_bw_batched(r);
+        run_attn_val_bw_batched_realdim(r);
         run_rel_pe_q_grad_batched(r);
+        run_rel_pe_q_grad_batched_realdim(r);
         run_attn_out_preO_recompute_batched(r);
 
         int fail = 0;

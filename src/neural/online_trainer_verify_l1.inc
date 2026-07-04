@@ -18,6 +18,17 @@
 //
 // Activation: build with -DNNCP_METAL_BW=1, run with NNCP_BW_VERIFY_L1=1 in the
 // environment. No new CMake option — zero cost when unset.
+//
+// NO-GO continued-triage (2026-07-03): layer19 (=L-1) passes FWD_DUMP and this
+// harness end-to-end, yet the 100seg pilot still shows a large bpc gap
+// (MPSGraph 3.34 vs Metal 6.20) — meaning the remaining defect is somewhere
+// this harness never exercised: layers 0..18. Set NNCP_BW_VERIFY_LAYER=<N> to
+// redirect which layer gets isolated and compared (0 for the embed-boundary/
+// masking-sensitive first layer, any N in [0, L-1] for a mid-stack probe).
+// Unset → defaults to L-1 (prior, only) behavior. See
+// nncp_bw_verify_l1_target_layer(). Each report_one line now also prints both
+// paths' L2 norm (metal_norm / mpsgraph_norm) alongside rel_err/max_abs, so a
+// single run answers "same ballpark?" without a separate WQNORM-style dump.
 
 static bool nncp_bw_verify_l1_enabled() {
     static int cached = -1;
@@ -26,6 +37,29 @@ static bool nncp_bw_verify_l1_enabled() {
         cached = (v && v[0] == '1') ? 1 : 0;
     }
     return cached != 0;
+}
+
+// NO-GO 継続時の切り分け(A): the harness was previously hardcoded to layer L-1
+// only. To test whether the remaining bpc divergence (MPSGraph 3.34 vs Metal
+// 6.20) traces to a specific layer (e.g. layer0's embed-boundary/masking, or
+// a mid-stack layer), allow NNCP_BW_VERIFY_LAYER=<N> to redirect which layer
+// this harness isolates and compares. Unset/invalid → defaults to L-1
+// (previous, only) behavior. Clamped to [0, L-1] so a bad value can't index
+// out of the per-layer buffer arrays.
+static uint32_t nncp_bw_verify_l1_target_layer(uint32_t L) {
+    static long cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("NNCP_BW_VERIFY_LAYER");
+        if (v && v[0] != '\0') {
+            char* end = nullptr;
+            long parsed = strtol(v, &end, 10);
+            cached = (end != v && parsed >= 0) ? parsed : (long)(L - 1);
+        } else {
+            cached = (long)(L - 1);
+        }
+    }
+    uint32_t layer = (uint32_t)cached;
+    return (layer < L) ? layer : (L - 1);
 }
 
 // Shadow buffer set: same layout/size as the real per-layer weight-grad buffers, so
@@ -248,6 +282,107 @@ static float nncp_bw_verify_l1_abs_err(const float* ref, const float* got, size_
     return max_abs;
 }
 
+// L2 norm — the per-tensor, per-layer counterpart to the all-layer-aggregate
+// [WQNORM] logging in run_per_layer_bptt_chunk (which sums n = L*H*H etc.
+// across every layer and only fires every 2000 steps). Printed for both the
+// Metal shadow and the MPSGraph reference alongside rel_err/max_abs (NO-GO
+// continued-triage item B) so a single BW_VERIFY_L1 line answers "are these
+// two gradients even the same ballpark" without needing a separate norm dump
+// or a second run.
+static float nncp_bw_verify_l1_l2norm(const float* p, size_t n) {
+    double s = 0.0;
+    for (size_t i = 0; i < n; i++) s += (double)p[i] * (double)p[i];
+    return sqrtf((float)s);
+}
+
+static bool nncp_bw_verify_relr_forensics_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("NNCP_BW_VERIFY_RELR_FORENSICS");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// Element-level forensics for grad_rel_r (2026-07-04, "systematic dropped-term"
+// hypothesis: B < C consistently by ~1.6e-3 rel at step 1, not noise-shaped —
+// suspect a boundary off-by-one in rel_pe_q_grad_dWrel(_batched)'s reduction
+// range vs MPSGraph's one-hot-matmul reduction range, per report request).
+//
+// Layout: grad_rel_r_all's per-layer slice is [NH, HD, D_POS] flat, index
+// (nh*HD+hd)*D_POS+dp — matches m2_weight_offsets' ofs.w_relr and the dWrel
+// kernels' own indexing (see rel_pe_q_grad_dWrel_batched in neural_net.metal:
+// d_W_rel_r[((h*HD+hd)*D_POS)+dp] += ...). Aggregates |shadow-ref| per dp
+// bucket (summed over all nh,hd — a boundary-term bug in the dWrel reduction
+// range would concentrate diff mass in specific dp values, not spread evenly)
+// and per head (nh), and flags dp==0 / dp==D_POS-1 / TL-adjacent buckets
+// specifically since those are exactly where a clamp-vs-wrap or reduction-
+// range off-by-one would land.
+static void nncp_bw_verify_l1_relr_forensics(uint32_t layer_idx,
+                                              const float* shadow, const float* ref,
+                                              uint32_t NH, uint32_t HD, uint32_t D_POS,
+                                              uint32_t TL) {
+    std::vector<double> dp_abs_sum(D_POS, 0.0);
+    std::vector<float>  dp_max_abs(D_POS, 0.0f);
+    std::vector<uint32_t> dp_max_nh(D_POS, 0), dp_max_hd(D_POS, 0);
+    std::vector<double> nh_abs_sum(NH, 0.0);
+    // Per-head reference L2 norm (2026-07-04, requested alongside diff): needed
+    // to tell apart "nh0-5 match because both sides are near-zero there (only
+    // nh6/7 actually carry positional signal — head localization is just the
+    // amplitude distribution, no structural bug)" from "nh0-5 match because
+    // they're genuinely nonzero AND correct". A near-zero ref_norm on a head
+    // with near-zero diff is NOT exculpatory; a nonzero ref_norm on a head
+    // with near-zero diff IS exculpatory for that head specifically.
+    std::vector<double> nh_ref_sumsq(NH, 0.0);
+
+    for (uint32_t nh = 0; nh < NH; nh++) {
+        for (uint32_t hd = 0; hd < HD; hd++) {
+            for (uint32_t dp = 0; dp < D_POS; dp++) {
+                size_t idx = ((size_t)nh * HD + hd) * D_POS + dp;
+                float d = fabsf(shadow[idx] - ref[idx]);
+                dp_abs_sum[dp] += d;
+                nh_abs_sum[nh] += d;
+                nh_ref_sumsq[nh] += (double)ref[idx] * (double)ref[idx];
+                if (d > dp_max_abs[dp]) {
+                    dp_max_abs[dp] = d;
+                    dp_max_nh[dp]  = nh;
+                    dp_max_hd[dp]  = hd;
+                }
+            }
+        }
+    }
+
+    // Top-N dp buckets by total |diff| — manual partial selection (no
+    // <algorithm> dependency: this file is textually #include'd and keeping
+    // its header footprint minimal avoids surprises in the parent TU).
+    const uint32_t N = (D_POS < 10) ? D_POS : 10;
+    std::vector<uint8_t> taken(D_POS, 0);
+    NSLog(@"[BW_VERIFY_L1][RELR_FORENSICS] layer=%u NH=%u HD=%u D_POS=%u TL=%u — top-%u dp buckets by total|diff| (sum over all nh,hd):",
+          layer_idx, NH, HD, D_POS, TL, N);
+    for (uint32_t rank = 0; rank < N; rank++) {
+        uint32_t best_dp = 0; double best_sum = -1.0;
+        for (uint32_t dp = 0; dp < D_POS; dp++) {
+            if (!taken[dp] && dp_abs_sum[dp] > best_sum) { best_sum = dp_abs_sum[dp]; best_dp = dp; }
+        }
+        taken[best_dp] = 1;
+        const char* flag = "";
+        if (best_dp == 0)                flag = "  <-- dp=0";
+        else if (best_dp == D_POS - 1)    flag = "  <-- dp=D_POS-1";
+        else if (TL > 0 && best_dp == TL - 1) flag = "  <-- dp==TL-1 (window edge)";
+        else if (best_dp == TL)          flag = "  <-- dp==TL (window edge+1)";
+        NSLog(@"[BW_VERIFY_L1][RELR_FORENSICS]   #%u dp=%u sum|diff|=%.6e max|diff|=%.6e @(nh=%u,hd=%u)%s",
+              rank, best_dp, dp_abs_sum[best_dp], dp_max_abs[best_dp],
+              dp_max_nh[best_dp], dp_max_hd[best_dp], flag);
+    }
+    NSLog(@"[BW_VERIFY_L1][RELR_FORENSICS] layer=%u per-head (nh) sum|diff| + mpsgraph_ref L2 norm (summed/computed over all hd,dp):", layer_idx);
+    for (uint32_t nh = 0; nh < NH; nh++) {
+        float ref_norm = sqrtf((float)nh_ref_sumsq[nh]);
+        NSLog(@"[BW_VERIFY_L1][RELR_FORENSICS]   nh=%u sum|diff|=%.6e mpsgraph_ref_norm=%.6e%s",
+              nh, nh_abs_sum[nh], ref_norm,
+              (ref_norm < 1e-6f) ? "  <-- ref itself ~0 here (no signal to lose)" : "");
+    }
+}
+
 // Print rel_err(shadow metal_bw_layer(layer_idx), MPSGraph reference) for d_h and
 // every weight-grad tensor layer_idx owns. Tolerance 1e-4 per design doc §5.1,
 // OR-ed with an absolute floor (abs_floor) so FP32 accumulation-order noise on
@@ -258,7 +393,8 @@ static float nncp_bw_verify_l1_abs_err(const float* ref, const float* got, size_
 // tiny enough that rel still exceeds tolerance").
 static void nncp_bw_verify_l1_report(OnlineTrainer* tr, uint32_t layer_idx,
                                       bool is_enwik8, uint32_t FFN1_MULT,
-                                      bool accumulate_weight_grads) {
+                                      bool accumulate_weight_grads,
+                                      bool is_first_processed_layer) {
     if (!g_bw_verify_l1_shadow_ok || !g_bw_verify_l1_ref.captured) {
         NSLog(@"[BW_VERIFY_L1] layer=%u SKIP (shadow_ok=%d ref_captured=%d)",
               layer_idx, g_bw_verify_l1_shadow_ok, g_bw_verify_l1_ref.captured);
@@ -277,9 +413,11 @@ static void nncp_bw_verify_l1_report(OnlineTrainer* tr, uint32_t layer_idx,
         const float* got = (const float*)((const uint8_t*)[shadow_buf contents] + byte_off);
         float rel = nncp_bw_verify_l1_rel_err(ref.data(), got, n);
         float abs = nncp_bw_verify_l1_abs_err(ref.data(), got, n);
+        float shadow_norm = nncp_bw_verify_l1_l2norm(got, n);
+        float ref_norm    = nncp_bw_verify_l1_l2norm(ref.data(), n);
         bool pass = (rel < 1e-4f) || (abs < abs_floor);
-        NSLog(@"[BW_VERIFY_L1] layer=%u %-14s rel_err=%.3e max_abs=%.3e %s",
-              layer_idx, name, rel, abs, pass ? "PASS" : "FAIL");
+        NSLog(@"[BW_VERIFY_L1] layer=%u %-14s rel_err=%.3e max_abs=%.3e metal_norm=%.6e mpsgraph_norm=%.6e %s",
+              layer_idx, name, rel, abs, shadow_norm, ref_norm, pass ? "PASS" : "FAIL");
     };
 
     report_one("d_h",         sh.pl_dh,        0,          r.pl_dh,        h_size);
@@ -292,30 +430,38 @@ static void nncp_bw_verify_l1_report(OnlineTrainer* tr, uint32_t layer_idx,
     report_one("grad_b_ffn1", sh.grad_b_ffn1,  ofs.b_ffn1, r.grad_b_ffn1,  (size_t)F * FFN1_MULT);
     report_one("grad_b_ffn2", sh.grad_b_ffn2,  ofs.b_h,    r.grad_b_ffn2,  (size_t)H);
     report_one("grad_ln",     sh.grad_ln,      ofs.w_ln,   r.grad_ln,      (size_t)4 * H);
-    if (is_enwik8 && sh.grad_rel_r_all)
+    if (is_enwik8 && sh.grad_rel_r_all) {
         report_one("grad_rel_r", sh.grad_rel_r_all, ofs.w_relr, r.grad_rel_r, (size_t)NH * HD * D_POS);
+        if (nncp_bw_verify_relr_forensics_enabled() && !r.grad_rel_r.empty()) {
+            const float* got = (const float*)((const uint8_t*)[sh.grad_rel_r_all contents] + ofs.w_relr);
+            const uint32_t TL = (uint32_t)(g_nncp_profile.mem_len + BPTT_CHUNK_LEN);
+            nncp_bw_verify_l1_relr_forensics(layer_idx, got, r.grad_rel_r.data(), NH, HD, D_POS, TL);
+        }
+    }
     // grad_b_rel_r is TIED/SHARED across all 20 layers (not a per-layer slice
-    // like the tensors above). The reference capture point (i == L-1, right
-    // after that single layer's contribution lands — see
+    // like the tensors above). The reference capture point (right after the
+    // target layer's own contribution lands — see
     // nncp_bw_verify_l1_capture_reference's comment) is only a clean,
-    // single-layer-equivalent value on the FIRST chunk of a segment
-    // (copy_grads=true / accumulate_weight_grads=false): on that chunk,
-    // layer L-1 is also the first layer to touch grad_b_rel_r this segment,
-    // so is_copy_shared=true there and the captured value really is "layer
-    // L-1 alone" — directly comparable to this single-layer shadow run. On
-    // any later chunk (accumulate_weight_grads=true), the production path's
-    // is_copy_shared is false even at i==L-1 (see run_per_layer_bptt_chunk),
-    // so what gets captured is "chunk 1's FULL 20-layer sum + chunk N's
-    // layer-L-1-alone contribution" — a quantity this single-layer shadow
-    // structurally cannot reproduce (it never sees layers 0..L-2's chunk-1
-    // contributions). Comparing there would always report a spurious FAIL
+    // single-layer-equivalent value when BOTH:
+    //   (a) this is the first chunk of a segment (accumulate_weight_grads=false
+    //       / copy_grads=true) — otherwise the reference already carries a
+    //       full prior-chunk 20-layer sum this single-layer shadow never saw, and
+    //   (b) the target layer IS L-1, the true first-processed layer in the
+    //       backward sweep — the production path's is_copy_shared (see
+    //       run_per_layer_bptt_chunk) is keyed to i==L-1, not to whichever
+    //       layer NNCP_BW_VERIFY_LAYER redirects this harness to. For any
+    //       other target layer, is_copy_shared is false even on chunk 1, so
+    //       the captured value already includes layer L-1..target+1's
+    //       contributions this single-layer shadow never computed.
+    // Comparing outside these conditions would always report a spurious FAIL
     // regardless of whether metal_bw_layer is correct, so skip it there.
     if (sh.grad_b_rel_r) {
-        if (!accumulate_weight_grads) {
+        if (!accumulate_weight_grads && is_first_processed_layer) {
             report_one("grad_b_rel_r", sh.grad_b_rel_r, 0, r.grad_b_rel_r, (size_t)NH * tr->ext_len);
         } else {
             NSLog(@"[BW_VERIFY_L1] layer=%u %-14s SKIP (tied/shared grad — reference only "
-                  @"single-layer-comparable on chunk 1 of a segment)", layer_idx, "grad_b_rel_r");
+                  @"single-layer-comparable on chunk 1 of a segment AND target_layer==L-1)",
+                  layer_idx, "grad_b_rel_r");
         }
     }
 }

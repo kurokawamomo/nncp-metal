@@ -870,6 +870,30 @@ kernel void rmsnorm_bw_gamma(
     if (lane == 0) d_gamma[i] = sum;
 }
 
+// rmsnorm_bw_gamma_acc: same as rmsnorm_bw_gamma but d_gamma[i] += sum (caller
+// zeroes the destination on the first BPTT chunk, same contract as
+// linear_bw_weight_acc_amx / linear_bw_bias_acc). Needed for grad_ln_final,
+// which — like grad_out/grad_b_out — is shared across every BPTT chunk of a
+// segment and must accumulate, not overwrite (2026-07-04 fix).
+kernel void rmsnorm_bw_gamma_acc(
+    device const float* grad_y  [[buffer(0)]],  // [B, D]
+    device const float* x       [[buffer(1)]],  // [B, D]
+    device const float* inv_rms [[buffer(2)]],  // [B]
+    device float*       d_gamma [[buffer(3)]],  // [D]
+    constant uint& B [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint i = gid / 32;
+    if (i >= D) return;
+    float partial = 0.0f;
+    for (uint b = lane; b < B; b += 32)
+        partial += grad_y[b * D + i] * x[b * D + i] * inv_rms[b];
+    float sum = simd_sum(partial);
+    if (lane == 0) d_gamma[i] += sum;
+}
+
 // B5. softmax_bw: dx[i] = y[i] * (dy[i] - sum_j dy[j]*y[j])
 //   y is the saved softmax output.
 // Dispatch: [row_count * 32, 1, 1], threadgroup [32, 1, 1]

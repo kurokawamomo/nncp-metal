@@ -102,6 +102,21 @@ static const int SEG_MAX_LAYERS      = 32;   // max layers for kv_mem arrays (su
 #define BPTT_CHUNK_LEN      (g_nncp_profile.seg_len / 2)
 #define BPTT_CHUNK_BT       (g_nncp_profile.num_streams * (g_nncp_profile.seg_len / 2))
 
+// NO-GO triage: NNCP_WQNORM_STEP=1 forces the [WQNORM] diagnostic (see the two
+// `_wq_diag` sites below) to fire on EVERY step instead of only step 0 and
+// every 2000th step, so a time series of when/which tensor's norm trajectory
+// first diverges can be captured. Unset → unchanged (sparse) behavior.
+// Declared unconditionally (not under #if NNCP_METAL_BW) since both
+// `_wq_diag` call sites exist regardless of that build flag.
+static bool nncp_wqnorm_every_step_forced() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_WQNORM_STEP");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
 // ---- Sub-structs for layer-chunked gradient checkpoint (L > 8 only) ----
 
 struct ChkFwdCtx {
@@ -269,6 +284,7 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_linear_bw_bias_acc;  // linear_bw_bias_acc (+=)
     id<MTLComputePipelineState> ps_rmsnorm_bw_x;
     id<MTLComputePipelineState> ps_rmsnorm_bw_gamma;
+    id<MTLComputePipelineState> ps_rmsnorm_bw_gamma_acc;  // rmsnorm_bw_gamma_acc (+=)
     id<MTLComputePipelineState> ps_softmax_bw;
     id<MTLComputePipelineState> ps_geglu_bw;
     id<MTLComputePipelineState> ps_geglu_bw_split;
@@ -417,6 +433,7 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_linear_bw_bias_acc = load(@"linear_bw_bias_acc");
     m2->ps_rmsnorm_bw_x       = load(@"rmsnorm_bw_x");
     m2->ps_rmsnorm_bw_gamma   = load(@"rmsnorm_bw_gamma");
+    m2->ps_rmsnorm_bw_gamma_acc = load(@"rmsnorm_bw_gamma_acc");
     m2->ps_softmax_bw         = load(@"softmax_bw");
     m2->ps_geglu_bw           = load(@"geglu_bw");
     m2->ps_geglu_bw_split     = load(@"geglu_bw_split");
@@ -443,10 +460,13 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_extract_new_kv_tail= load(@"extract_new_kv_from_mh_tail");
     m2->ps_scale_buffer       = load(@"scale_buffer");
 
-    // Gatekeeper: loss-bw requires these six kernels.
+    // Gatekeeper: loss-bw requires these kernels (weight_acc/bias_acc/gamma_acc
+    // added 2026-07-04 so grad_out/grad_b_out/grad_ln_final can accumulate
+    // across BPTT chunks instead of overwriting — see metal_bw_loss).
     if (!m2->ps_ce_softmax_fused_bw || !m2->ps_linear_bw_input ||
-        !m2->ps_linear_bw_weight || !m2->ps_linear_bw_bias ||
-        !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma) {
+        !m2->ps_linear_bw_weight || !m2->ps_linear_bw_weight_acc ||
+        !m2->ps_linear_bw_bias || !m2->ps_linear_bw_bias_acc ||
+        !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma || !m2->ps_rmsnorm_bw_gamma_acc) {
         NSLog(@"[M2] required backward kernels missing — disabling Metal-BW");
         metal_bw_destroy(m2);
         return nullptr;
@@ -492,10 +512,20 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->d_x_ln1    = newBuf(BT_H * sizeof(float));
     m2->d_x_ln2    = newBuf(BT_H * sizeof(float));
     m2->d_x_mid    = newBuf(BT_H * sizeof(float));
-    // d_q_rel_raw: [B*NH, T, D_POS]. D_POS bounded by TL across profiles
-    // (default: d_pos=32 ≤ TL=96; enwik8: d_pos=320 = TL=320). Size by BT*NH*TL as
-    // safe upper bound — same as d_scores.
-    m2->d_q_rel_raw = newBuf(BT_NH_TL * sizeof(float));
+    // d_q_rel_raw: [B*NH, T, D_POS]. Bug fix (2026-07-04, grad_rel_r
+    // forensics nh=6/7 corruption): row stride is D_POS (see
+    // rel_pe_q_scatter_bw_batched's write index `(bnh*T+ti)*D_POS+d`), not
+    // TL like d_scores/attn_prob — but this buffer was previously sized
+    // with BT_NH_TL (TL=288 for enwik8) on the stale assumption D_POS≤TL,
+    // which no longer holds (D_POS=320). Every row past the first
+    // overflowed its 288-float slot by 32 floats, corrupting whatever
+    // follows in the heap; highest-bnh threads (b*NH+h with h=6,7 being
+    // the last two, highest-bnh heads of every b-block) hit the overflow
+    // region first, matching the observed head-6/7 localization exactly.
+    // max() against BT_NH_TL kept defensively so this can't silently
+    // regress if a future profile flips which of the two is larger again.
+    const size_t d_q_rel_raw_floats = (size_t)BT * NH * D_POS;
+    m2->d_q_rel_raw = newBuf(((BT_NH_TL > d_q_rel_raw_floats) ? BT_NH_TL : d_q_rel_raw_floats) * sizeof(float));
     m2->ffn_recomp  = newBuf(BT_F * sizeof(float));
 
     // Rel-PE distance tables [T_CHUNK, TL] int32, precomputed from profile.
@@ -1190,7 +1220,6 @@ static bool metal_bw_loss(OnlineTrainer* tr,
 {
     M2BwContext* m2 = (M2BwContext*)tr->m2;
     if (!m2 || !m2->allocated) return false;
-    (void)copy_grads;
 
     const uint32_t BT = m2->BT;
     const uint32_t H  = tr->H;
@@ -1198,6 +1227,17 @@ static bool metal_bw_loss(OnlineTrainer* tr,
     const bool is_enwik8 = m2->is_enwik8;
     const float eps = 1e-5f;
     const float inv_bt = 1.0f / (float)BT;
+
+    // Bug fix (2026-07-04, take 2): metal_bw_loss no longer writes
+    // grad_out/grad_b_out/grad_ln_final at all — see the caller-side comment
+    // at the MPSGraph loss-bw block (run_per_layer_bptt_chunk) for why take 1
+    // (memset-then-accumulate here, skip the MPSGraph write) was unsafe. The
+    // MPSGraph loss-bw graph, which always runs regardless of which backward
+    // path handles the per-layer grads, already computes and correctly
+    // accumulates these three tensors — metal_bw_loss's job is reduced to
+    // its one truly-required output: tr->pl_dh (the upstream gradient
+    // metal_bw_layer's layer L-1 needs). `copy_grads` is unused here now.
+    (void)copy_grads;
 
     id<MTLLibrary> lib = [tr->device newDefaultLibrary];
     if (!lib) {
@@ -1281,28 +1321,9 @@ static bool metal_bw_loss(OnlineTrainer* tr,
         [enc dispatchThreadgroups:MTLSizeMake(K/8, M/8, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
-    {
-        [enc setComputePipelineState:m2->ps_linear_bw_weight];
-        [enc setBuffer:x_after_ln     offset:0 atIndex:0];
-        [enc setBuffer:m2->logits_buf offset:0 atIndex:1];
-        [enc setBuffer:tr->grad_out   offset:0 atIndex:2];
-        uint32_t M = BT, K = H, N = V;
-        [enc setBytes:&M length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&K length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(N/8, K/8, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    }
-    {
-        [enc setComputePipelineState:m2->ps_linear_bw_bias];
-        [enc setBuffer:m2->logits_buf offset:0 atIndex:0];
-        [enc setBuffer:tr->grad_b_out offset:0 atIndex:1];
-        uint32_t M = BT, N = V;
-        [enc setBytes:&M length:sizeof(uint32_t) atIndex:2];
-        [enc setBytes:&N length:sizeof(uint32_t) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(N*32, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    }
+    // grad_out/grad_b_out are NOT computed here (take 2, see comment above) —
+    // the MPSGraph loss-bw path owns them exclusively. Only d_x (feeding
+    // pl_dh below) is needed from this projection's backward.
 
     if (is_enwik8) {
         [enc setComputePipelineState:m2->ps_rmsnorm_bw_x];
@@ -1314,17 +1335,9 @@ static bool metal_bw_loss(OnlineTrainer* tr,
         [enc setBytes:&H length:sizeof(uint32_t) atIndex:5];
         [enc dispatchThreads:MTLSizeMake(BT * 32, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-        [enc setComputePipelineState:m2->ps_rmsnorm_bw_gamma];
-        [enc setBuffer:m2->x_ln_final    offset:0 atIndex:0];
-        [enc setBuffer:tr->pl_h[tr->L]   offset:0 atIndex:1];
-        [enc setBuffer:m2->inv_rms_final offset:0 atIndex:2];
-        [enc setBuffer:tr->grad_ln_final offset:0 atIndex:3];
-        uint32_t Bn = BT;
-        [enc setBytes:&Bn length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&H  length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(H * 32, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        // grad_ln_final's gamma is NOT computed here (take 2, see comment
+        // above) — the MPSGraph loss-bw path owns it exclusively. Only
+        // tr->pl_dh (written just above) is needed from this LN's backward.
     }
 
     [enc endEncoding];
@@ -5795,6 +5808,21 @@ static bool nncp_fwd_dump_verify_enabled() {
     return v != 0;
 }
 
+// NO-GO triage kill-switch: NNCP_METAL_BW_DISABLE=1 forces metal_bw_train_step
+// to be skipped even when its PSOs/preconditions are otherwise satisfied,
+// falling back to the always-available MPSGraph "Phase M-Readback" path (the
+// same fallback already taken when a PSO fails to load). Lets an A/B run
+// isolate whether an NNCP_METAL_BW=1 build's regression comes from the Metal
+// backward computation itself, or from something else that changed behavior
+// under #if NNCP_METAL_BW outside of backward (optimizer/clip/loss/retrain/KV
+// paths — see the grep enumeration in the accompanying report). Unset →
+// unchanged (Metal backward runs whenever its own preconditions allow it).
+static bool nncp_metal_bw_disabled() {
+    static int v = -1;
+    if (v < 0) v = (getenv("NNCP_METAL_BW_DISABLE") && getenv("NNCP_METAL_BW_DISABLE")[0] == '1') ? 1 : 0;
+    return v != 0;
+}
+
 // Bug fix (2026-07-03, metric hypothesis): the original `denom = max(|ref|, 1e-6)`
 // floor is far too small. For zero-crossing tensors (q ~ N(0, small var) at init,
 // GELU's near-zero region for geglu_val, linear residual outputs) a handful of
@@ -6079,6 +6107,115 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
     fwd_dump_check(layer, "final_out(x_out)", final_out.data(), (const float*)[tr->pl_h[layer + 1] contents], (size_t)BT * H);
 }
 #endif // NNCP_METAL_BW
+
+// NO-GO triage: NNCP_STATE_NORM_STEP=1. WQNORM tracks only the gradient at
+// step N; it says nothing about the STATE (weights / KV memory / optimizer
+// moments) the gradient gets applied to or the state carried into step N+1.
+// The 30seg trajectory being byte-identical before/after bug-4's fix, despite
+// all 12 WQNORM gradient tensors matching bit-exact at step 1, means step 2's
+// 4.5% divergence must come from something WQNORM never captures: a piece of
+// STATE that already differs right after step 1's weight update completes.
+// This dumps L2 norms of every weight tensor, both KV memory buffers (the
+// per-segment scratch AND the persisted cross-segment carry — see
+// tr->kv_mem_buf_k/v vs tr->kv_pre_seg_buf_k/v), and every RMSProp 2nd-moment
+// buffer, in one line, right after the optimizer's command buffer completes
+// (weights are GPU-updated and CPU-readable at that point). Comparing B/C's
+// first line names which state diverges first.
+static bool nncp_state_norm_step_forced() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_STATE_NORM_STEP");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+static float nncp_l2norm_buf(id<MTLBuffer> b, size_t n) {
+    if (!b) return -1.0f;  // sentinel: buffer doesn't exist / not applicable
+    const float* p = (const float*)[b contents];
+    double s = 0.0;
+    for (size_t i = 0; i < n; i++) s += (double)p[i] * (double)p[i];
+    return sqrtf((float)s);
+}
+
+static void nncp_state_norm_dump(OnlineTrainer* tr, const MPSTransformerWeightBuffers& wb,
+                                  uint64_t step_num) {
+    const uint32_t L = tr->L, H = tr->H, F = tr->F, V = tr->V, NH = tr->NH, HD = tr->HD, D_POS = tr->d_pos;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const size_t FFN1_MULT = is_enwik8 ? 2UL : 1UL;
+
+    // --- ① weight tensors ---
+    float wq   = nncp_l2norm_buf(wb.attn_q,   (size_t)L * H * H);
+    float wk   = nncp_l2norm_buf(wb.attn_k,   (size_t)L * H * H);
+    float wv   = nncp_l2norm_buf(wb.attn_v,   (size_t)L * H * H);
+    float wo   = nncp_l2norm_buf(wb.attn_out, (size_t)L * H * H);
+    float wf1  = nncp_l2norm_buf(wb.ffn1,     (size_t)L * H * F * FFN1_MULT);
+    float wf2  = nncp_l2norm_buf(wb.ffn2,     (size_t)L * F * H);
+    float wbf1 = nncp_l2norm_buf(wb.b_ffn1,   (size_t)L * F * FFN1_MULT);
+    float wbf2 = nncp_l2norm_buf(wb.b_ffn2,   (size_t)L * H);
+    float wln  = nncp_l2norm_buf(wb.ln,       (size_t)L * 4 * H);
+    float wlnf = nncp_l2norm_buf(wb.ln_final, (size_t)2 * H);
+    float wrelr  = is_enwik8
+        ? nncp_l2norm_buf(wb.w_rel_r_all, (size_t)L * NH * HD * D_POS)
+        : nncp_l2norm_buf(wb.w_rel_r,     (size_t)NH * HD * D_POS);
+    float wbrelr = nncp_l2norm_buf(wb.b_rel_r, (size_t)NH * tr->ext_len);
+    float wembed = nncp_l2norm_buf(wb.embed, (size_t)V * H);
+    // w_out tied to embed in some profiles — same underlying buffer means "tied",
+    // report a sentinel rather than a redundant (and misleading if compared
+    // naively) duplicate norm.
+    float wout   = (wb.out_proj == wb.embed) ? -2.0f : nncp_l2norm_buf(wb.out_proj, (size_t)H * V);
+    float wbout  = nncp_l2norm_buf(wb.b_out, (size_t)V);
+
+    // --- ② KV memory buffers (aggregate over all layers) ---
+    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+    double kvmem_k_sq = 0.0, kvmem_v_sq = 0.0, kvpseg_k_sq = 0.0, kvpseg_v_sq = 0.0;
+    for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+        auto accum = [&](id<MTLBuffer> b, double& acc) {
+            if (!b) return;
+            const float* p = (const float*)[b contents];
+            for (size_t i = 0; i < MEM_SLOTS * H; i++) acc += (double)p[i] * (double)p[i];
+        };
+        accum(tr->kv_mem_buf_k[li],     kvmem_k_sq);
+        accum(tr->kv_mem_buf_v[li],     kvmem_v_sq);
+        accum(tr->kv_pre_seg_buf_k[li], kvpseg_k_sq);
+        accum(tr->kv_pre_seg_buf_v[li], kvpseg_v_sq);
+    }
+    float kvmem_k  = sqrtf((float)kvmem_k_sq);
+    float kvmem_v  = sqrtf((float)kvmem_v_sq);
+    float kvpseg_k = sqrtf((float)kvpseg_k_sq);
+    float kvpseg_v = sqrtf((float)kvpseg_v_sq);
+
+    // --- ③ optimizer moments (RMSProp 2nd moment; SGD has none — sentinels) ---
+    float vq   = nncp_l2norm_buf(tr->v_q,      (size_t)L * H * H);
+    float vk   = nncp_l2norm_buf(tr->v_k,      (size_t)L * H * H);
+    float vv   = nncp_l2norm_buf(tr->v_v,      (size_t)L * H * H);
+    float vo   = nncp_l2norm_buf(tr->v_o,      (size_t)L * H * H);
+    float vf1  = nncp_l2norm_buf(tr->v_ffn1,   (size_t)L * H * F * FFN1_MULT);
+    float vf2  = nncp_l2norm_buf(tr->v_ffn2,   (size_t)L * F * H);
+    float vbf1 = nncp_l2norm_buf(tr->v_b_ffn1, (size_t)L * F * FFN1_MULT);
+    float vbf2 = nncp_l2norm_buf(tr->v_b_ffn2, (size_t)L * H);
+    float vln  = nncp_l2norm_buf(tr->v_ln,     (size_t)L * 4 * H);
+    float vlnf = nncp_l2norm_buf(tr->v_ln_final, (size_t)2 * H);
+    float vrelr  = is_enwik8
+        ? nncp_l2norm_buf(tr->v_rel_r_all, (size_t)L * NH * HD * D_POS)
+        : nncp_l2norm_buf(tr->v_rel_r,     (size_t)NH * HD * D_POS);
+    float vbrelr = nncp_l2norm_buf(tr->v_b_rel_r, (size_t)NH * tr->ext_len);
+    float vembed = nncp_l2norm_buf(tr->v_embed, (size_t)V * H);
+    float vout   = nncp_l2norm_buf(tr->v_out,   (size_t)H * V);
+    float vbout  = nncp_l2norm_buf(tr->v_b_out, (size_t)V);
+
+    fprintf(stderr,
+        "[STATE_NORM] step=%llu "
+        "W:wq=%.9f,wk=%.9f,wv=%.9f,wo=%.9f,wffn1=%.9f,wffn2=%.9f,wbffn1=%.9f,wbffn2=%.9f,"
+        "wln=%.9f,wlnf=%.9f,wrelr=%.9f,wbrelr=%.9f,wembed=%.9f,wout=%.9f,wbout=%.9f "
+        "KV:kvmemk=%.9f,kvmemv=%.9f,kvpsegk=%.9f,kvpsegv=%.9f "
+        "OPT:vq=%.9f,vk=%.9f,vv=%.9f,vo=%.9f,vffn1=%.9f,vffn2=%.9f,vbffn1=%.9f,vbffn2=%.9f,"
+        "vln=%.9f,vlnf=%.9f,vrelr=%.9f,vbrelr=%.9f,vembed=%.9f,vout=%.9f,vbout=%.9f\n",
+        (unsigned long long)step_num,
+        wq, wk, wv, wo, wf1, wf2, wbf1, wbf2, wln, wlnf, wrelr, wbrelr, wembed, wout, wbout,
+        kvmem_k, kvmem_v, kvpseg_k, kvpseg_v,
+        vq, vk, vv, vo, vf1, vf2, vbf1, vbf2, vln, vlnf, vrelr, vbrelr, vembed, vout, vbout);
+}
 
 static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const MPSTransformerWeightBuffers& wb,
@@ -6387,6 +6524,32 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     }
 #endif
 
+    // Bug fix (2026-07-04, take 2 — STATE_NORM sn2: wout still diverges,
+    // vout=0 persists even after making metal_bw_loss accumulate-aware).
+    // The "skip MPSGraph's write, let metal_bw_loss own it" design (take 1)
+    // was unsafe: metal_bw_loss's zero-init memset runs synchronously on the
+    // CPU the moment metal_bw_loss is called, but the GPU dispatches that are
+    // supposed to refill grad_out/grad_b_out/grad_ln_final are encoded into
+    // the SAME cmd_buf as Stage 3 (per-layer) / Stage 4 (embed) of
+    // metal_bw_train_step — and the caller only commits+waits that cmd_buf
+    // if metal_bw_train_step returns true all the way through. If ANY later
+    // stage fails (metal_bw_layer/metal_bw_embed have preconditions this
+    // predicate can't cheaply mirror), the whole cmd_buf is discarded
+    // uncommitted — but the CPU-side memset already zeroed the buffers, and
+    // with the MPSGraph write skipped there is no fallback to refill them.
+    // Net effect: grad_out/grad_b_out/grad_ln_final go to zero and STAY zero
+    // (matching "vout=0" persisting across the whole run, not just chunk 2).
+    //
+    // Fix (take 2): stop trying to give metal_bw_loss ownership at all.
+    // metal_bw_loss's only externally-required output is tr->pl_dh (the
+    // upstream gradient metal_bw_layer's layer L-1 needs) — grad_out/
+    // grad_b_out/grad_ln_final are computed there too, but redundantly: the
+    // MPSGraph loss-bw immediately below already computes and correctly
+    // accumulates (copy_grads-aware) the exact same three tensors, and always
+    // runs regardless of which backward path handles the per-layer grads.
+    // metal_bw_loss no longer touches any of the three (see its own updated
+    // comment) — so the MPSGraph write here is unconditional again, exactly
+    // as it was before today's earlier (unsafe) change.
     // ---- Loss backward: LN_FINAL + CE ----
     float loss_val = 0.0f;
     @autoreleasepool {
@@ -6417,18 +6580,13 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         putGrad(tr->grad_b_out,    res[lg.db_out]);
     }
 
-#if NNCP_METAL_BW
-    // Phase B verify: run metal_bw_layer(L-1) against a shadow tr *before* the
-    // MPSGraph reference loop below mutates tr->pl_dh, using tr->pl_dh's current
-    // (pristine, post-loss-bw) value as input. See online_trainer_verify_l1.inc.
-    // accumulate_weight_grads must mirror this chunk's copy_grads state — see
-    // the bug-fix comment on nncp_bw_verify_l1_run_shadow's definition: the
-    // MPSGraph reference accumulates across BPTT chunks within a segment
-    // exactly like the production path, so the shadow must too.
-    if (dump_inter && nncp_bw_verify_l1_enabled()) {
-        nncp_bw_verify_l1_run_shadow(tr, &wb, L - 1, is_enwik8, (uint32_t)FFN1_MULT, /*accumulate_weight_grads=*/!copy_grads);
-    }
-#endif
+    // (Phase B verify's shadow run moved inside the Phase M-Readback loop below —
+    // see the `i == (int)nncp_bw_verify_l1_target_layer(L)` hook. It must run at
+    // the top of that layer's own iteration, using tr->pl_dh's value AT THAT POINT
+    // in the backward sweep, not the pristine post-loss-bw value: that value is
+    // only correct for the deepest layer L-1 processed first — any other target
+    // layer's true incoming d_h only exists after the reference has propagated
+    // through the layers above it. See online_trainer_verify_l1.inc.)
 
     // ---- Backward pass: 20 layers (reversed) ----
 #if NNCP_METAL_BW
@@ -6438,8 +6596,12 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         id<MTLCommandBuffer> cmd_buf = [tr->cmdQueue commandBufferWithUnretainedReferences];
         // Verify mode always runs the MPSGraph reference path below (never the fast
         // full-Metal path) so layer L-1's reference value is available to compare
-        // against the shadow run above.
-        if (!nncp_bw_verify_l1_enabled() &&
+        // against the shadow run above. NNCP_METAL_BW_DISABLE=1 is a separate,
+        // explicit kill-switch for the same fallback (NO-GO A/B triage — see
+        // nncp_metal_bw_disabled()'s comment): unlike verify mode it doesn't
+        // also enable the BW_VERIFY_L1 shadow/reference machinery, it just
+        // forces every step down the MPSGraph path.
+        if (!nncp_bw_verify_l1_enabled() && !nncp_metal_bw_disabled() &&
             cmd_buf && metal_bw_train_step(tr, &wb, cmd_buf, accumulate_weight_grads)) {
             [cmd_buf commit];
             [cmd_buf waitUntilCompleted];
@@ -6457,8 +6619,42 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         tr->rbs_q && tr->rbs_k && tr->rbs_v && tr->rbs_o &&
         tr->rbs_ffn1 && tr->rbs_ffn2 && tr->rbs_b_ffn1 && tr->rbs_b_ffn2 &&
         tr->rbs_ln && tr->rbs_rel_r && tr->rbs_b_rel_r && tr->rbs_dh_next;
+#if NNCP_METAL_BW
+    const uint32_t verify_target_layer = nncp_bw_verify_l1_enabled()
+        ? nncp_bw_verify_l1_target_layer(L) : 0;
+#endif
     for (int i = (int)L - 1; i >= 0; i--) {
         @autoreleasepool {
+#if NNCP_METAL_BW
+            // Phase B verify: run metal_bw_layer(target_layer) against a shadow tr
+            // right at the top of THIS layer's own iteration, using tr->pl_dh's
+            // value at this exact point in the backward sweep — for target_layer
+            // == L-1 that's the pristine post-loss-bw value (as before); for any
+            // other target_layer it's the value the reference itself is about to
+            // consume as its own d(pl_h[target_layer+1]) input, i.e. already
+            // correctly propagated through every layer above it. Mutating pl_dh
+            // for THIS iteration happens further down, after this hook.
+            //
+            // Bug fix (2026-07-03): when target_layer < L-1, the prior L-1-target
+            // iterations' GPU writes into pl_dh (the use_gpu_readback blit further
+            // down each iteration) are committed WITHOUT waitUntilCompleted — the
+            // Phase M-Readback loop relies on same-queue FIFO ordering for later
+            // *GPU* reads, but nncp_bw_verify_l1_run_shadow does a CPU-side
+            // [buf contents] memcpy, which has no such ordering guarantee against
+            // still-in-flight commits. Every other CPU readback in this loop
+            // (nncp_bw_verify_l1_capture_reference below) already fences first —
+            // this hook needs the same fence, and needed it more visibly the
+            // deeper target_layer is (more prior async iterations pending),
+            // matching the observed layer19-exact / layer10-2e-2 / layer0-3e-2
+            // growing-divergence signature exactly.
+            if (dump_inter && nncp_bw_verify_l1_enabled() && i == (int)verify_target_layer) {
+                id<MTLCommandBuffer> shadow_fence = [tr->cmdQueue commandBuffer];
+                [shadow_fence commit];
+                [shadow_fence waitUntilCompleted];
+                nncp_bw_verify_l1_run_shadow(tr, &wb, verify_target_layer, is_enwik8,
+                                              (uint32_t)FFN1_MULT, /*accumulate_weight_grads=*/!copy_grads);
+            }
+#endif
             NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
             PerLayerBwdGraph& bg = tr->pl_bwd;
             // Same weight feeds as forward, but use bwd graph placeholders
@@ -6626,18 +6822,26 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 }
             }
 #if NNCP_METAL_BW
-            // Phase B verify: capture the just-written reference for layer L-1 before
-            // the next iteration (layer L-2) overwrites tr->pl_dh / adds into the
-            // shared tr->grad_b_rel_r. See online_trainer_verify_l1.inc.
-            if (nncp_bw_verify_l1_enabled() && i == (int)L - 1) {
+            // Phase B verify: capture the just-written reference for the target
+            // layer before the next iteration overwrites tr->pl_dh / adds into the
+            // shared tr->grad_b_rel_r. See online_trainer_verify_l1.inc. Note:
+            // the grad_b_rel_r "is_copy_shared" semantics above are keyed to the
+            // true first-processed layer (L-1), not verify_target_layer — when
+            // verify_target_layer != L-1, grad_b_rel_r's report is skipped
+            // regardless of accumulate_weight_grads (see nncp_bw_verify_l1_report),
+            // since the single-layer shadow can only ever reproduce a tied/shared
+            // grad's reference value when the target IS the first-processed layer.
+            if (nncp_bw_verify_l1_enabled() && i == (int)verify_target_layer) {
                 if (use_gpu_readback) {
                     // GPU-resident path commits async; force completion before CPU read.
                     id<MTLCommandBuffer> vfence = [tr->cmdQueue commandBuffer];
                     [vfence commit];
                     [vfence waitUntilCompleted];
                 }
-                nncp_bw_verify_l1_capture_reference(tr, (uint32_t)i, is_enwik8, (uint32_t)FFN1_MULT);
-                nncp_bw_verify_l1_report(tr, (uint32_t)i, is_enwik8, (uint32_t)FFN1_MULT, /*accumulate_weight_grads=*/!copy_grads);
+                nncp_bw_verify_l1_capture_reference(tr, verify_target_layer, is_enwik8, (uint32_t)FFN1_MULT);
+                nncp_bw_verify_l1_report(tr, verify_target_layer, is_enwik8, (uint32_t)FFN1_MULT,
+                                          /*accumulate_weight_grads=*/!copy_grads,
+                                          /*is_first_processed_layer=*/(verify_target_layer == L - 1));
             }
 #endif
         }
@@ -7068,7 +7272,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         float avg_loss = (loss1 + loss2) * 0.5f;
 
         // [WQNORM-DIAG]
-        bool _wq_diag = (tr->train_step == 0) || ((tr->train_step + 1ULL) % 2000 == 0);
+        bool _wq_diag = nncp_wqnorm_every_step_forced() ||
+                        (tr->train_step == 0) || ((tr->train_step + 1ULL) % 2000 == 0);
         if (_wq_diag) {
             size_t n = (size_t)L * (size_t)H * (size_t)H;
             auto lnorm = [](id<MTLBuffer> b, size_t n_) -> float {
@@ -7085,9 +7290,25 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                 : lnorm(tr->grad_rel_r,     (size_t)tr->NH * tr->HD * tr->d_pos);
             float gnorm_ffn1  = lnorm(tr->grad_ffn1,     (size_t)L * H * F * FFN1_MULT);
             float gnorm_embed = lnorm(tr->grad_embed,    (size_t)V * H);
-            fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f\n",
+            // NO-GO triage: b_rel_r is TIED/SHARED across all 20 layers (unlike
+            // every other tensor above, which is a per-layer slice) — its
+            // all-20-layer accumulation is the one code path BW_VERIFY_L1's
+            // single-layer isolation structurally cannot exercise (see
+            // nncp_bw_verify_l1_report's grad_b_rel_r skip-gate comment in
+            // online_trainer_verify_l1.inc). Added here alongside grad_ln/
+            // grad_ffn2/grad_b_ffn1/grad_b_ffn2 so a 3-way (MPSGraph vs Metal
+            // vs Metal+kill-switch) WQNORM diff can localize which tensor's
+            // trajectory first splits.
+            float gnorm_b_relr = lnorm(tr->grad_b_rel_r, (size_t)tr->NH * tr->ext_len);
+            float gnorm_ln     = lnorm(tr->grad_ln,      (size_t)L * 4 * H);
+            float gnorm_ffn2   = lnorm(tr->grad_ffn2,    (size_t)L * F * H);
+            float gnorm_b_ffn1 = lnorm(tr->grad_b_ffn1,  (size_t)L * F * FFN1_MULT);
+            float gnorm_b_ffn2 = lnorm(tr->grad_b_ffn2,  (size_t)L * H);
+            fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f "
+                    "gbrelr=%.9f gln=%.9f gffn2=%.9f gbffn1=%.9f gbffn2=%.9f\n",
                     (unsigned long long)(tr->train_step + 1),
-                    gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed);
+                    gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed,
+                    gnorm_b_relr, gnorm_ln, gnorm_ffn2, gnorm_b_ffn1, gnorm_b_ffn2);
         }
 
         if (tr->ps_rmsprop || tr->ps_sgd) {
@@ -7109,6 +7330,19 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             }
 
             clip_gradients(tr, tr->grad_clip);
+
+            // NO-GO triage: grad_out/grad_b_out/grad_ln_final norms as fed to
+            // the optimizer (post-clip — this is exactly what apply_rmsprop/
+            // apply_sgd below consumes). Direct visibility into the tensors
+            // at the center of the metal_bw_loss double-write bug, separate
+            // from nncp_state_norm_dump's post-update weight/KV/moment dump.
+            if (nncp_state_norm_step_forced()) {
+                float gout  = nncp_l2norm_buf(tr->grad_out,      (size_t)H * V);
+                float gbout = nncp_l2norm_buf(tr->grad_b_out,    (size_t)V);
+                float glnf  = nncp_l2norm_buf(tr->grad_ln_final, (size_t)2 * H);
+                fprintf(stderr, "[STATE_NORM] step=%llu PRE_OPT gout=%.9f gbout=%.9f glnf=%.9f\n",
+                        (unsigned long long)_eff_step, gout, gbout, glnf);
+            }
 
             id<MTLCommandBuffer>         cmd = [tr->cmdQueue commandBufferWithUnretainedReferences];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -7160,6 +7394,10 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+        }
+        if (nncp_state_norm_step_forced()) {
+            const uint64_t _state_step = tr->is_retrain ? tr->retrain_train_step : tr->train_step;
+            nncp_state_norm_dump(tr, wb, _state_step);
         }
         } // @autoreleasepool (chunked path)
         return true;
@@ -7372,7 +7610,8 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     }
 
     // [WQNORM-DIAG] raw grad norms (before clip): first step + every 2000 segments
-    bool _wq_diag = (tr->train_step == 0) ||
+    bool _wq_diag = nncp_wqnorm_every_step_forced() ||
+                    (tr->train_step == 0) ||
                     ((tr->train_step + 1ULL) % 2000 == 0);
     if (_wq_diag) {
         size_t n = (size_t)tr->L * (size_t)tr->H * (size_t)tr->H;
@@ -7406,11 +7645,23 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         float gnorm_v    = lnorm(tr->grad_v,     n);
         float gnorm_o    = lnorm(tr->grad_o,     n);
         float gnorm_relr = (g_nncp_profile.h==1024)
-            ? lnorm(tr->grad_rel_r_all, (size_t)L * tr->NH * tr->HD * tr->d_pos)
+            ? lnorm(tr->grad_rel_r_all, (size_t)tr->L * tr->NH * tr->HD * tr->d_pos)
             : lnorm(tr->grad_rel_r,     (size_t)tr->NH * tr->HD * tr->d_pos);
-        fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f\n",
+        // NO-GO triage: see the matching addition in run_per_layer_bptt_chunk's
+        // [WQNORM-DIAG] block above — grad_b_rel_r is the tied/shared,
+        // all-20-layer-accumulated tensor BW_VERIFY_L1's single-layer
+        // isolation cannot exercise, so it's the prime suspect for where a
+        // Metal-vs-MPSGraph divergence would first appear undetected.
+        float gnorm_b_relr = lnorm(tr->grad_b_rel_r, (size_t)tr->NH * tr->ext_len);
+        float gnorm_ln     = lnorm(tr->grad_ln,      (size_t)tr->L * 4 * tr->H);
+        float gnorm_ffn2   = lnorm(tr->grad_ffn2,    (size_t)tr->L * tr->F * tr->H);
+        float gnorm_b_ffn1 = lnorm(tr->grad_b_ffn1,  (size_t)tr->L * tr->F * FFN1_MULT);
+        float gnorm_b_ffn2 = lnorm(tr->grad_b_ffn2,  (size_t)tr->L * tr->H);
+        fprintf(stderr, "[WQNORM] step=%llu gq=%.9f gk=%.9f gv=%.9f go=%.9f grelr=%.9f gffn1=%.9f gembed=%.9f "
+                "gbrelr=%.9f gln=%.9f gffn2=%.9f gbffn1=%.9f gbffn2=%.9f\n",
                 (unsigned long long)(tr->train_step + 1),
-                gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed);
+                gnorm_raw, gnorm_k, gnorm_v, gnorm_o, gnorm_relr, gnorm_ffn1, gnorm_embed,
+                gnorm_b_relr, gnorm_ln, gnorm_ffn2, gnorm_b_ffn1, gnorm_b_ffn2);
     }
 
     if (tr->ps_rmsprop || tr->ps_sgd) {
