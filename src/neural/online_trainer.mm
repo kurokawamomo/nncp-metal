@@ -6046,6 +6046,20 @@ static bool nncp_metal_bw_disabled() {
     return v != 0;
 }
 
+// [BISECT④] (2026-07-05, loss-trajectory bisect): retrain-contamination
+// hypothesis (bisect③, is_retrain-gated slide skip) is dead — noslide_rt was
+// byte-identical to aonly. Next bisect: disable nncp_chunk_mem_slide
+// UNCONDITIONALLY, reverting train to bug6-before frozen-mem (chunk2 never
+// sees chunk1's own K/V at all — same pre-seg mem for both chunks). bug7
+// (B_REL_STRIDE) and bug8(A) (decode side) stay untouched. If loss recovers
+// to ~2.4-2.6, the bug is somewhere in slide's actual data movement; if not,
+// suspect bug7 or A next.
+static bool nncp_chunk_slide_disabled() {
+    static int v = -1;
+    if (v < 0) v = (getenv("NNCP_DISABLE_SLIDE") && getenv("NNCP_DISABLE_SLIDE")[0] == '1') ? 1 : 0;
+    return v != 0;
+}
+
 // Bug fix (2026-07-03, metric hypothesis): the original `denom = max(|ref|, 1e-6)`
 // floor is far too small. For zero-crossing tensors (q ~ N(0, small var) at init,
 // GELU's near-zero region for geglu_val, linear residual outputs) a handful of
@@ -8024,6 +8038,43 @@ static void nncp_slide_verify_layer(OnlineTrainer* tr, uint32_t layer, uint32_t 
             layer, max_abs, (max_abs == 0.0f) ? "PASS" : "FAIL");
 }
 
+// [SLIDE_VERIFY2] (2026-07-05, blind-spot fix): SLIDE_VERIFY above only
+// checks the APPEND side (mem[last] == chunk1_kv[last]) — it never checks
+// that the SHIFT side actually moved the right data. Captures mem[T_CHUNK:
+// MEM_LEN) (b=0) BEFORE the slide call, then after the slide compares it
+// against mem[0:MEM_LEN-T_CHUNK) — the "drop the oldest T_CHUNK, shift the
+// rest forward" half of the FIFO. A mismatch here (with SLIDE_VERIFY still
+// PASSing) would mean the shift's memmove itself is wrong even though the
+// tail append happens to land correctly.
+static std::vector<float> g_slide_verify2_before_k[SEG_MAX_LAYERS];
+static std::vector<float> g_slide_verify2_before_v[SEG_MAX_LAYERS];
+
+static void nncp_slide_verify2_capture_before(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
+    const float* mem_k = (const float*)[tr->kv_mem_buf_k[layer] contents];
+    const float* mem_v = (const float*)[tr->kv_mem_buf_v[layer] contents];
+    g_slide_verify2_before_k[layer].assign(mem_k + (size_t)T_CHUNK * H, mem_k + (size_t)MEM_LEN * H);
+    g_slide_verify2_before_v[layer].assign(mem_v + (size_t)T_CHUNK * H, mem_v + (size_t)MEM_LEN * H);
+}
+
+static void nncp_slide_verify2_check_after(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
+    const int KEEP = MEM_LEN - T_CHUNK;
+    const float* mem_k = (const float*)[tr->kv_mem_buf_k[layer] contents];
+    const float* mem_v = (const float*)[tr->kv_mem_buf_v[layer] contents];
+    float max_abs_k = 0.0f, max_abs_v = 0.0f;
+    for (size_t i = 0; i < (size_t)KEEP * H; i++) {
+        float dk = fabsf(mem_k[i] - g_slide_verify2_before_k[layer][i]);
+        float dv = fabsf(mem_v[i] - g_slide_verify2_before_v[layer][i]);
+        if (dk > max_abs_k) max_abs_k = dk;
+        if (dv > max_abs_v) max_abs_v = dv;
+    }
+    fprintf(stderr, "[SLIDE_VERIFY2] layer=%u shifted-region(k) max_abs=%.3e shifted-region(v) max_abs=%.3e  %s\n",
+            layer, max_abs_k, max_abs_v, (max_abs_k == 0.0f && max_abs_v == 0.0f) ? "PASS" : "FAIL");
+}
+
 // ---------------------------------------------------------------------------
 // Segment-level training: run ONE backward pass over a full [B, T] segment
 // ---------------------------------------------------------------------------
@@ -8075,25 +8126,21 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [drain commit];
             [drain waitUntilCompleted];
         }
-        // [BISECT] (2026-07-05, retrain-contamination hypothesis): loss
-        // trajectory bisect shows the regression starts at bug6(slide) itself
-        // (401-500: baseline 2.360 → +slide 2.997). Hypothesis: during a
-        // retrain pass (reprocessing OLD historical data with the model's
-        // CURRENT weights), chunk1_kv_buf/kv_mem_buf are the SAME live
-        // buffers decode's real-time progression uses — sliding here mixes
-        // "chunk1 of this retrain segment" into chunk2's mem exactly as
-        // intended for a live forward pass, but the pre-seg mem it slides
-        // INTO (kv_pre_seg_buf, latched from decode's actual current
-        // position) has no temporal relationship to the historical segment
-        // being retrained, making the slide's contribution a context
-        // mismatch that compounds every retrain step. Skip entirely during
-        // retrain to test this in isolation — bisect variant, not a
-        // permanent fix decision.
-        if (!tr->is_retrain) {
+        // [BISECT③/④] retrain-only gate (bisect③, now confirmed dead —
+        // noslide_rt was byte-identical to aonly) kept as an inert special
+        // case of the more general bisect④ gate below (is_retrain implies
+        // slide-disabled either way once NNCP_DISABLE_SLIDE isn't set, so
+        // this condition alone no longer changes behavior — the real
+        // toggle is nncp_chunk_slide_disabled()).
+        if (!tr->is_retrain && !nncp_chunk_slide_disabled()) {
+            static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
+            if (nncp_c1kv_verify_enabled()) {
+                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify2_capture_before(tr, li, H);
+            }
             nncp_chunk_mem_slide(tr, H);  // bug 6 fix: chunk1's K/V slides into chunk2's mem (A-only baseline)
             if (nncp_c1kv_verify_enabled()) {
-                static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
                 for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
+                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify2_check_after(tr, li, H);
             }
         }
         float loss2 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
