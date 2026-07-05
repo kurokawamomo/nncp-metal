@@ -8075,10 +8075,26 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [drain commit];
             [drain waitUntilCompleted];
         }
-        nncp_chunk_mem_slide(tr, H);  // bug 6 fix: chunk1's K/V slides into chunk2's mem (A-only baseline)
-        if (nncp_c1kv_verify_enabled()) {
-            static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
-            for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
+        // [BISECT] (2026-07-05, retrain-contamination hypothesis): loss
+        // trajectory bisect shows the regression starts at bug6(slide) itself
+        // (401-500: baseline 2.360 → +slide 2.997). Hypothesis: during a
+        // retrain pass (reprocessing OLD historical data with the model's
+        // CURRENT weights), chunk1_kv_buf/kv_mem_buf are the SAME live
+        // buffers decode's real-time progression uses — sliding here mixes
+        // "chunk1 of this retrain segment" into chunk2's mem exactly as
+        // intended for a live forward pass, but the pre-seg mem it slides
+        // INTO (kv_pre_seg_buf, latched from decode's actual current
+        // position) has no temporal relationship to the historical segment
+        // being retrained, making the slide's contribution a context
+        // mismatch that compounds every retrain step. Skip entirely during
+        // retrain to test this in isolation — bisect variant, not a
+        // permanent fix decision.
+        if (!tr->is_retrain) {
+            nncp_chunk_mem_slide(tr, H);  // bug 6 fix: chunk1's K/V slides into chunk2's mem (A-only baseline)
+            if (nncp_c1kv_verify_enabled()) {
+                static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
+                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
+            }
         }
         float loss2 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
         float avg_loss = (loss1 + loss2) * 0.5f;
