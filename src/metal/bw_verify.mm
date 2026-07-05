@@ -99,6 +99,20 @@ struct Mtl {
         if (!p) { fprintf(stderr, "pso err: %s\n", e.localizedDescription.UTF8String); exit(1); }
         return p;
     }
+    // FP16 helpers — kv_memory_shift_to/from_scratch operate on `half` (the
+    // real KV cache dtype), not float like the other kernels here.
+    id<MTLBuffer> bufH(size_t nhalf) {
+        return [dev newBufferWithLength:nhalf * sizeof(__fp16)
+                                options:MTLResourceStorageModeShared];
+    }
+    id<MTLBuffer> bufHFrom(const std::vector<__fp16>& v) {
+        id<MTLBuffer> b = bufH(v.size());
+        memcpy([b contents], v.data(), v.size() * sizeof(__fp16));
+        return b;
+    }
+    void readIntoH(id<MTLBuffer> b, std::vector<__fp16>& v) {
+        memcpy(v.data(), [b contents], v.size() * sizeof(__fp16));
+    }
 };
 
 static Mtl g_mtl;
@@ -206,6 +220,21 @@ static void record(const char* name, const std::vector<float>& gpu,
     printf("  %-22s  N=%-8u  max_abs=%.3e  max_rel=%.3e  sha=%s  %s\n",
            name, r.total_elems, ma, mr, r.sha.substr(0,16).c_str(),
            r.ok ? "OK" : "FAIL");
+}
+
+// Bit-exact comparison for synthetic-integer-pattern half-buffer tests (kv
+// shift kernels are pure data movement — no arithmetic — so an exact match
+// is expected, not just "close").
+static void recordExactH(const char* name, const std::vector<__fp16>& gpu,
+                          const std::vector<__fp16>& ref) {
+    std::vector<float> gpuf(gpu.size()), reff(ref.size());
+    for (size_t i = 0; i < gpu.size(); i++) { gpuf[i] = (float)gpu[i]; reff[i] = (float)ref[i]; }
+    float ma = max_abs_err(reff.data(), gpuf.data(), reff.size());
+    bool ok = (ma == 0.0f);
+    Result r{name, (uint)ref.size(), ma, ma, sha_of(gpuf.data(), gpuf.size()), ok};
+    g_results.push_back(r);
+    printf("  %-22s  N=%-8u  max_abs=%.3e  (bit-exact expected)  sha=%s  %s\n",
+           name, r.total_elems, ma, r.sha.substr(0,16).c_str(), r.ok ? "OK" : "FAIL");
 }
 
 static void dispatch_tg(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
@@ -626,6 +655,96 @@ static void cpu_attn_val_bw(const float* d_attn_out, const float* attn_prob,
                 ds[t*TL+tl] = s;
             }
     }
+}
+
+// CPU reference for the 2-stage kv_memory_shift_to_scratch/from_scratch pair
+// (bug 8 fix (A), neural_net.metal): new mem = [old_mem[seg_len:memory_len]
+// (drop oldest seg_len) ++ current[0:seg_len] (append all of current)].
+// Mirrors the kernels' index math exactly (see neural_net.metal comment).
+static void cpu_kv_memory_shift(const std::vector<__fp16>& kv_in, std::vector<__fp16>& kv_out,
+                                 uint num_lb, uint total_len, uint memory_len, uint seg_len, uint H) {
+    kv_out = kv_in;  // current region [memory_len:total_len) is untouched by these kernels
+    for (uint lb = 0; lb < num_lb; lb++) {
+        for (uint pos = 0; pos < memory_len; pos++) {
+            uint src_pos = (pos < memory_len - seg_len)
+                ? (pos + seg_len)
+                : (memory_len + (pos - (memory_len - seg_len)));
+            for (uint h = 0; h < H; h++) {
+                kv_out[lb*total_len*H + pos*H + h] = kv_in[lb*total_len*H + src_pos*H + h];
+            }
+        }
+    }
+}
+
+// [SHIFT_VERIFY] (2026-07-05, urgent — A-only also regressed, and this shift
+// kernel pair is the one common factor between the unified and A-only
+// worlds that had NO bw_verify coverage yet). Synthetic pattern: every
+// (lb, pos, h) cell gets a UNIQUE small integer (exact in fp16, no rounding)
+// so any stride/index bug shows up as an exact mismatch, not a tolerance
+// judgment call. Covers multiple "layers" AND multiple "streams" folded into
+// num_lb (the kernels treat num_lb as one flat dimension — see
+// neural_net.metal, no separate layer/batch stride inside the kernel — so
+// enumerating several distinct lb values with unique-per-cell content is
+// sufficient to catch any lb-indexing bug without needing a separate
+// layer-stride vs batch-stride test).
+static void run_kv_memory_shift(Rng&) {
+    const uint num_layers = 2, batch = 3, num_lb = num_layers * batch;  // 6 distinct (layer,stream) slots
+    const uint memory_len = 8, seg_len = 3, total_len = memory_len + seg_len;  // 11
+    const uint H = 4;
+
+    std::vector<__fp16> kv_k(num_lb * total_len * H), kv_v(num_lb * total_len * H);
+    for (uint lb = 0; lb < num_lb; lb++)
+        for (uint pos = 0; pos < total_len; pos++)
+            for (uint h = 0; h < H; h++) {
+                float v = (float)(lb*100 + pos*5 + h);
+                kv_k[lb*total_len*H + pos*H + h] = (__fp16)v;
+                kv_v[lb*total_len*H + pos*H + h] = (__fp16)(v + 0.5f);  // distinct k/v patterns
+            }
+
+    std::vector<__fp16> ref_k, ref_v;
+    cpu_kv_memory_shift(kv_k, ref_k, num_lb, total_len, memory_len, seg_len, H);
+    cpu_kv_memory_shift(kv_v, ref_v, num_lb, total_len, memory_len, seg_len, H);
+
+    auto ps_to   = g_mtl.pso(@"kv_memory_shift_to_scratch");
+    auto ps_from = g_mtl.pso(@"kv_memory_shift_from_scratch");
+    id<MTLBuffer> b_kv_k = g_mtl.bufHFrom(kv_k);
+    id<MTLBuffer> b_kv_v = g_mtl.bufHFrom(kv_v);
+    id<MTLBuffer> b_scr_k = g_mtl.bufH((size_t)num_lb * memory_len * H);
+    id<MTLBuffer> b_scr_v = g_mtl.bufH((size_t)num_lb * memory_len * H);
+
+    uint n_copy = num_lb * memory_len * H;
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ps_to];
+    [enc setBuffer:b_kv_k offset:0 atIndex:0];
+    [enc setBuffer:b_kv_v offset:0 atIndex:1];
+    [enc setBuffer:b_scr_k offset:0 atIndex:2];
+    [enc setBuffer:b_scr_v offset:0 atIndex:3];
+    [enc setBytes:&num_lb length:4 atIndex:4];
+    [enc setBytes:&total_len length:4 atIndex:5];
+    [enc setBytes:&memory_len length:4 atIndex:6];
+    [enc setBytes:&seg_len length:4 atIndex:7];
+    [enc setBytes:&H length:4 atIndex:8];
+    [enc dispatchThreads:MTLSizeMake(n_copy,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<uint>(n_copy,256),1,1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:ps_from];
+    [enc setBuffer:b_kv_k offset:0 atIndex:0];
+    [enc setBuffer:b_kv_v offset:0 atIndex:1];
+    [enc setBuffer:b_scr_k offset:0 atIndex:2];
+    [enc setBuffer:b_scr_v offset:0 atIndex:3];
+    [enc setBytes:&num_lb length:4 atIndex:4];
+    [enc setBytes:&total_len length:4 atIndex:5];
+    [enc setBytes:&memory_len length:4 atIndex:6];
+    [enc setBytes:&H length:4 atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(n_copy,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<uint>(n_copy,256),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<__fp16> out_k(kv_k.size()), out_v(kv_v.size());
+    g_mtl.readIntoH(b_kv_k, out_k);
+    g_mtl.readIntoH(b_kv_v, out_v);
+    recordExactH("kv_memory_shift_k", out_k, ref_k);
+    recordExactH("kv_memory_shift_v", out_v, ref_v);
 }
 
 // Tests -----------------------------------------------------------------------
@@ -1839,6 +1958,7 @@ int main(int argc, char** argv) {
         run_rel_pe_q_grad_batched(r);
         run_rel_pe_q_grad_batched_realdim(r);
         run_attn_out_preO_recompute_batched(r);
+        run_kv_memory_shift(r);
 
         int fail = 0;
         for (auto& r : g_results) if (!r.ok) fail++;
