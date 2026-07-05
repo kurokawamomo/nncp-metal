@@ -7111,6 +7111,90 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                     }
                 }
             }
+
+            // [ATTN_ARB2] (2026-07-05, "slide toxicity" investigation, candidate
+            // ①): extends ATTN_ARB to chunk2/local-t=0 (absolute segment
+            // position T_CHUNK) — same kv_len=MEM_LEN+1 structure as chunk1's
+            // t=0 case (causal mask only admits this chunk's OWN token at
+            // local t=0), except kv_mem_buf_k/v[i] is now the POST-SLIDE
+            // buffer (mem[MEM_LEN-T_CHUNK:MEM_LEN) = chunk1's real K/V, not
+            // pre-seg latch). Directly tests whether chunk2's REAL forward
+            // pass reads/interprets the slid-in mem correctly, independent of
+            // decode (Q and self-K/V are sourced from train's OWN captures —
+            // m2_dump->Q_saved[i]/x_ln1[i] row 0 — so this is a
+            // self-consistency check: does train's own attention math,
+            // reimplemented on the CPU, reproduce train's own actual output
+            // given the actual post-slide mem bytes?). If ATTN_ARB2 PASSes
+            // while the real training loss is still bad, the bug is NOT in
+            // "chunk2 misreading slid mem" — it's upstream (the values
+            // themselves, or something in the gradient/optimizer path).
+            if (dump_inter && i == 0 && t_start == T_CHUNK && m2_dump->x_ln1[0] && m2_dump->Q_saved[0]) {
+                const uint32_t NH_ = tr->NH, HD_ = tr->HD, D_POS_ = tr->d_pos;
+                const int B_REL_STRIDE_ = (int)tr->ext_len;
+                const float scale = 1.0f / sqrtf((float)HD_);
+                const float* x_ln1_row0 = (const float*)[m2_dump->x_ln1[0] contents];  // b=0,t=0-in-chunk2
+                const float* q_row0     = (const float*)[m2_dump->Q_saved[0] contents];
+                const float* w_k = (const float*)[wb.attn_k contents];   // layer 0 slice (i==0)
+                const float* w_v = (const float*)[wb.attn_v contents];
+                const float* w_o = (const float*)[wb.attn_out contents];
+                std::vector<float> self_k(H), self_v(H);
+                for (uint32_t n = 0; n < H; n++) {
+                    double sk = 0.0, sv = 0.0;
+                    for (uint32_t k = 0; k < H; k++) {
+                        sk += (double)x_ln1_row0[k] * w_k[(size_t)k * H + n];
+                        sv += (double)x_ln1_row0[k] * w_v[(size_t)k * H + n];
+                    }
+                    self_k[n] = (float)sk; self_v[n] = (float)sv;
+                }
+                const float* kv_mem_k = (const float*)[tr->kv_mem_buf_k[0] contents];  // [MEM_LEN,H] b=0, POST-SLIDE
+                const float* kv_mem_v = (const float*)[tr->kv_mem_buf_v[0] contents];
+                const float* w_rel_r_ = (const float*)[wb.w_rel_r_all contents];  // layer 0 slice
+                const float* b_rel_r_ = (const float*)[wb.b_rel_r contents];
+                const int kv_len = MEM_LEN + 1;
+                std::vector<float> arb_pre_o(H, 0.0f), scores2(kv_len);
+                for (uint32_t h = 0; h < NH_; h++) {
+                    const float* qh = &q_row0[h * HD_];
+                    const float* w_rel_h = w_rel_r_ + (size_t)h * HD_ * D_POS_;
+                    float mx = -1e9f;
+                    for (int kx = 0; kx < kv_len; kx++) {
+                        const float* kh = (kx < MEM_LEN) ? (kv_mem_k + (size_t)kx * H + h * HD_) : self_k.data() + h * HD_;
+                        int d = MEM_LEN + 0 - kx;
+                        int qd = ((d % (int)D_POS_) + (int)D_POS_) % (int)D_POS_;
+                        int bd = d < 0 ? 0 : (d >= B_REL_STRIDE_ ? B_REL_STRIDE_ - 1 : d);
+                        double dot = 0.0, qrel = 0.0;
+                        for (uint32_t hd = 0; hd < HD_; hd++) {
+                            dot  += (double)qh[hd] * kh[hd];
+                            qrel += (double)qh[hd] * w_rel_h[(size_t)hd * D_POS_ + qd];
+                        }
+                        float s = scale * (float)dot + scale * (float)qrel
+                                  + sqrtf((float)H) * b_rel_r_[(size_t)h * B_REL_STRIDE_ + bd];
+                        scores2[kx] = s;
+                        if (s > mx) mx = s;
+                    }
+                    double sum = 0.0;
+                    for (int kx = 0; kx < kv_len; kx++) { scores2[kx] = expf(scores2[kx] - mx); sum += scores2[kx]; }
+                    for (int kx = 0; kx < kv_len; kx++) scores2[kx] = (float)(scores2[kx] / sum);
+                    for (uint32_t hd = 0; hd < HD_; hd++) {
+                        double acc = 0.0;
+                        for (int kx = 0; kx < kv_len; kx++) {
+                            const float* vh = (kx < MEM_LEN) ? (kv_mem_v + (size_t)kx * H + h * HD_) : self_v.data() + h * HD_;
+                            acc += (double)scores2[kx] * vh[hd];
+                        }
+                        arb_pre_o[h * HD_ + hd] = (float)acc;
+                    }
+                }
+                std::vector<float> arb_post_o(H, 0.0f);
+                for (uint32_t n = 0; n < H; n++) {
+                    double s = 0.0;
+                    for (uint32_t k = 0; k < H; k++) s += (double)arb_pre_o[k] * w_o[(size_t)k * H + n];
+                    arb_post_o[n] = (float)s;
+                }
+                const float* train_attn_out = (const float*)[m2_dump->attn_out[0] contents];  // row0, POST-O-proj
+                float ma = 0.0f, mr = 0.0f;
+                fwd_dump_max_err(arb_post_o.data(), train_attn_out, H, &ma, &mr);
+                fprintf(stderr, "[ATTN_ARB2] t_start=%d layer=0 vs_train_attn_out(postO) max_abs=%.3e max_rel=%.3e  %s\n",
+                        t_start, ma, mr, ma < 1e-3f ? "PASS" : "FAIL");
+            }
 #else
             // Phase A: bind pl_h[i+1] directly; runWithMTLCommandQueue submits async
             NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
@@ -8202,6 +8286,16 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                 if (s_loss_step < 0) s_loss_step = !!getenv("NNCP_LOSS_STEP");
                 if (s_loss_step) fprintf(stderr, "[LOSS] step=%llu loss=%.8f\n",
                         (unsigned long long)_eff_step, avg_loss);
+                // [LOSS_CHUNK] (2026-07-05, shortcut hypothesis): loss1/loss2
+                // are already computed separately (per-chunk, before being
+                // averaged into avg_loss) — this just exposes both instead of
+                // only the average. If chunk2's loss is anomalously low in
+                // the frozen (NNCP_DISABLE_SLIDE=1) world, that's a shortcut
+                // signature (chunk2 finding self-information some other way,
+                // not via the mem path), meaning frozen's 2.2-2.3 headline
+                // number is inflated rather than a genuine baseline.
+                if (s_loss_step) fprintf(stderr, "[LOSS_CHUNK] step=%llu c1=%.8f c2=%.8f\n",
+                        (unsigned long long)_eff_step, loss1, loss2);
             }
 
             clip_gradients(tr, tr->grad_clip);
