@@ -293,21 +293,8 @@ struct PerLayerFwdGraph {
     MPSGraphTensor*  w_ln;       // [4, H]
     MPSGraphTensor*  w_rel_r;    // [NH, HD, D_POS]
     MPSGraphTensor*  b_rel_r;    // [NH, EXT]
-    MPSGraphTensor*  kv_k;       // [B*MEM, H]  (MEM=288 unified, bug 8 fix (B))
+    MPSGraphTensor*  kv_k;       // [B*MEM, H]  (MEM=mem_len=256, bug6/7 baseline)
     MPSGraphTensor*  kv_v;       // [B*MEM, H]
-    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): causal_mask/
-    // P_all_q/Q_all_b were graph-build-time CONSTANTS, baked for one fixed
-    // chunk. Now placeholders — chunk1 and chunk2 need DIFFERENT relative-
-    // distance tables for the same mem slots (chunk1's true predecessor count
-    // is mem_len=256; chunk2's is mem_len+T_CHUNK=288, since chunk2's mem now
-    // holds chunk1's real K/V too, not a FIFO-discarded slide) and different
-    // masks (chunk1 masks out the mem-slot's last T_CHUNK entries, which are
-    // dummy/unused for chunk1; chunk2 doesn't). Both variants are precomputed
-    // ONCE (nncp_precompute_attn_tables) into persistent MTLBuffers and fed
-    // zero-copy per chunk call — see run_per_layer_bptt_chunk.
-    MPSGraphTensor*  causal_mask; // [T, EXT]
-    MPSGraphTensor*  P_all_q;     // [1, T, D_POS, EXT]
-    MPSGraphTensor*  Q_all_b;     // [T, EXT, B_REL_STRIDE]
     MPSGraphTensor*  x_out;      // [BT, H] output
 
     // --- Phase M-2b Step 2: forward intermediates exposed for backward ---
@@ -357,8 +344,6 @@ struct PerLayerBwdGraph {
     MPSGraphTensor*  w_ln;
     MPSGraphTensor*  w_rel_r, *b_rel_r;
     MPSGraphTensor*  kv_k, *kv_v;
-    // Bug 8 fix (B): same rationale as PerLayerFwdGraph's own fields.
-    MPSGraphTensor*  causal_mask, *P_all_q, *Q_all_b;
     // Dropout spike: same mask tensors as PerLayerFwdGraph, fed from the
     // SAME per-layer mask buffer the forward pass generated and saved (see
     // tr->dropout_mask_attn/ffn2[i]) — never regenerated here, so this
@@ -468,15 +453,9 @@ struct M2BwContext {
     id<MTLBuffer> d_x_mid;      // [BT, H]           d(x_mid)
     id<MTLBuffer> d_q_rel_raw;  // [B*NH, T, D_POS]  d_q_rel_raw (rel_pe_q_scatter_bw out, per-row)
 
-    // Rel-PE distance tables (precomputed once from profile). Bug 8(B):
-    // unified 320-width window makes the mem-portion distance depend on
-    // which BPTT chunk this call is (chunk1 abs_query_offset=0, chunk2=32
-    // — same reasoning as PerLayerFwdGraph's causal_mask/P_all_q/Q_all_b),
-    // so two persistent variants are precomputed once and selected per call.
-    id<MTLBuffer> qdist_buf_c1; // [T, TL] int32, abs_query_offset=0
-    id<MTLBuffer> bdist_buf_c1; // [T, TL] int32, abs_query_offset=0
-    id<MTLBuffer> qdist_buf_c2; // [T, TL] int32, abs_query_offset=T_CHUNK
-    id<MTLBuffer> bdist_buf_c2; // [T, TL] int32, abs_query_offset=T_CHUNK
+    // Rel-PE distance tables (precomputed once from profile).
+    id<MTLBuffer> qdist_buf; // [T, TL] int32
+    id<MTLBuffer> bdist_buf; // [T, TL] int32
 
     // Attention recompute scratch
     id<MTLBuffer> k_full;       // [B*NH, TL, HD]    K_full = kv_mem_k ++ K_new (recomputed per layer)
@@ -526,8 +505,7 @@ static void metal_bw_destroy(M2BwContext* m2) {
     m2->d_x_ln1 = nil; m2->d_x_ln2 = nil; m2->d_x_mid = nil;
     m2->d_q_rel_raw = nil;
     m2->ffn_recomp = nil;
-    m2->qdist_buf_c1 = nil; m2->bdist_buf_c1 = nil;
-    m2->qdist_buf_c2 = nil; m2->bdist_buf_c2 = nil;
+    m2->qdist_buf = nil; m2->bdist_buf = nil;
     m2->k_full = nil; m2->v_full = nil; m2->kv_new_scr = nil; m2->zero_bias = nil;
     m2->q_mh = nil; m2->d_attn_out_mh = nil;
     m2->d_q_mh = nil; m2->d_k_mh = nil; m2->d_v_mh = nil; m2->d_q_rel_mh = nil;
@@ -535,8 +513,8 @@ static void metal_bw_destroy(M2BwContext* m2) {
 }
 
 static void m2_fill_relpe_dist_tables(int32_t* qdist, int32_t* bdist,
-                                       uint32_t T, uint32_t MEM_LEN_TRUE, uint32_t MEM_LEN, uint32_t TL,
-                                       uint32_t D_POS, int abs_query_offset); // forward declaration
+                                       uint32_t T, uint32_t MEM_LEN, uint32_t TL,
+                                       uint32_t D_POS); // forward declaration
 
 static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
                                   uint32_t L, uint32_t H, uint32_t F, uint32_t V,
@@ -658,23 +636,13 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ffn_recomp  = newBuf(BT_F * sizeof(float));
 
     // Rel-PE distance tables [T_CHUNK, TL] int32, precomputed from profile.
-    // Bug 8(B): MEM_LEN passed in is now the unified width (mem_len_true +
-    // T_CHUNK); MEM_LEN_TRUE recovers the true decode mem_len for the
-    // chunk-dependent mem-portion distance formula. Two variants (chunk1
-    // abs_query_offset=0, chunk2 abs_query_offset=T_CHUNK) precomputed once.
     {
-        const uint32_t MEM_LEN_TRUE = MEM_LEN - T_CHUNK;
         const size_t n = (size_t)T_CHUNK * TL;
-        m2->qdist_buf_c1 = newBuf(n * sizeof(int32_t));
-        m2->bdist_buf_c1 = newBuf(n * sizeof(int32_t));
-        m2->qdist_buf_c2 = newBuf(n * sizeof(int32_t));
-        m2->bdist_buf_c2 = newBuf(n * sizeof(int32_t));
-        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf_c1 contents],
-                                   (int32_t*)[m2->bdist_buf_c1 contents],
-                                   T_CHUNK, MEM_LEN_TRUE, MEM_LEN, TL, D_POS, /*abs_query_offset=*/0);
-        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf_c2 contents],
-                                   (int32_t*)[m2->bdist_buf_c2 contents],
-                                   T_CHUNK, MEM_LEN_TRUE, MEM_LEN, TL, D_POS, /*abs_query_offset=*/(int)T_CHUNK);
+        m2->qdist_buf = newBuf(n * sizeof(int32_t));
+        m2->bdist_buf = newBuf(n * sizeof(int32_t));
+        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf contents],
+                                   (int32_t*)[m2->bdist_buf contents],
+                                   T_CHUNK, MEM_LEN, TL, D_POS);
     }
 
     // Attention K/V recompute scratch
@@ -1232,19 +1200,6 @@ struct OnlineTrainer {
     // chunk1's positions (XCMP: all 20 layers FAIL, layer0 max_abs~3.4).
     id<MTLBuffer>   chunk1_kv_buf_k[SEG_MAX_LAYERS];
     id<MTLBuffer>   chunk1_kv_buf_v[SEG_MAX_LAYERS];
-
-    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): kv_mem_buf_k/v
-    // grow from [B, mem_len(256), H] to [B, mem_len+T_CHUNK(288), H] — chunk1
-    // fills [0:256) with pre_seg_mem and zeros [256:288) (dummy, masked);
-    // chunk2 fills [0:256) with the SAME UNCHANGED pre_seg_mem (never
-    // discarded — this is the "concat, not slide" fix) and [256:288) with
-    // chunk1's real K/V (replacing bug 6's FIFO slide). Precomputed causal
-    // mask / relative-distance gather tables, one variant per chunk (fed
-    // zero-copy, no per-call CPU recompute — see nncp_precompute_attn_tables).
-    id<MTLBuffer>   causal_mask_buf_c1, causal_mask_buf_c2;  // [T, EXT=320]
-    id<MTLBuffer>   p_all_q_buf_c1, p_all_q_buf_c2;          // [1,T,D_POS,EXT=320]
-    id<MTLBuffer>   q_all_b_buf_c1, q_all_b_buf_c2;          // [T,EXT=320,B_REL_STRIDE=320]
-    bool            attn_tables_ready = false;
 
     // XCMP_SUB (2026-07-05, injection-point triage): diagnostic-only, layer0
     // scratch for the sub-tensor bisection ([XCMP_SUB]). Lazily allocated on
@@ -3336,107 +3291,18 @@ static MPSGraphTensor* build_single_layer(
 }
 
 // Build per-layer forward graph (compiled once, reused for all 20 layers)
-// Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): precompute BOTH
-// chunk variants of the causal mask / relative-distance gather tables ONCE,
-// upload to persistent MTLBuffers, and feed the right one per chunk call
-// (run_per_layer_bptt_chunk) — zero-copy, no per-call CPU recompute (unified
-// memory). MEM_LEN here is the UNIFIED mem-placeholder width (mem_len+T_CHUNK
-// = 288): chunk1's mem holds [pre_seg_mem(256), dummy(32)]; chunk2's holds
-// [pre_seg_mem(256, UNCHANGED — no longer FIFO-slid away), chunk1_kv(32,
-// real)]. `abs_query_offset` is 0 for chunk1, T_CHUNK for chunk2 — the only
-// thing that actually differs between the two chunks' distance tables (see
-// the derivation in this function's git history / the design doc): for a
-// mem-portion key (k < MEM_LEN, "absolute position" defined uniformly as
-// k-mem_len_true), distance = abs_query_offset + mem_len_true + t - k; for an
-// own-chunk key (k >= MEM_LEN, local index kk = k-MEM_LEN), distance = t-kk
-// (offset cancels — this chunk's own causal structure doesn't depend on
-// where the chunk sits in the segment). `extra_mask` (true for chunk1 only)
-// masks out k in [mem_len_true, MEM_LEN) — the "dummy" slots that hold
-// chunk1's own (not-yet-computed-from-chunk1's-own-perspective) data; chunk2
-// leaves this region unmasked since it holds chunk1's REAL K/V there.
-static void nncp_precompute_attn_tables(OnlineTrainer* tr) {
-    if (tr->attn_tables_ready) return;
-    const int T = BPTT_CHUNK_LEN;
-    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;   // 256
-    const int MEM_LEN = MEM_LEN_TRUE + T;                    // 288 (unified)
-    const int EXT_LEN = MEM_LEN + T;                         // 320
-    const int D_POS = (int)tr->d_pos;
-    const int B_REL_STRIDE = (int)tr->ext_len;               // 320 (== EXT_LEN)
-
-    auto build_variant = [&](int abs_query_offset, bool extra_mask,
-                              id<MTLBuffer>& out_mask, id<MTLBuffer>& out_p_all_q,
-                              id<MTLBuffer>& out_q_all_b) {
-        std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
-        std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
-        for (int t = 0; t < T; t++) {
-            for (int k = 0; k < EXT_LEN; k++) {
-                int d;
-                if (k < MEM_LEN) {
-                    d = abs_query_offset + MEM_LEN_TRUE + t - k;
-                    if (extra_mask && k >= MEM_LEN_TRUE) mask_data[(size_t)t * EXT_LEN + k] = -1e9f;
-                } else {
-                    int kk = k - MEM_LEN;
-                    d = t - kk;
-                    if (kk > t) mask_data[(size_t)t * EXT_LEN + k] = -1e9f;
-                }
-                q_dist_vec[(size_t)t * EXT_LEN + k] = ((d % D_POS) + D_POS) % D_POS;
-                b_dist_vec[(size_t)t * EXT_LEN + k] = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
-            }
-        }
-        size_t p_total = (size_t)T * D_POS * EXT_LEN;
-        std::vector<float> p_all(p_total, 0.f);
-        for (int ti = 0; ti < T; ti++)
-            for (int kk = 0; kk < EXT_LEN; kk++)
-                p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[(size_t)ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
-        size_t b_total = (size_t)T * EXT_LEN * B_REL_STRIDE;
-        std::vector<float> b_all(b_total, 0.f);
-        for (int ti = 0; ti < T; ti++)
-            for (int kk = 0; kk < EXT_LEN; kk++)
-                b_all[(size_t)ti * EXT_LEN * B_REL_STRIDE + (size_t)kk * B_REL_STRIDE
-                      + b_dist_vec[(size_t)ti * EXT_LEN + kk]] = 1.f;
-
-        out_mask = [tr->device newBufferWithBytes:mask_data.data()
-                                            length:mask_data.size() * sizeof(float)
-                                           options:MTLResourceStorageModeShared];
-        out_p_all_q = [tr->device newBufferWithBytes:p_all.data()
-                                               length:p_total * sizeof(float)
-                                              options:MTLResourceStorageModeShared];
-        out_q_all_b = [tr->device newBufferWithBytes:b_all.data()
-                                               length:b_total * sizeof(float)
-                                              options:MTLResourceStorageModeShared];
-    };
-
-    build_variant(0, true,  tr->causal_mask_buf_c1, tr->p_all_q_buf_c1, tr->q_all_b_buf_c1);
-    build_variant(T, false, tr->causal_mask_buf_c2, tr->p_all_q_buf_c2, tr->q_all_b_buf_c2);
-    tr->attn_tables_ready = true;
-
-    // [ATTN_TABLE_DUMP] (2026-07-05, final500 regression triage — candidate ③:
-    // is chunk1's dummy-tail [256:288) actually masked with -1e9 in the buffer
-    // that's really fed to the graph?). Direct byte-level check of the
-    // persistent MTLBuffer right after upload — t=0, boundary k indices only.
-    if (getenv("NNCP_ATTN_TABLE_DUMP")) {
-        const float* m1 = (const float*)[tr->causal_mask_buf_c1 contents];
-        const float* m2v = (const float*)[tr->causal_mask_buf_c2 contents];
-        fprintf(stderr, "[ATTN_TABLE_DUMP] c1(t=0) k=254..289: ");
-        for (int k = 254; k <= 289; k++) fprintf(stderr, "%.0f ", m1[0 * EXT_LEN + k]);
-        fprintf(stderr, "\n[ATTN_TABLE_DUMP] c2(t=0) k=254..289: ");
-        for (int k = 254; k <= 289; k++) fprintf(stderr, "%.0f ", m2v[0 * EXT_LEN + k]);
-        fprintf(stderr, "\n");
-    }
-}
-
+// A-only revert (2026-07-05): bug8(B)'s unified-320 chunk-dependent tables
+// reverted pending isolation of the final500 train-loss regression — see
+// window-symmetry-fix-design.md / snapshot branch wip/bug8b-unified320-snapshot
+// for the full unified implementation. This restores the bug6+7 baseline:
+// MEM_LEN=mem_len(256, not unified), EXT_LEN=MEM_LEN+T(288), causal_mask/
+// P_all_q/Q_all_b are build-time CONSTANTS (single formula, chunk-independent
+// — both chunk1 and chunk2 reuse the same table, matching bug6/7's design).
 static void build_per_layer_fwd(OnlineTrainer* tr) {
     const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
-    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): MEM_LEN is now
-    // the UNIFIED mem-placeholder width (true mem_len + T_CHUNK = 288), shared
-    // by chunk1 (mem[256:288) dummy/masked) and chunk2 (mem[256:288) = chunk1's
-    // real K/V, concatenated not slid) — see nncp_precompute_attn_tables for
-    // the per-chunk distance-table variants this enables. EXT_LEN (320) is
-    // MEM_LEN+T_CHUNK, and now equals B_REL_STRIDE exactly (both = mem_len +
-    // seg_len = tr->ext_len) — no separate B_REL_STRIDE constant needed anymore.
-    const int MEM_LEN = (int)g_nncp_profile.mem_len + T;
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;
     const int EXT_LEN = MEM_LEN + T;
-    const int B_REL_STRIDE = (int)tr->ext_len;  // == EXT_LEN now; kept named for clarity at call sites
+    const int B_REL_STRIDE = (int)tr->ext_len;  // bug7 fix: b_rel_r's true per-head stride (320)
     const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
     const uint32_t D_POS = tr->d_pos;
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
@@ -3461,12 +3327,40 @@ static void build_per_layer_fwd(OnlineTrainer* tr) {
     ctx.b_rel_r = [g placeholderWithShape:@[@(NH), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"pl_br"];
     ctx.kv_k    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvk"];
     ctx.kv_v    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvv"];
-    // Bug 8 fix (B): causal_mask/P_all_q/Q_all_b are now placeholders, fed
-    // per-chunk from one of the two precomputed variants (see
-    // nncp_precompute_attn_tables + run_per_layer_bptt_chunk's feed selection).
-    ctx.causal_mask = [g placeholderWithShape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"pl_mask"];
-    ctx.P_all_q     = [g placeholderWithShape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"pl_pallq"];
-    ctx.Q_all_b     = [g placeholderWithShape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"pl_qallb"];
+
+    // ---- Extended causal mask + rel-PE gather tables (build-time constants,
+    // single formula shared by both BPTT chunks — bug6/7 baseline). ----
+    std::vector<float> mask_vals_ext((size_t)T * EXT_LEN, 0.0f);
+    for (int ti = 0; ti < T; ti++)
+        for (int k = MEM_LEN; k < EXT_LEN; k++)
+            if (k - MEM_LEN > ti) mask_vals_ext[ti * EXT_LEN + k] = -1e9f;
+    MPSGraphTensor* causal_mask = [g constantWithData:
+        [NSData dataWithBytes:mask_vals_ext.data() length:mask_vals_ext.size() * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
+    for (int ti = 0; ti < T; ti++) {
+        for (int k = 0; k < EXT_LEN; k++) {
+            int d = MEM_LEN + ti - k;
+            q_dist_vec[ti*EXT_LEN+k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+            b_dist_vec[ti*EXT_LEN+k] = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
+        }
+    }
+    size_t p_total = (size_t)T * D_POS * EXT_LEN;
+    std::vector<float> p_all(p_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti*EXT_LEN+kk] * EXT_LEN + kk] = 1.f;
+    MPSGraphTensor* P_all_q = [g constantWithData:[NSData dataWithBytes:p_all.data() length:p_total*sizeof(float)]
+        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    size_t b_total = (size_t)T * EXT_LEN * B_REL_STRIDE;
+    std::vector<float> b_all(b_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            b_all[(size_t)ti * EXT_LEN * B_REL_STRIDE + (size_t)kk * B_REL_STRIDE + b_dist_vec[ti*EXT_LEN+kk]] = 1.f;
+    MPSGraphTensor* Q_all_b = [g constantWithData:[NSData dataWithBytes:b_all.data() length:b_total*sizeof(float)]
+        shape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32];
 
     // b_rt_h: [NH, B_REL_STRIDE] → transpose → [1, B_REL_STRIDE, NH].
     MPSGraphTensor* b_rt_h = [g reshapeTensor:
@@ -3492,15 +3386,14 @@ static void build_per_layer_fwd(OnlineTrainer* tr) {
         ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
-        ctx.causal_mask, ctx.P_all_q, ctx.Q_all_b, b_rt_h, &ctx,
+        causal_mask, P_all_q, Q_all_b, b_rt_h, &ctx,
         ctx.mask_attn, ctx.mask_ffn2);
 }
 
 // Build per-layer backward graph (proxy loss method, compiled once)
 static void build_per_layer_bwd(OnlineTrainer* tr) {
     const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
-    // Bug 8 fix (B) — see build_per_layer_fwd's comment for the full rationale.
-    const int MEM_LEN = (int)g_nncp_profile.mem_len + T;
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;
     const int EXT_LEN = MEM_LEN + T;
     const int B_REL_STRIDE = (int)tr->ext_len;
     const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
@@ -3528,10 +3421,40 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
     ctx.b_rel_r  = [g placeholderWithShape:@[@(NH), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"plb_br"];
     ctx.kv_k     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvk"];
     ctx.kv_v     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvv"];
-    // Bug 8 fix (B) — placeholders now, same rationale as build_per_layer_fwd.
-    ctx.causal_mask = [g placeholderWithShape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"plb_mask"];
-    ctx.P_all_q     = [g placeholderWithShape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"plb_pallq"];
-    ctx.Q_all_b     = [g placeholderWithShape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"plb_qallb"];
+
+    // ---- Extended causal mask + rel-PE gather tables (build-time constants,
+    // same single-formula table as build_per_layer_fwd — bug6/7 baseline). ----
+    std::vector<float> mask_vals_ext((size_t)T * EXT_LEN, 0.0f);
+    for (int ti = 0; ti < T; ti++)
+        for (int k = MEM_LEN; k < EXT_LEN; k++)
+            if (k - MEM_LEN > ti) mask_vals_ext[ti * EXT_LEN + k] = -1e9f;
+    MPSGraphTensor* causal_mask = [g constantWithData:
+        [NSData dataWithBytes:mask_vals_ext.data() length:mask_vals_ext.size() * sizeof(float)]
+        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
+    for (int ti = 0; ti < T; ti++) {
+        for (int k = 0; k < EXT_LEN; k++) {
+            int d = MEM_LEN + ti - k;
+            q_dist_vec[ti*EXT_LEN+k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
+            b_dist_vec[ti*EXT_LEN+k] = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
+        }
+    }
+    size_t p_total = (size_t)T * D_POS * EXT_LEN;
+    std::vector<float> p_all(p_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti*EXT_LEN+kk] * EXT_LEN + kk] = 1.f;
+    MPSGraphTensor* P_all_q = [g constantWithData:[NSData dataWithBytes:p_all.data() length:p_total*sizeof(float)]
+        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
+
+    size_t b_total = (size_t)T * EXT_LEN * B_REL_STRIDE;
+    std::vector<float> b_all(b_total, 0.f);
+    for (int ti = 0; ti < T; ti++)
+        for (int kk = 0; kk < EXT_LEN; kk++)
+            b_all[(size_t)ti * EXT_LEN * B_REL_STRIDE + (size_t)kk * B_REL_STRIDE + b_dist_vec[ti*EXT_LEN+kk]] = 1.f;
+    MPSGraphTensor* Q_all_b = [g constantWithData:[NSData dataWithBytes:b_all.data() length:b_total*sizeof(float)]
+        shape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32];
 
     MPSGraphTensor* b_rt_h = [g reshapeTensor:
         [g transposeTensor:ctx.b_rel_r dimension:0 withDimension:1 name:nil]
@@ -3554,7 +3477,7 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
         ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
-        ctx.causal_mask, ctx.P_all_q, ctx.Q_all_b, b_rt_h, nullptr,
+        causal_mask, P_all_q, Q_all_b, b_rt_h, nullptr,
         ctx.mask_attn, ctx.mask_ffn2);
 
     // Proxy loss
@@ -4207,7 +4130,6 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     if ((int)tr->L > 8) {
         build_per_layer_fwd(tr);
         build_per_layer_bwd(tr);
-        nncp_precompute_attn_tables(tr);  // bug 8 fix (B)
         build_loss_bwd(tr);
         // Allocate h[0..L] buffers for saved hidden states
         const size_t h_size = (size_t)BPTT_CHUNK_BT * tr->H;
@@ -4334,13 +4256,8 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     }
 
     // Phase E2.3: KV memory staging buffers (zeroed) — [SEG_TRAIN_STREAMS * MEM_LEN, H] per layer
-    // Bug 8 fix (B): MEM_LEN here is the unified 288-wide width (mem_len+
-    // T_CHUNK), NOT SEG_TRAIN_MEM(256) — kv_mem_buf_k/v must hold pre_seg_mem
-    // AND chunk1's concatenated K/V. kv_pre_seg_buf_k/v (a few lines above,
-    // separate allocation) correctly stays SEG_TRAIN_MEM-wide — it's decode's
-    // true mem_len latch, unrelated to this unification.
     {
-        const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
+        const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
         for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
             tr->kv_mem_buf_k[li] = [device newBufferWithLength:MEM_SLOTS * H * sizeof(float) options:opts];
             tr->kv_mem_buf_v[li] = [device newBufferWithLength:MEM_SLOTS * H * sizeof(float) options:opts];
@@ -4451,10 +4368,7 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         const bool is_enwik8_m2 = (g_nncp_profile.h == 1024);
         const uint32_t BT_m2     = (uint32_t)BPTT_CHUNK_BT;
         const uint32_t T_CHUNK_m2= (uint32_t)BPTT_CHUNK_LEN;
-        // Bug 8(B): unified window — MEM_LEN_m2 is mem_len_true + T_CHUNK
-        // (288), TL_m2 is the full EXT_LEN (320), matching the MPSGraph
-        // side's unified causal_mask/P_all_q/Q_all_b width exactly.
-        const uint32_t MEM_LEN_m2= (uint32_t)g_nncp_profile.mem_len + T_CHUNK_m2;
+        const uint32_t MEM_LEN_m2= (uint32_t)g_nncp_profile.mem_len;
         const uint32_t TL_m2     = MEM_LEN_m2 + T_CHUNK_m2;
         const uint32_t D_POS_m2  = tr->d_pos;
         tr->m2 = metal_bw_init(device, metalLib,
@@ -5269,18 +5183,11 @@ static inline M2WeightOffsets m2_weight_offsets(uint32_t layer,
 // Build qdist/bdist tables [T, TL] (TL = MEM_LEN + T_CHUNK), matching the MPSGraph
 // formula at L2208-2214. d = MEM_LEN + ti - k.
 static void m2_fill_relpe_dist_tables(int32_t* qdist, int32_t* bdist,
-                                       uint32_t T, uint32_t MEM_LEN_TRUE, uint32_t MEM_LEN, uint32_t TL,
-                                       uint32_t D_POS, int abs_query_offset) {
-    // Bug 8(B): mem-portion (k < MEM_LEN) distance depends on which BPTT
-    // chunk this is — chunk1's absolute query position is `ti`, chunk2's is
-    // `T_CHUNK+ti` (T_CHUNK == abs_query_offset here). Current-portion
-    // (k >= MEM_LEN) distance is chunk-independent (always `ti - (k-MEM_LEN)`).
-    // Mirrors fwd_dump_cpu_verify_layer's `d` formula exactly.
+                                       uint32_t T, uint32_t MEM_LEN, uint32_t TL,
+                                       uint32_t D_POS) {
     for (uint32_t ti = 0; ti < T; ti++) {
         for (uint32_t k = 0; k < TL; k++) {
-            int d = (k < MEM_LEN)
-                ? (abs_query_offset + (int)MEM_LEN_TRUE + (int)ti - (int)k)
-                : ((int)ti - ((int)k - (int)MEM_LEN));
+            int d = (int)MEM_LEN + (int)ti - (int)k;
             qdist[ti*TL + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
             bdist[ti*TL + k] = d < 0 ? 0 : (d >= (int)TL ? (int)TL-1 : d);
         }
@@ -5614,10 +5521,7 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     const uint32_t D_POS   = tr->d_pos;
     const uint32_t T       = (uint32_t)BPTT_CHUNK_LEN;
     const uint32_t B       = (uint32_t)g_nncp_profile.num_streams;
-    // Bug 8(B): unified window — MEM_LEN is now mem_len_true+T_CHUNK (288,
-    // matching tr->kv_mem_buf_k/v[i]'s unified allocation width), TL is the
-    // full EXT_LEN (320, matching attn_prob[i]/d_scores' m2 init sizing).
-    const uint32_t MEM_LEN = (uint32_t)g_nncp_profile.mem_len + T;
+    const uint32_t MEM_LEN = (uint32_t)g_nncp_profile.mem_len;
     const uint32_t TL      = MEM_LEN + T;
     const uint32_t BT      = B * T;
     const uint32_t B_NH    = B * NH;
@@ -5941,11 +5845,8 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         // dispatch_rel_pe_br_bw_all_rows — see metal-bw-speed-static-analysis.md
         // §8.3/§8.5. bw_verify: rel_pe_br_scatter_bw_batched bit-exact vs the
         // non-batched kernel (max_abs=0, max_rel=0).
-        // Bug 8(B): chunk-dependent distance table (accumulate_weight_grads
-        // is false only on the first BPTT chunk — see metal_bw_train_step).
-        id<MTLBuffer> bdist_sel = accumulate_weight_grads ? m2->bdist_buf_c2 : m2->bdist_buf_c1;
         dispatch_rel_pe_br_bw_batched(enc, m2->ps_rel_pe_br_bw_batched,
-                                       m2->d_scores, tr->grad_b_rel_r, bdist_sel,
+                                       m2->d_scores, tr->grad_b_rel_r, m2->bdist_buf,
                                        TL, NH, B, T, sqrtf((float)H));
         barrier();
     }
@@ -5976,9 +5877,8 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // dispatch_rel_pe_q_bw_all_rows — see metal-bw-speed-static-analysis.md
     // §8.2/§8.5. bw_verify: rel_pe_q_scatter_bw_batched bit-exact vs the
     // non-batched kernel (max_abs=0, max_rel=0).
-    id<MTLBuffer> qdist_sel = accumulate_weight_grads ? m2->qdist_buf_c2 : m2->qdist_buf_c1;
     dispatch_rel_pe_q_bw_batched(enc, m2->ps_rel_pe_q_bw_batched,
-                                  m2->d_scores, m2->d_q_rel_raw, qdist_sel,
+                                  m2->d_scores, m2->d_q_rel_raw, m2->qdist_buf,
                                   TL, D_POS, B_NH, T);
     barrier();
 
@@ -6200,17 +6100,12 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
                                       uint32_t layer, M2BwContext* m2,
                                       int B, int T, uint32_t H, uint32_t NH, uint32_t HD,
                                       uint32_t F, uint32_t D_POS, int MEM_LEN, int EXT_LEN,
-                                      bool is_enwik8, size_t FFN1_MULT,
-                                      int abs_query_offset /* bug 8 fix (B): 0 for chunk1, T_CHUNK for chunk2 */)
+                                      bool is_enwik8, size_t FFN1_MULT)
 {
     const int BT = B * T;
     const float eps   = 1e-5f;
     const float scale = 1.0f / sqrtf((float)HD);
     const size_t ffn1_dim = FFN1_MULT * F;
-    // Bug 8 fix (B): MEM_LEN_TRUE_ = decode's true mem_len (256); MEM_LEN
-    // (param) is the unified 288-wide placeholder. extra_mask = chunk1 only.
-    const int MEM_LEN_TRUE_ = (int)g_nncp_profile.mem_len;
-    const bool extra_mask = (abs_query_offset == 0);
 
     const float* x     = (const float*)[tr->pl_h[layer] contents];
     const float* w_q   = (const float*)[wb->attn_q   contents] + (size_t)layer * H * H;
@@ -6299,15 +6194,7 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
                     if (krow) for (uint32_t hd = 0; hd < HD; hd++) dot += (double)qrow[hd] * krow[hd];
                     float raw = scale * (float)dot;
 
-                    // Bug 8 fix (B): unified-window distance formula — see
-                    // nncp_precompute_attn_tables's comment for the full
-                    // derivation. mem-portion keys (kx<MEM_LEN) use the TRUE
-                    // mem_len (256) + abs_query_offset (0 for chunk1, T_CHUNK
-                    // for chunk2); own-chunk keys (kx>=MEM_LEN) use a simple
-                    // offset-independent intra-chunk distance.
-                    int d = (kx < MEM_LEN)
-                        ? (abs_query_offset + MEM_LEN_TRUE_ + t - kx)
-                        : (t - (kx - MEM_LEN));
+                    int d = MEM_LEN + t - kx;
                     int qd = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
                     double qrel = 0.0;
                     for (uint32_t hd = 0; hd < HD; hd++)
@@ -6317,10 +6204,6 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
                     int bd = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
                     raw += sqrtf((float)H) * b_rel_r[(size_t)nh * B_REL_STRIDE + bd];
 
-                    // Bug 8 fix (B): mask out kx in [MEM_LEN_TRUE_, MEM_LEN) for
-                    // chunk1 (extra_mask) — dummy slots, no real data there yet.
-                    // Standard intra-chunk causal mask for kx>=MEM_LEN unchanged.
-                    if (extra_mask && kx >= MEM_LEN_TRUE_ && kx < MEM_LEN) raw += -1e9f;
                     if (kx >= MEM_LEN && (kx - MEM_LEN) > t) raw += -1e9f;
                     scores[kx] = raw;
                 }
@@ -6511,11 +6394,7 @@ static void nncp_state_norm_dump(OnlineTrainer* tr, const MPSTransformerWeightBu
     float wbout  = nncp_l2norm_buf(wb.b_out, (size_t)V);
 
     // --- ② KV memory buffers (aggregate over all layers) ---
-    // Bug 8 fix (B): kv_mem_buf_k/v are now 288-wide (unified) per stream,
-    // while kv_pre_seg_buf_k/v stay 256-wide (decode's true mem_len latch) —
-    // separate slot counts, not the single shared MEM_SLOTS this used to be.
-    const size_t MEM_SLOTS_UNIFIED = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
-    const size_t MEM_SLOTS_TRUE    = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
     double kvmem_k_sq = 0.0, kvmem_v_sq = 0.0, kvpseg_k_sq = 0.0, kvpseg_v_sq = 0.0;
     for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
         auto accum = [&](id<MTLBuffer> b, double& acc, size_t n_slots) {
@@ -6523,10 +6402,10 @@ static void nncp_state_norm_dump(OnlineTrainer* tr, const MPSTransformerWeightBu
             const float* p = (const float*)[b contents];
             for (size_t i = 0; i < n_slots * H; i++) acc += (double)p[i] * (double)p[i];
         };
-        accum(tr->kv_mem_buf_k[li],     kvmem_k_sq,  MEM_SLOTS_UNIFIED);
-        accum(tr->kv_mem_buf_v[li],     kvmem_v_sq,  MEM_SLOTS_UNIFIED);
-        accum(tr->kv_pre_seg_buf_k[li], kvpseg_k_sq, MEM_SLOTS_TRUE);
-        accum(tr->kv_pre_seg_buf_v[li], kvpseg_v_sq, MEM_SLOTS_TRUE);
+        accum(tr->kv_mem_buf_k[li],     kvmem_k_sq,  MEM_SLOTS);
+        accum(tr->kv_mem_buf_v[li],     kvmem_v_sq,  MEM_SLOTS);
+        accum(tr->kv_pre_seg_buf_k[li], kvpseg_k_sq, MEM_SLOTS);
+        accum(tr->kv_pre_seg_buf_v[li], kvpseg_v_sq, MEM_SLOTS);
     }
     float kvmem_k  = sqrtf((float)kvmem_k_sq);
     float kvmem_v  = sqrtf((float)kvmem_v_sq);
@@ -6604,11 +6483,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const int T       = SEG_TRAIN_LEN;
     const int T_CHUNK = (int)BPTT_CHUNK_LEN;
     const int BT      = (int)BPTT_CHUNK_BT;
-    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): MEM_LEN is now
-    // the UNIFIED mem-placeholder width (mem_len_true + T_CHUNK = 288), shared
-    // by chunk1 and chunk2 — see nncp_precompute_attn_tables's own comment.
-    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;  // 256, kv_pre_seg_buf's true width
-    const int MEM_LEN      = MEM_LEN_TRUE + T_CHUNK;         // 288, kv_mem_buf's unified width
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;  // 256 (bug6/7 baseline, not unified)
     const int BM      = B * MEM_LEN;
     uint32_t L = tr->L, H = tr->H, F = tr->F, V = tr->V;
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
@@ -6638,32 +6513,18 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     // this code did before the fix, silently discarded that slide every time
     // and left chunk2 seeing only the pre-segment mem (the root cause XCMP
     // caught: all 20 layers FAIL, layer0 max_abs~3.4).
-    // Bug 8 fix (B): kv_mem_buf is now 288-wide per stream (MEM_LEN), while
-    // kv_pre_seg_buf stays 256-wide (MEM_LEN_TRUE, decode's true mem_len) — a
-    // per-stream copy (not one flat memcpy) into the FIRST MEM_LEN_TRUE slots,
-    // plus a zero-fill of the dummy tail [MEM_LEN_TRUE:MEM_LEN) (masked out
-    // for chunk1 by nncp_precompute_attn_tables's causal_mask_buf_c1, so its
-    // content never actually reaches softmax — zeroed defensively anyway).
+    // kv_mem_buf and kv_pre_seg_buf are both mem_len(256)-wide (bug6/7
+    // baseline) — a single flat memcpy per layer restores the pre-segment
+    // latch into kv_mem_buf for chunk1's forward.
     if (t_start == 0) {
-        const size_t pre_seg_stride = (size_t)MEM_LEN_TRUE * H;
-        const size_t mem_stride     = (size_t)MEM_LEN * H;
-        const size_t dummy_floats   = (size_t)(MEM_LEN - MEM_LEN_TRUE) * H;
+        const size_t mem_bytes = (size_t)BM * H * sizeof(float);
         for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-            float* dst_k = (float*)[tr->kv_mem_buf_k[li] contents];
-            float* dst_v = (float*)[tr->kv_mem_buf_v[li] contents];
-            const float* src_k = (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li])
-                ? (const float*)[tr->kv_pre_seg_buf_k[li] contents] : nullptr;
-            const float* src_v = (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_v[li])
-                ? (const float*)[tr->kv_pre_seg_buf_v[li] contents] : nullptr;
-            for (int s = 0; s < B; s++) {
-                float* dk = dst_k + (size_t)s * mem_stride;
-                float* dv = dst_v + (size_t)s * mem_stride;
-                if (src_k) memcpy(dk, src_k + (size_t)s * pre_seg_stride, pre_seg_stride * sizeof(float));
-                else       memset(dk, 0, pre_seg_stride * sizeof(float));
-                if (src_v) memcpy(dv, src_v + (size_t)s * pre_seg_stride, pre_seg_stride * sizeof(float));
-                else       memset(dv, 0, pre_seg_stride * sizeof(float));
-                memset(dk + pre_seg_stride, 0, dummy_floats * sizeof(float));
-                memset(dv + pre_seg_stride, 0, dummy_floats * sizeof(float));
+            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li] && tr->kv_pre_seg_buf_v[li]) {
+                memcpy([tr->kv_mem_buf_k[li] contents], [tr->kv_pre_seg_buf_k[li] contents], mem_bytes);
+                memcpy([tr->kv_mem_buf_v[li] contents], [tr->kv_pre_seg_buf_v[li] contents], mem_bytes);
+            } else {
+                memset([tr->kv_mem_buf_k[li] contents], 0, mem_bytes);
+                memset([tr->kv_mem_buf_v[li] contents], 0, mem_bytes);
             }
         }
     }
@@ -6720,10 +6581,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     // B_REL_STRIDE), so this must match THAT, which is mem+seg.
     NSArray<NSNumber*>* shape_br  = @[@(tr->NH), @((int)tr->ext_len)];
     NSArray<NSNumber*>* shape_kv  = @[@(BM), @(H)];
-    // Bug 8 fix (B): shapes for the now-placeholder causal_mask/P_all_q/Q_all_b.
-    NSArray<NSNumber*>* shape_mask  = @[@(T_CHUNK), @(EXT_LEN)];
-    NSArray<NSNumber*>* shape_p_all_q = @[@1, @(T_CHUNK), @(tr->d_pos), @(EXT_LEN)];
-    NSArray<NSNumber*>* shape_q_all_b = @[@(T_CHUNK), @(EXT_LEN), @((int)tr->ext_len)];
 
     // Per-trainer persistent slice view cache. Views are created once per
     // (buffer, layer, size) and reused across all training segments. This avoids
@@ -6801,15 +6658,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             feeds[fg.kv_k] = floatTD(tr->kv_mem_buf_k[layer], shape_kv);
         if (layer < SEG_MAX_LAYERS && tr->kv_mem_buf_v[layer])
             feeds[fg.kv_v] = floatTD(tr->kv_mem_buf_v[layer], shape_kv);
-        // Bug 8 fix (B): select the chunk1 or chunk2 precomputed variant —
-        // zero-copy feed, no per-call CPU recompute (nncp_precompute_attn_tables
-        // built both once, up front).
-        {
-            const bool is_chunk1 = (t_start == 0);
-            feeds[fg.causal_mask] = floatTD(is_chunk1 ? tr->causal_mask_buf_c1 : tr->causal_mask_buf_c2, shape_mask);
-            feeds[fg.P_all_q]     = floatTD(is_chunk1 ? tr->p_all_q_buf_c1     : tr->p_all_q_buf_c2,     shape_p_all_q);
-            feeds[fg.Q_all_b]     = floatTD(is_chunk1 ? tr->q_all_b_buf_c1     : tr->q_all_b_buf_c2,     shape_q_all_b);
-        }
         // Dropout spike: only meaningful when this graph actually has mask
         // placeholders (built when NNCP_DROPOUT>0 — see build_per_layer_fwd/
         // bwd). Freshly GENERATED here (forward pass is where a layer's mask
@@ -7118,27 +6966,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                             }
                         }
 
-                        // [ATTN_PROB_TAIL] (2026-07-05, final500 regression triage —
-                        // candidate ③: is chunk1's dummy-tail [MEM_LEN_TRUE:MEM_LEN)
-                        // actually masked to ~0 probability in the REAL softmax output
-                        // the forward graph produced, not just in the mask table?).
-                        // m2_dump->attn_prob[0] is populated unconditionally by the
-                        // dump_inter binding above (fwd_out[t_attn_prob]) whenever
-                        // NNCP_METAL_BW is compiled in, independent of
-                        // NNCP_METAL_BW_DISABLE — so this reads the actual softmax
-                        // output the training step just consumed, b=0/head=0/t=0.
-                        if (dump_inter && m2_dump->attn_prob[0]) {
-                            const float* ap = (const float*)[m2_dump->attn_prob[0] contents];
-                            const int MEM_LEN_TRUE_ = (int)g_nncp_profile.mem_len;
-                            fprintf(stderr, "[ATTN_PROB_TAIL] t_start=%d b=0 head=0 t=0 "
-                                    "prob[k=%d..%d](dummy-tail)=", t_start, MEM_LEN_TRUE_, MEM_LEN - 1);
-                            for (int k = MEM_LEN_TRUE_; k < MEM_LEN; k++) fprintf(stderr, "%.3e ", ap[k]);
-                            fprintf(stderr, "\n[ATTN_PROB_TAIL] t_start=%d b=0 head=0 t=0 "
-                                    "prob[k=%d..%d](real-mem-tail)=", t_start, MEM_LEN_TRUE_ - 4, MEM_LEN_TRUE_ - 1);
-                            for (int k = MEM_LEN_TRUE_ - 4; k < MEM_LEN_TRUE_; k++) fprintf(stderr, "%.3e ", ap[k]);
-                            fprintf(stderr, "\n");
-                        }
-
                         // [ATTN_ARB] (2026-07-05, third-party arbiter): full attention
                         // (all keys, all heads) at t=0/layer0, computed on the CPU in
                         // FP64-accumulated FP32 from BIT-EXACT inputs (x_ln1, q —
@@ -7313,7 +7140,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 if (nncp_fwd_dump_verify_enabled()) {
                     fwd_dump_cpu_verify_layer(tr, &wb, i, m2_dump,
                         B, T_CHUNK, H, tr->NH, tr->HD, F, tr->d_pos,
-                        MEM_LEN, EXT_LEN, is_enwik8, FFN1_MULT, t_start);
+                        MEM_LEN, EXT_LEN, is_enwik8, FFN1_MULT);
                 }
             }
 #endif
@@ -7505,15 +7332,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 feeds[bg.kv_k] = floatTD(tr->kv_mem_buf_k[i], shape_kv);
             if ((uint32_t)i < SEG_MAX_LAYERS && tr->kv_mem_buf_v[i])
                 feeds[bg.kv_v] = floatTD(tr->kv_mem_buf_v[i], shape_kv);
-            // Bug 8 fix (B): same chunk1/chunk2 variant selection as the
-            // forward graph's buildLayerFeeds — this is the backward-recompute
-            // graph, must see the SAME tables the forward pass used.
-            {
-                const bool is_chunk1 = (t_start == 0);
-                feeds[bg.causal_mask] = floatTD(is_chunk1 ? tr->causal_mask_buf_c1 : tr->causal_mask_buf_c2, shape_mask);
-                feeds[bg.P_all_q]     = floatTD(is_chunk1 ? tr->p_all_q_buf_c1     : tr->p_all_q_buf_c2,     shape_p_all_q);
-                feeds[bg.Q_all_b]     = floatTD(is_chunk1 ? tr->q_all_b_buf_c1     : tr->q_all_b_buf_c2,     shape_q_all_b);
-            }
             feedDropoutMasksBwd(feeds, bg, (uint32_t)i);
 
             NSDictionary* res = nil;
@@ -8153,37 +7971,31 @@ static void nncp_c1kv_verify_layer(OnlineTrainer* tr, const MPSTransformerWeight
     }
 }
 
-// Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): supersedes bug
-// 6's FIFO slide. The original nncp.c never discards pre_seg_mem mid-segment
-// — mem is frozen for the WHOLE segment, and the "current" region simply
-// grows. Reproducing that exactly with a chunked (chunk1/chunk2) BPTT split
-// means chunk2's mem view must be [pre_seg_mem(256, UNCHANGED) ++ chunk1's
-// real K/V(32)] = 288 total, NOT a FIFO-discard-then-append back down to 256
-// (which is what the superseded nncp_chunk_mem_slide_core did). Concat is
-// simpler than slide: no overlapping read/write, so no memmove/race concerns
-// — chunk1's K/V is just appended into the ALREADY-CORRECT (never touched)
-// tail slots [mem_len_true : mem_len_true+T_CHUNK) that chunk1's own "Reset
-// KV memory" step (run_per_layer_bptt_chunk) zero-filled as a placeholder.
-static void nncp_chunk_mem_concat(OnlineTrainer* tr, uint32_t H) {
-    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;
-    const int MEM_LEN      = MEM_LEN_TRUE + (int)BPTT_CHUNK_LEN;  // 288, unified width
-    const int T_CHUNK      = (int)BPTT_CHUNK_LEN;
-    const int B            = SEG_TRAIN_STREAMS;
-    auto concat_one = [&](id<MTLBuffer> mem_buf, id<MTLBuffer> chunk1_buf) {
+// Bug 6 fix (chunk-mem-fix-design.md): chunk1→chunk2 mem discontinuity fix.
+// kv_mem_buf (mem_len=256-wide) FIFO-slides between chunk1 and chunk2's
+// forward passes: drop the oldest T_CHUNK(32) entries, append chunk1's own
+// K/V at the tail — so chunk2 sees [pre_seg_mem's newest 224] ++ [chunk1's
+// own 32], staying 256-wide throughout (A-only revert baseline; bug8(B)'s
+// concat-not-slide unification is parked on wip/bug8b-unified320-snapshot).
+static void nncp_chunk_mem_slide(OnlineTrainer* tr, uint32_t H) {
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;   // 256
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;            // 32
+    const int KEEP    = MEM_LEN - T_CHUNK;              // 224
+    const int B       = SEG_TRAIN_STREAMS;
+    auto slide_one = [&](id<MTLBuffer> mem_buf, id<MTLBuffer> chunk1_buf) {
         if (!mem_buf || !chunk1_buf) return;
         float* mem = (float*)[mem_buf contents];
         const float* c1 = (const float*)[chunk1_buf contents];
         for (int s = 0; s < B; s++) {
-            float* mem_s = mem + (size_t)s * MEM_LEN * H;         // [0:MEM_LEN) per stream
-            const float* c1_s = c1 + (size_t)s * T_CHUNK * H;     // [0:T_CHUNK) per stream
-            // [0:MEM_LEN_TRUE) is pre_seg_mem — untouched, left exactly as
-            // chunk1's own "Reset KV memory" step wrote it.
-            memcpy(mem_s + (size_t)MEM_LEN_TRUE * H, c1_s, (size_t)T_CHUNK * H * sizeof(float));
+            float* mem_s = mem + (size_t)s * MEM_LEN * H;
+            const float* c1_s = c1 + (size_t)s * T_CHUNK * H;
+            memmove(mem_s, mem_s + (size_t)T_CHUNK * H, (size_t)KEEP * H * sizeof(float));
+            memcpy(mem_s + (size_t)KEEP * H, c1_s, (size_t)T_CHUNK * H * sizeof(float));
         }
     };
     for (uint32_t li = 0; li < tr->L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-        concat_one(tr->kv_mem_buf_k[li], tr->chunk1_kv_buf_k[li]);
-        concat_one(tr->kv_mem_buf_v[li], tr->chunk1_kv_buf_v[li]);
+        slide_one(tr->kv_mem_buf_k[li], tr->chunk1_kv_buf_k[li]);
+        slide_one(tr->kv_mem_buf_v[li], tr->chunk1_kv_buf_v[li]);
     }
 }
 
@@ -8197,11 +8009,8 @@ static void nncp_chunk_mem_concat(OnlineTrainer* tr, uint32_t H) {
 // (e.g. an unnoticed second reset, or a stale cached MPSGraphTensorData
 // wrapping the OLD buffer contents from before the slide).
 static void nncp_slide_verify_layer(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
-    // Bug 8 fix (B): MEM_LEN is now the unified 288-wide kv_mem_buf width
-    // (was 256) — the "last slot" check below still holds unchanged under
-    // concat (mem[MEM_LEN-1] == chunk1_kv[T_CHUNK-1] either way).
     const int T_CHUNK = (int)BPTT_CHUNK_LEN;
-    const int MEM_LEN = (int)g_nncp_profile.mem_len + T_CHUNK;
+    const int MEM_LEN = (int)g_nncp_profile.mem_len;
     const float* mem = (const float*)[tr->kv_mem_buf_k[layer] contents];
     const float* c1  = (const float*)[tr->chunk1_kv_buf_k[layer] contents];
     const float* mem_last = mem + (size_t)(MEM_LEN - 1) * H;      // b=0, pos=MEM_LEN-1
@@ -8266,7 +8075,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [drain commit];
             [drain waitUntilCompleted];
         }
-        nncp_chunk_mem_concat(tr, H);  // bug 8 fix (B): chunk1's K/V → chunk2's mem, concat (not slide)
+        nncp_chunk_mem_slide(tr, H);  // bug 6 fix: chunk1's K/V slides into chunk2's mem (A-only baseline)
         if (nncp_c1kv_verify_enabled()) {
             static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
             for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
@@ -8778,15 +8587,12 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
         zeroBuf(tr->v_rel_r, (size_t)tr->NH * tr->HD * tr->d_pos);
     }
     zeroBuf(tr->v_b_rel_r,  (size_t)tr->NH * tr->ext_len);
-    // Bug 8 fix (B): kv_mem_buf_k/v are 288-wide (unified) now; kv_pre_seg_buf_k/v
-    // stay 256-wide (decode's true mem_len latch).
-    const size_t MEM_SLOTS_UNIFIED = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
-    const size_t MEM_SLOTS_TRUE    = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
     for (int li = 0; li < SEG_MAX_LAYERS; li++) {
-        zeroBuf(tr->kv_mem_buf_k[li],     MEM_SLOTS_UNIFIED * rH);
-        zeroBuf(tr->kv_mem_buf_v[li],     MEM_SLOTS_UNIFIED * rH);
-        zeroBuf(tr->kv_pre_seg_buf_k[li], MEM_SLOTS_TRUE * rH);
-        zeroBuf(tr->kv_pre_seg_buf_v[li], MEM_SLOTS_TRUE * rH);
+        zeroBuf(tr->kv_mem_buf_k[li],     MEM_SLOTS * rH);
+        zeroBuf(tr->kv_mem_buf_v[li],     MEM_SLOTS * rH);
+        zeroBuf(tr->kv_pre_seg_buf_k[li], MEM_SLOTS * rH);
+        zeroBuf(tr->kv_pre_seg_buf_v[li], MEM_SLOTS * rH);
     }
 
     if (!deterministic_init) return; // leave weights as-is
