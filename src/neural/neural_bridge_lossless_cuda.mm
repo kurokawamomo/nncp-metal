@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <Accelerate/Accelerate.h>
+#include <vector>
 
 #include "neural_bridge.h"
 #include "layer_flow_optimizer.h"
@@ -1268,6 +1269,40 @@ static inline size_t get_block_len() {
 
 static mach_timebase_info_data_t g_tb = {};
 
+// NNCP_DECODE_DUMP=1 companion (2026-07-05, "配膳の皿違い" triage): decode_dump.inc
+// (mps_transformer_graph.mm) already confirmed decode_ce_bpc ≈ [LOSS] and 320/320
+// kernel-parity PASS for seg450, yet actual coded bits (3.61 bpc) far exceed both —
+// meaning the divergence is NOT in the model (kernel or its inputs) but somewhere
+// between "probs computed here" and "write_sym's actual bit cost". This local
+// (this file doesn't include decode_dump.inc) copy of the same env-var scheme
+// gates a coder-side CE + per-token bit-count dump at the EXACT probs/byte_val
+// write_sym sees, isolating an off-by-one (wrong t's distribution encoding
+// byte t) or stream/table mismatch from a genuine coder bug (already audited by
+// Pane 4 as correct).
+static bool nb_decode_dump_enabled() {
+    static int v = -1;
+    if (v < 0) v = getenv("NNCP_DECODE_DUMP") ? 1 : 0;
+    return v != 0;
+}
+static int nb_decode_dump_target_seg() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_DECODE_DUMP_SEG");
+        v = e ? atoi(e) : 1;
+        if (v < 1) v = 1;
+    }
+    return v;
+}
+static int nb_decode_dump_ntok() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_DECODE_DUMP_NTOK");
+        v = e ? atoi(e) : 3;
+        if (v < 1) v = 1;
+    }
+    return v;
+}
+
 // Main CUDA-compatible lossless compression function — segment-based (Case 3 architecture)
 size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t input_size,
                                            uint8_t* output_data, size_t output_capacity,
@@ -1379,6 +1414,43 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
             mps_transformer_execute_segment(mps_ctx, seg_tokens, NUM_STREAMS, SEG_LEN, seg_logits);
             uint64_t perf_t1 = mach_absolute_time();
 
+            // NO-GO triage (2026-07-04, decode-train gap — see
+            // baseline2k-report-20260704.md): NNCP_CODED_BITS_STEP=1 logs the
+            // actual arithmetic-coder output size for THIS segment, summed
+            // across all NUM_STREAMS encoders. PutBitState.idx is the coder's
+            // running byte-write position (see put_bit_flush's use of it at
+            // its return); a pre/post delta gives exactly the bytes this
+            // segment cost, independent of [LOSS]'s own (separately
+            // computed, see run_per_layer_bptt_chunk) forward pass. Reported
+            // in bits (×8, byte granularity — arithmetic coders don't expose
+            // sub-byte counts mid-stream, and 100+ symbols/seg makes this a
+            // fine approximation for a per-seg trend, not a bit-exact count).
+            static int s_coded_bits_step = -1;
+            if (s_coded_bits_step < 0) s_coded_bits_step = !!getenv("NNCP_CODED_BITS_STEP");
+            uint64_t coded_bytes_before = 0;
+            if (s_coded_bits_step) {
+                for (int s = 0; s < ns; s++) coded_bytes_before += (uint64_t)encoders[s].idx;
+            }
+
+            // NNCP_CODED_BREAKDOWN=1 (2026-07-05, "軸の特定" — decode_ce==coder_ce
+            // already confirmed at seg450's s=0 head, so the excess bits must live
+            // elsewhere: either spread across t (in-seg/KV context degrading later
+            // in the segment) or concentrated in streams other than s=0 (a
+            // per-stream KV/index bug isolated to decode, since training processes
+            // all streams identically and is known-healthy). [CODED_S] gives the
+            // per-stream total for this seg; [CODED_T] gives s=0's per-token cost
+            // across the whole segment. Reuses NNCP_DECODE_DUMP_SEG for which seg
+            // to report (no separate env needed).
+            static int s_coded_breakdown = -1;
+            if (s_coded_breakdown < 0) s_coded_breakdown = !!getenv("NNCP_CODED_BREAKDOWN");
+            const bool breakdown_this_seg = s_coded_breakdown
+                && ((perf_count + 1) == nb_decode_dump_target_seg());
+            std::vector<uint64_t> bd_stream_before;
+            if (breakdown_this_seg) {
+                bd_stream_before.resize(ns);
+                for (int s = 0; s < ns; s++) bd_stream_before[s] = (uint64_t)encoders[s].idx;
+            }
+
             // 4. Arithmetic encode + buffer training pairs (t outer, s inner for training symmetry).
             for (int t = 0; t < SEG_LEN; t++) {
                 const size_t abs_pos = file_pos + block_idx + (size_t)t;
@@ -1411,11 +1483,59 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                     }
 
                     const uint8_t byte_val = input_data[data_off];
-                    write_sym(&encoders[s], probs, vocab_size, (int)byte_val);
+
+                    // NNCP_DECODE_DUMP=1 (案2続き, 2026-07-05): capture the coder's
+                    // OWN view of this token — the exact `probs`/`byte_val` write_sym
+                    // is about to consume, plus its actual per-token bit cost (idx
+                    // delta) — right at the point of use. Stream s=0 only, matching
+                    // decode_dump.inc's scope (mps_transformer_graph.mm, which
+                    // computed decode_ce_bpc from the same segment/token).
+                    const bool dump_this_coder_tok = (s == 0) && nb_decode_dump_enabled()
+                        && ((perf_count + 1) == nb_decode_dump_target_seg())
+                        && (t < nb_decode_dump_ntok());
+                    // [CODED_T]: s=0's per-token bit cost across the WHOLE segment
+                    // (not just the first NTOK tokens) — isolates t-dependence
+                    // (in-seg/KV context degrading later in the segment) from a
+                    // per-stream bug.
+                    const bool breakdown_this_tok = breakdown_this_seg && (s == 0);
+                    if (dump_this_coder_tok || breakdown_this_tok) {
+                        double coder_ce_bpc = dump_this_coder_tok
+                            ? -log2((double)fmaxf(probs[byte_val], 1e-30f)) : 0.0;
+                        uint64_t idx_before = (uint64_t)encoders[s].idx;
+                        write_sym(&encoders[s], probs, vocab_size, (int)byte_val);
+                        uint64_t idx_after = (uint64_t)encoders[s].idx;
+                        uint64_t coder_bits = (idx_after - idx_before) * 8ULL;
+                        if (dump_this_coder_tok)
+                            fprintf(stderr, "[DEC_DUMP] tok=%d coder_ce_bpc=%.4f coder_bits=%llu byte_val=%u\n",
+                                    t, coder_ce_bpc, (unsigned long long)coder_bits, (unsigned)byte_val);
+                        if (breakdown_this_tok)
+                            fprintf(stderr, "[CODED_T] seg=%d t=%d bits=%llu\n",
+                                    perf_count + 1, t, (unsigned long long)coder_bits);
+                    } else {
+                        write_sym(&encoders[s], probs, vocab_size, (int)byte_val);
+                    }
 
                     // Accumulate training target for segment-level backward pass.
                     if (g_online_trainer)
                         seg_targets[s * SEG_LEN + t] = (int32_t)byte_val;
+                }
+            }
+
+            if (s_coded_bits_step) {
+                uint64_t coded_bytes_after = 0;
+                for (int s = 0; s < ns; s++) coded_bytes_after += (uint64_t)encoders[s].idx;
+                uint64_t seg_bits = (coded_bytes_after - coded_bytes_before) * 8ULL;
+                fprintf(stderr, "[CODED] seg=%d bits=%llu\n",
+                        perf_count + 1, (unsigned long long)seg_bits);
+            }
+
+            // [CODED_S]: per-stream bit total for this seg — isolates a
+            // stream-dependent (per-stream KV/index) bug from a t-dependent one.
+            if (breakdown_this_seg) {
+                for (int s = 0; s < ns; s++) {
+                    uint64_t bits = ((uint64_t)encoders[s].idx - bd_stream_before[s]) * 8ULL;
+                    fprintf(stderr, "[CODED_S] seg=%d s=%d bits=%llu\n",
+                            perf_count + 1, s, (unsigned long long)bits);
                 }
             }
 

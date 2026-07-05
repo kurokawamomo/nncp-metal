@@ -457,6 +457,7 @@ kernel void transformer_attention_decode_cached(
     constant uint&      d_pos          [[buffer(12)]],
     constant uint&      total_len      [[buffer(13)]],
     constant float&     b_rel_r_scale  [[buffer(14)]],
+    constant float&     score_clamp_bound [[buffer(15)]],  // NNCP_DECODE_SCORE_CLAMP A/B switch; default 50.0f
     uint2 gid  [[thread_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]
 ) {
@@ -489,7 +490,7 @@ kernel void transformer_attention_decode_cached(
         float dot = simd_sum(partial_dot) * scale;
 
         dot += q_rel_k * scale + B_rel_r[h * total_len + dist] * b_rel_r_scale;
-        dot = clamp(dot, -50.0f, 50.0f);
+        dot = clamp(dot, -score_clamp_bound, score_clamp_bound);
         if (lane == 0) scores_tmp[score_base + k] = dot;
         if (dot > max_score) max_score = dot;
     }
@@ -535,6 +536,7 @@ kernel void transformer_attention_decode_cached_online(
     constant uint&      d_pos          [[buffer(12)]],
     constant uint&      total_len      [[buffer(13)]],
     constant float&     b_rel_r_scale  [[buffer(14)]],
+    constant float&     score_clamp_bound [[buffer(15)]],  // NNCP_DECODE_SCORE_CLAMP A/B switch; default 50.0f
     uint2 gid  [[thread_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]
 ) {
@@ -579,7 +581,7 @@ kernel void transformer_attention_decode_cached_online(
         float dot  = simd_sum(dot_partial) * scale;
         float qrel = simd_sum(q_rel_partial) * scale;
         dot += qrel + B_rel_r[h * total_len + dist] * b_rel_r_scale;
-        dot = clamp(dot, -50.0f, 50.0f);
+        dot = clamp(dot, -score_clamp_bound, score_clamp_bound);
 
         float new_m = max(m, dot);
         float alpha = exp(m - new_m);
@@ -638,6 +640,82 @@ kernel void kv_memory_shift(
 
     kv_k[dst] = kv_k[src];
     kv_v[dst] = kv_v[src];
+}
+
+// Bug 8 fix (2026-07-05, window-symmetry-fix-design.md, design (A)): generalized
+// KV memory shift for current_len != memory_len (current_len = seg_len here,
+// NOT memory_len — the original kv_memory_shift above hardcodes them equal,
+// which only held while kv_total_len was wrongly kv_memory_len*2; the fix sets
+// kv_total_len = kv_memory_len + seg_len, matching the original nncp.c's
+// per-segment reset cadence exactly). New mem = [old_mem[seg_len:memory_len]
+// (drop the oldest seg_len) ++ current[0:seg_len] (append all of current)].
+//
+// Two-kernel (scratch-buffer) design, NOT a single in-place kernel: computing
+// this in place would race — e.g. dest slot `pos` may read source slot
+// `pos+seg_len`, while a DIFFERENT thread writes THAT same slot as ITS OWN
+// destination, with no ordering guarantee between parallel threads in one
+// dispatch. Stage 1 reads only from the untouched original buffer into a
+// same-size scratch region; stage 2 (a separate dispatch, memory-barriered
+// after stage 1) copies scratch back into the cache's memory region. Mirrors
+// nncp_chunk_mem_slide_core's CPU-side logic (online_trainer.mm, bug 6 fix)
+// exactly, just as two GPU passes instead of a CPU memmove+memcpy.
+//
+// Grid (both kernels): [num_lb * memory_len * H, 1, 1]
+kernel void kv_memory_shift_to_scratch(
+    device const half*  kv_k        [[buffer(0)]],
+    device const half*  kv_v        [[buffer(1)]],
+    device half*        scratch_k   [[buffer(2)]],
+    device half*        scratch_v   [[buffer(3)]],
+    constant uint&      num_lb      [[buffer(4)]],  // num_layers * batch_size
+    constant uint&      total_len   [[buffer(5)]],  // memory_len + seg_len
+    constant uint&      memory_len  [[buffer(6)]],  // tokens kept as memory
+    constant uint&      seg_len     [[buffer(7)]],  // current region width
+    constant uint&      H           [[buffer(8)]],  // hidden_size
+    uint gid [[thread_position_in_grid]]
+) {
+    uint n = num_lb * memory_len * H;
+    if (gid >= n) return;
+
+    uint h   = gid % H;
+    uint rem = gid / H;
+    uint pos = rem % memory_len;  // destination memory slot (in the NEW mem)
+    uint lb  = rem / memory_len;
+
+    uint src_pos = (pos < memory_len - seg_len)
+        ? (pos + seg_len)                          // shifted-forward old mem
+        : (memory_len + (pos - (memory_len - seg_len)));  // appended current
+
+    uint src = lb * total_len * H + src_pos * H + h;
+    uint dst = lb * memory_len * H + pos * H + h;
+
+    scratch_k[dst] = kv_k[src];
+    scratch_v[dst] = kv_v[src];
+}
+
+kernel void kv_memory_shift_from_scratch(
+    device half*        kv_k        [[buffer(0)]],
+    device half*        kv_v        [[buffer(1)]],
+    device const half*  scratch_k   [[buffer(2)]],
+    device const half*  scratch_v   [[buffer(3)]],
+    constant uint&      num_lb      [[buffer(4)]],
+    constant uint&      total_len   [[buffer(5)]],  // memory_len + seg_len
+    constant uint&      memory_len  [[buffer(6)]],
+    constant uint&      H           [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint n = num_lb * memory_len * H;
+    if (gid >= n) return;
+
+    uint h   = gid % H;
+    uint rem = gid / H;
+    uint pos = rem % memory_len;
+    uint lb  = rem / memory_len;
+
+    uint dst = lb * total_len * H + pos * H + h;
+    uint src = lb * memory_len * H + pos * H + h;
+
+    kv_k[dst] = scratch_k[src];
+    kv_v[dst] = scratch_v[src];
 }
 
 // SGD weight update: weight[i] -= lr * grad[i]

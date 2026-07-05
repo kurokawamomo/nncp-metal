@@ -117,6 +117,83 @@ static bool nncp_wqnorm_every_step_forced() {
     return v != 0;
 }
 
+// ---------------------------------------------------------------------------
+// Dropout spike (2026-07-04, ~/Codes/architect/nncp-implimentation-report/
+// plan-A-quality-first-20260704.md (b)): mask-multiply dropout. MPSGraph's
+// native dropoutTensor has no supported backward (see maybe_dropout's
+// disabled callers elsewhere in this file, all pinned to rate=0.0f with a
+// comment to that effect) — feeding a Bernoulli mask as a placeholder and
+// multiplying is plain elementwise math, so autodiff (and metal_bw_layer's
+// hand-written backward, when/if wired for dropout — out of scope here)
+// handles it exactly like any other multiply.
+//
+// Scope of this increment: 2 of the 7 original-nncp dropout sites (Pane 4's
+// audit) — attn_out pre-residual (#4, dropout_prob) and FF2-out pre-residual
+// (#6, dropout_prob). The other 5 (#1 embed, #2 Q/V, #3 softmax post
+// dropout_att_prob, #5 FF1-out, #7 final) are staged for later increments.
+//
+// Env gate: NNCP_DROPOUT=<rate> (e.g. 0.19). Unset/<=0/unparseable → rate=0,
+// and every call site below skips mask creation/application entirely so the
+// MPSGraph graph is byte-for-byte the same shape as before this change —
+// this is what guarantees the "rate=0 bit-exact" verification requirement.
+static float nncp_dropout_rate() {
+    static float cached = -1.0f;
+    if (cached < 0.0f) {
+        const char* e = getenv("NNCP_DROPOUT");
+        float v = 0.0f;
+        if (e && e[0] != '\0') {
+            char* end = nullptr;
+            float parsed = strtof(e, &end);
+            if (end != e && parsed > 0.0f && parsed < 1.0f) v = parsed;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+// Deterministic per-element Bernoulli mask fill, inverted-dropout convention
+// (Pane 4's audit of nncp.c's dropout_mul/nc_tensor_set_dropout): kept
+// elements scaled by 1/(1-rate), dropped elements zero. `seed` must be
+// identical between the forward call that originates a layer's mask and any
+// later reuse of that SAME mask (this increment avoids needing that: the
+// mask is generated once at forward time and saved into a persistent
+// per-layer buffer — see tr->dropout_mask_attn/ffn2[i] — then only ever READ
+// back for backward-recompute, never regenerated from the seed there; the
+// seed only needs to be unique and reproducible run-to-run for a given
+// (step, chunk, layer, hook), which is what makes this "決定的" per the spec).
+// splitmix64: fast, tiny, fully deterministic — no <random> dependency.
+static inline uint64_t nncp_splitmix64_next(uint64_t& state) {
+    uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static void nncp_fill_dropout_mask(float* mask, size_t n, float rate, uint64_t seed) {
+    uint64_t state = seed;
+    const float keep_scale = 1.0f / (1.0f - rate);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t r = nncp_splitmix64_next(state);
+        // top 24 bits → uniform float in [0,1)
+        float u = (float)(r >> 40) * (1.0f / 16777216.0f);
+        mask[i] = (u >= rate) ? keep_scale : 0.0f;
+    }
+}
+
+// Seed derivation: unique per (step_kind, step, t_start-chunk, layer, hook).
+// step_kind separates train vs retrain counters (which can otherwise collide
+// at the same numeric value); hook_id separates attn(#4)=0 from ffn2(#6)=1.
+static inline uint64_t nncp_dropout_seed(bool is_retrain, uint64_t step,
+                                          int t_start, uint32_t layer_idx,
+                                          uint32_t hook_id) {
+    uint64_t s = is_retrain ? 0xD12E5EED1ULL : 0xF012E5EEDULL;
+    s = s * 1000003ULL + step;
+    s = s * 1000003ULL + (uint64_t)(uint32_t)t_start;
+    s = s * 1000003ULL + layer_idx;
+    s = s * 1000003ULL + hook_id;
+    return s;
+}
+
 // ---- Sub-structs for layer-chunked gradient checkpoint (L > 8 only) ----
 
 struct ChkFwdCtx {
@@ -216,8 +293,21 @@ struct PerLayerFwdGraph {
     MPSGraphTensor*  w_ln;       // [4, H]
     MPSGraphTensor*  w_rel_r;    // [NH, HD, D_POS]
     MPSGraphTensor*  b_rel_r;    // [NH, EXT]
-    MPSGraphTensor*  kv_k;       // [B*MEM, H]
+    MPSGraphTensor*  kv_k;       // [B*MEM, H]  (MEM=288 unified, bug 8 fix (B))
     MPSGraphTensor*  kv_v;       // [B*MEM, H]
+    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): causal_mask/
+    // P_all_q/Q_all_b were graph-build-time CONSTANTS, baked for one fixed
+    // chunk. Now placeholders — chunk1 and chunk2 need DIFFERENT relative-
+    // distance tables for the same mem slots (chunk1's true predecessor count
+    // is mem_len=256; chunk2's is mem_len+T_CHUNK=288, since chunk2's mem now
+    // holds chunk1's real K/V too, not a FIFO-discarded slide) and different
+    // masks (chunk1 masks out the mem-slot's last T_CHUNK entries, which are
+    // dummy/unused for chunk1; chunk2 doesn't). Both variants are precomputed
+    // ONCE (nncp_precompute_attn_tables) into persistent MTLBuffers and fed
+    // zero-copy per chunk call — see run_per_layer_bptt_chunk.
+    MPSGraphTensor*  causal_mask; // [T, EXT]
+    MPSGraphTensor*  P_all_q;     // [1, T, D_POS, EXT]
+    MPSGraphTensor*  Q_all_b;     // [T, EXT, B_REL_STRIDE]
     MPSGraphTensor*  x_out;      // [BT, H] output
 
     // --- Phase M-2b Step 2: forward intermediates exposed for backward ---
@@ -226,12 +316,35 @@ struct PerLayerFwdGraph {
     // buffers. NULL if not requested or if profile path doesn't compute it.
     MPSGraphTensor*  t_x_ln1;     // [BT, H]    Pre-LN1 output (= x_in for default)
     MPSGraphTensor*  t_Q_saved;   // [BT, H]    Q projection output
+    // Chunk-boundary mem fix (2026-07-05, chunk-mem-fix-design.md step 1):
+    // K/V projection outputs, saved so chunk1's own K/V can be FIFO-slid into
+    // chunk2's kv_mem_buf — mirrors t_Q_saved's save pattern exactly (same
+    // [BT,H] shape, same identityWithTensor defense-in-depth rationale below).
+    MPSGraphTensor*  t_K_saved;   // [BT, H]    K projection output
+    MPSGraphTensor*  t_V_saved;   // [BT, H]    V projection output
     MPSGraphTensor*  t_attn_prob; // [B, NH, T, EXT_LEN]  softmax output
     MPSGraphTensor*  t_attn_out;  // [BT, H]    O-projection output
+    // ATTN_ARB (2026-07-05): PRE-O-proj — same definition as decode_dump.inc's
+    // dumped attn_out (dec_buf_attn_val). See build_single_layer's comment.
+    MPSGraphTensor*  t_attn_pre_o; // [BT, H]
     MPSGraphTensor*  t_geglu_val; // [BT, F]    GeGLU val half (enwik8 only); else NULL
     MPSGraphTensor*  t_geglu_gate;// [BT, F]    GeGLU gate half (enwik8 only); else NULL
+    // XCMP_SUB (2026-07-05, injection-point triage): actual post-activation
+    // tensor (post-GeGLU/GELU, pre-FFN2) — matches decode's dec_buf_geglu /
+    // dec_buf_ffn1-in-place exactly. [BT, F].
+    MPSGraphTensor*  t_ffn_act;
     MPSGraphTensor*  t_x_ln2;     // [BT, H]    Pre-LN2 output (= x_mid for default)
     MPSGraphTensor*  t_x_mid;     // [BT, H]    residual #1 output (LN2 input)
+
+    // --- Dropout spike (2026-07-04, plan-A-quality-first (b)): mask-multiply
+    // dropout, NOT MPSGraph's dropoutTensor (backward unsupported there — see
+    // maybe_dropout's disabled callers elsewhere in this file). NULL when
+    // NNCP_DROPOUT is unset/<=0 — build_single_layer skips the multiply
+    // entirely in that case, so the graph is structurally identical to
+    // before (guarantees rate=0 bit-exactness). [BT, H] each, matching
+    // attn_out's and ff(FF2 out)'s shape at the residual-add point.
+    MPSGraphTensor*  mask_attn;   // hook #4 (Pane 4's original-nncp numbering)
+    MPSGraphTensor*  mask_ffn2;   // hook #6
 };
 
 struct PerLayerBwdGraph {
@@ -244,6 +357,15 @@ struct PerLayerBwdGraph {
     MPSGraphTensor*  w_ln;
     MPSGraphTensor*  w_rel_r, *b_rel_r;
     MPSGraphTensor*  kv_k, *kv_v;
+    // Bug 8 fix (B): same rationale as PerLayerFwdGraph's own fields.
+    MPSGraphTensor*  causal_mask, *P_all_q, *Q_all_b;
+    // Dropout spike: same mask tensors as PerLayerFwdGraph, fed from the
+    // SAME per-layer mask buffer the forward pass generated and saved (see
+    // tr->dropout_mask_attn/ffn2[i]) — never regenerated here, so this
+    // graph's internal forward-recompute reproduces bit-identical dropout
+    // to what actually produced pl_h[i+1], which autodiff needs to be
+    // correct. NULL when dropout is disabled.
+    MPSGraphTensor*  mask_attn, *mask_ffn2;
     // Outputs
     MPSGraphTensor*  grad_in;    // [BT, H]
     MPSGraphTensor*  dw_q, *dw_k, *dw_v, *dw_o;
@@ -346,9 +468,15 @@ struct M2BwContext {
     id<MTLBuffer> d_x_mid;      // [BT, H]           d(x_mid)
     id<MTLBuffer> d_q_rel_raw;  // [B*NH, T, D_POS]  d_q_rel_raw (rel_pe_q_scatter_bw out, per-row)
 
-    // Rel-PE distance tables (precomputed once from profile)
-    id<MTLBuffer> qdist_buf;    // [T, TL] int32
-    id<MTLBuffer> bdist_buf;    // [T, TL] int32
+    // Rel-PE distance tables (precomputed once from profile). Bug 8(B):
+    // unified 320-width window makes the mem-portion distance depend on
+    // which BPTT chunk this call is (chunk1 abs_query_offset=0, chunk2=32
+    // — same reasoning as PerLayerFwdGraph's causal_mask/P_all_q/Q_all_b),
+    // so two persistent variants are precomputed once and selected per call.
+    id<MTLBuffer> qdist_buf_c1; // [T, TL] int32, abs_query_offset=0
+    id<MTLBuffer> bdist_buf_c1; // [T, TL] int32, abs_query_offset=0
+    id<MTLBuffer> qdist_buf_c2; // [T, TL] int32, abs_query_offset=T_CHUNK
+    id<MTLBuffer> bdist_buf_c2; // [T, TL] int32, abs_query_offset=T_CHUNK
 
     // Attention recompute scratch
     id<MTLBuffer> k_full;       // [B*NH, TL, HD]    K_full = kv_mem_k ++ K_new (recomputed per layer)
@@ -398,7 +526,8 @@ static void metal_bw_destroy(M2BwContext* m2) {
     m2->d_x_ln1 = nil; m2->d_x_ln2 = nil; m2->d_x_mid = nil;
     m2->d_q_rel_raw = nil;
     m2->ffn_recomp = nil;
-    m2->qdist_buf = nil; m2->bdist_buf = nil;
+    m2->qdist_buf_c1 = nil; m2->bdist_buf_c1 = nil;
+    m2->qdist_buf_c2 = nil; m2->bdist_buf_c2 = nil;
     m2->k_full = nil; m2->v_full = nil; m2->kv_new_scr = nil; m2->zero_bias = nil;
     m2->q_mh = nil; m2->d_attn_out_mh = nil;
     m2->d_q_mh = nil; m2->d_k_mh = nil; m2->d_v_mh = nil; m2->d_q_rel_mh = nil;
@@ -406,8 +535,8 @@ static void metal_bw_destroy(M2BwContext* m2) {
 }
 
 static void m2_fill_relpe_dist_tables(int32_t* qdist, int32_t* bdist,
-                                       uint32_t T, uint32_t MEM_LEN, uint32_t TL,
-                                       uint32_t D_POS); // forward declaration
+                                       uint32_t T, uint32_t MEM_LEN_TRUE, uint32_t MEM_LEN, uint32_t TL,
+                                       uint32_t D_POS, int abs_query_offset); // forward declaration
 
 static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
                                   uint32_t L, uint32_t H, uint32_t F, uint32_t V,
@@ -529,13 +658,23 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ffn_recomp  = newBuf(BT_F * sizeof(float));
 
     // Rel-PE distance tables [T_CHUNK, TL] int32, precomputed from profile.
+    // Bug 8(B): MEM_LEN passed in is now the unified width (mem_len_true +
+    // T_CHUNK); MEM_LEN_TRUE recovers the true decode mem_len for the
+    // chunk-dependent mem-portion distance formula. Two variants (chunk1
+    // abs_query_offset=0, chunk2 abs_query_offset=T_CHUNK) precomputed once.
     {
+        const uint32_t MEM_LEN_TRUE = MEM_LEN - T_CHUNK;
         const size_t n = (size_t)T_CHUNK * TL;
-        m2->qdist_buf = newBuf(n * sizeof(int32_t));
-        m2->bdist_buf = newBuf(n * sizeof(int32_t));
-        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf contents],
-                                   (int32_t*)[m2->bdist_buf contents],
-                                   T_CHUNK, MEM_LEN, TL, D_POS);
+        m2->qdist_buf_c1 = newBuf(n * sizeof(int32_t));
+        m2->bdist_buf_c1 = newBuf(n * sizeof(int32_t));
+        m2->qdist_buf_c2 = newBuf(n * sizeof(int32_t));
+        m2->bdist_buf_c2 = newBuf(n * sizeof(int32_t));
+        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf_c1 contents],
+                                   (int32_t*)[m2->bdist_buf_c1 contents],
+                                   T_CHUNK, MEM_LEN_TRUE, MEM_LEN, TL, D_POS, /*abs_query_offset=*/0);
+        m2_fill_relpe_dist_tables((int32_t*)[m2->qdist_buf_c2 contents],
+                                   (int32_t*)[m2->bdist_buf_c2 contents],
+                                   T_CHUNK, MEM_LEN_TRUE, MEM_LEN, TL, D_POS, /*abs_query_offset=*/(int)T_CHUNK);
     }
 
     // Attention K/V recompute scratch
@@ -1086,6 +1225,49 @@ struct OnlineTrainer {
     id<MTLBuffer>   kv_pre_seg_buf_v[SEG_MAX_LAYERS];
     bool            kv_pre_seg_valid;
 
+    // Bug 6 fix (2026-07-05, chunk-mem-fix-design.md): chunk1's own K/V
+    // [BPTT_CHUNK_LEN * H], saved via t_K_saved/t_V_saved during chunk1's
+    // forward so chunk2 can FIFO-slide them into kv_mem_buf_k/v — without
+    // this, chunk2 saw only the pre-segment mem (kv_pre_seg_buf), never
+    // chunk1's positions (XCMP: all 20 layers FAIL, layer0 max_abs~3.4).
+    id<MTLBuffer>   chunk1_kv_buf_k[SEG_MAX_LAYERS];
+    id<MTLBuffer>   chunk1_kv_buf_v[SEG_MAX_LAYERS];
+
+    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): kv_mem_buf_k/v
+    // grow from [B, mem_len(256), H] to [B, mem_len+T_CHUNK(288), H] — chunk1
+    // fills [0:256) with pre_seg_mem and zeros [256:288) (dummy, masked);
+    // chunk2 fills [0:256) with the SAME UNCHANGED pre_seg_mem (never
+    // discarded — this is the "concat, not slide" fix) and [256:288) with
+    // chunk1's real K/V (replacing bug 6's FIFO slide). Precomputed causal
+    // mask / relative-distance gather tables, one variant per chunk (fed
+    // zero-copy, no per-call CPU recompute — see nncp_precompute_attn_tables).
+    id<MTLBuffer>   causal_mask_buf_c1, causal_mask_buf_c2;  // [T, EXT=320]
+    id<MTLBuffer>   p_all_q_buf_c1, p_all_q_buf_c2;          // [1,T,D_POS,EXT=320]
+    id<MTLBuffer>   q_all_b_buf_c1, q_all_b_buf_c2;          // [T,EXT=320,B_REL_STRIDE=320]
+    bool            attn_tables_ready = false;
+
+    // XCMP_SUB (2026-07-05, injection-point triage): diagnostic-only, layer0
+    // scratch for the sub-tensor bisection ([XCMP_SUB]). Lazily allocated on
+    // first use (only when NNCP_DECODE_DUMP + XCMP are active); NULL otherwise
+    // — zero cost in normal operation, unlike chunk1_kv_buf_k/v above (which
+    // are production-load-bearing for the bug 6 fix).
+    id<MTLBuffer>   xcmp_x_ln1_buf;
+    id<MTLBuffer>   xcmp_q_buf;
+    id<MTLBuffer>   xcmp_attn_out_buf;
+    id<MTLBuffer>   xcmp_ffn_act_buf;
+    id<MTLBuffer>   xcmp_attn_pre_o_buf;  // ATTN_ARB: same definition as decode's dumped attn_out
+
+    // Dropout spike (2026-07-04, plan-A-quality-first (b)): mask-multiply
+    // dropout, hooks #4 (attn_out) / #6 (FF2-out). Generated once per (layer,
+    // BPTT chunk) at forward time by run_per_layer_bptt_chunk and SAVED here
+    // — the backward-recompute graph (tr->pl_bwd, via build_single_layer's
+    // forward-recompute path) reads the SAME buffer back rather than
+    // regenerating it, so autodiff differentiates through the exact mask
+    // that actually produced pl_h[i+1]. [BT, H] each. Allocated lazily
+    // (nil until first use) only when NNCP_DROPOUT > 0.
+    id<MTLBuffer>   dropout_mask_attn[SEG_MAX_LAYERS];
+    id<MTLBuffer>   dropout_mask_ffn2[SEG_MAX_LAYERS];
+
     // ---- Layer-chunked gradient checkpointing (L > 8, e.g. enwik8) ----
     // 4 groups × 5 layers each; group g covers layers [g*5 .. g*5+4].
     // lgf_* = forward-only graph (reused for all groups).
@@ -1476,7 +1658,10 @@ static bool metal_bw_train_step(OnlineTrainer* tr,
     // Pre-layer: zero-init b_rel_r grad (tied across layers → accumulate kernel).
     if (!accumulate_weight_grads && tr->grad_b_rel_r) {
         const uint32_t NH = tr->NH;
-        const uint32_t EXT_LEN = g_nncp_profile.mem_len + (uint32_t)BPTT_CHUNK_LEN;
+        // grad_b_rel_r's true width is tr->ext_len (bug7's B_REL_STRIDE,
+        // now == unified EXT_LEN == 320), not mem_len+T_CHUNK (288) — using
+        // the latter zeroed only the first 288 of every 320-float head row.
+        const uint32_t EXT_LEN = (uint32_t)tr->ext_len;
         memset([tr->grad_b_rel_r contents], 0,
                (size_t)NH * EXT_LEN * sizeof(float));
     }
@@ -2959,7 +3144,11 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* P_all_q,
     MPSGraphTensor* Q_all_b,
     MPSGraphTensor* b_rt_h,
-    PerLayerFwdGraph* out_intermediates = nullptr)
+    PerLayerFwdGraph* out_intermediates = nullptr,
+    // Dropout spike (plan-A (b)): hook #4 (attn_out, pre-residual) and #6
+    // (ff/FF2-out, pre-residual). NULL ⇒ skipped entirely (rate=0 bit-exact).
+    MPSGraphTensor* mask_attn = nullptr,
+    MPSGraphTensor* mask_ffn2 = nullptr)
 {
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
     const NSInteger FFN1_DIM = is_enwik8 ? (NSInteger)(2*F) : (NSInteger)F;
@@ -2981,6 +3170,17 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_q name:nil];
     MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_k name:nil];
     MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_v name:nil];
+    if (out_intermediates) {
+        // Chunk-boundary mem fix (chunk-mem-fix-design.md step 1): k/v are
+        // live, non-terminal tensors here (consumed below by toMH/k_ext concat),
+        // same situation as t_attn_out — identityWithTensor: forces a distinct
+        // materialization so MPSGraph's memory planner can't alias this dump
+        // output's storage with a same-shape [BT,H] sibling elsewhere in this
+        // repeatedly-invoked graph (see t_Q_saved's comment above for the full
+        // rationale/precedent — this is the same defensive pattern, not new).
+        out_intermediates->t_K_saved = [g identityWithTensor:k name:nil];
+        out_intermediates->t_V_saved = [g identityWithTensor:v name:nil];
+    }
 
     // Multi-head reshape: [BT, H] → [B, NH, T, HD]
     auto toMH = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
@@ -3063,12 +3263,27 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* attn = [g matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v_ext name:nil];
     attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil];
     attn = [g reshapeTensor:attn withShape:@[@(BT), @(H)] name:nil];
+    // ATTN_ARB (2026-07-05, definition-mismatch audit): decode's own dumped
+    // "attn_out" (decode_dump.inc, dec_buf_attn_val) is captured BEFORE the
+    // O-projection — the raw weighted-sum-of-V, pre-w_o. t_attn_out below has
+    // ALWAYS been captured AFTER the w_o matmul (see the line right below) —
+    // an apples-to-oranges comparison against decode's pre-O-proj value,
+    // which is what XCMP_SUB's "attn_out" stage was actually doing. This new
+    // tensor captures the PRE-O-proj value for a fair, same-definition diff.
+    if (out_intermediates) { out_intermediates->t_attn_pre_o = [g identityWithTensor:attn name:nil]; }
     attn = [g matrixMultiplicationWithPrimaryTensor:attn secondaryTensor:w_o name:nil];
     // Defense-in-depth: same rationale as t_Q_saved above — `attn` is [BT,H],
     // the same shape as x_mid/res1/x_ln1/... in this graph, and is also fed
     // forward into the residual add below, so it is a live, non-terminal
     // tensor at the point we also request it as a dump output.
     if (out_intermediates) { out_intermediates->t_attn_out = [g identityWithTensor:attn name:nil]; }
+
+    // Dropout hook #4 (original-nncp numbering, Pane 4's audit): attn_out,
+    // applied AFTER the dump above (t_attn_out records the pre-dropout,
+    // "real" O-projection output — matching what a from-scratch backward
+    // would want to recompute against) but BEFORE the residual add, matching
+    // nncp.c's dropout_mul(attn_out, dropout_prob, ...) placement exactly.
+    if (mask_attn) attn = [g multiplicationWithPrimaryTensor:attn secondaryTensor:mask_attn name:nil];
 
     // Residual #1
     MPSGraphTensor* res1 = [g additionWithPrimaryTensor:residual secondaryTensor:attn name:nil];
@@ -3103,9 +3318,17 @@ static MPSGraphTensor* build_single_layer(
         }
         ff = tr_gelu(g, fp);
     }
+    // XCMP_SUB (2026-07-05): the actual post-activation tensor (post-GeGLU for
+    // enwik8, post-GELU for default), pre-FFN2 — matches decode's dec_buf_geglu
+    // (Pre-LN) / dec_buf_ffn1-in-place (Post-LN) exactly. `ff` is reassigned
+    // right below to the FFN2 output, so save it here, before that happens.
+    if (out_intermediates) { out_intermediates->t_ffn_act = [g identityWithTensor:ff name:nil]; }
     ff = [g additionWithPrimaryTensor:
         [g matrixMultiplicationWithPrimaryTensor:ff secondaryTensor:w_ffn2 name:nil]
         secondaryTensor:b_ffn2 name:nil];
+
+    // Dropout hook #6: FF2-out, pre-residual (nncp.c's dropout_mul(ff2_out, ...)).
+    if (mask_ffn2) ff = [g multiplicationWithPrimaryTensor:ff secondaryTensor:mask_ffn2 name:nil];
 
     // Residual #2
     MPSGraphTensor* res2 = [g additionWithPrimaryTensor:residual secondaryTensor:ff name:nil];
@@ -3113,10 +3336,107 @@ static MPSGraphTensor* build_single_layer(
 }
 
 // Build per-layer forward graph (compiled once, reused for all 20 layers)
+// Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): precompute BOTH
+// chunk variants of the causal mask / relative-distance gather tables ONCE,
+// upload to persistent MTLBuffers, and feed the right one per chunk call
+// (run_per_layer_bptt_chunk) — zero-copy, no per-call CPU recompute (unified
+// memory). MEM_LEN here is the UNIFIED mem-placeholder width (mem_len+T_CHUNK
+// = 288): chunk1's mem holds [pre_seg_mem(256), dummy(32)]; chunk2's holds
+// [pre_seg_mem(256, UNCHANGED — no longer FIFO-slid away), chunk1_kv(32,
+// real)]. `abs_query_offset` is 0 for chunk1, T_CHUNK for chunk2 — the only
+// thing that actually differs between the two chunks' distance tables (see
+// the derivation in this function's git history / the design doc): for a
+// mem-portion key (k < MEM_LEN, "absolute position" defined uniformly as
+// k-mem_len_true), distance = abs_query_offset + mem_len_true + t - k; for an
+// own-chunk key (k >= MEM_LEN, local index kk = k-MEM_LEN), distance = t-kk
+// (offset cancels — this chunk's own causal structure doesn't depend on
+// where the chunk sits in the segment). `extra_mask` (true for chunk1 only)
+// masks out k in [mem_len_true, MEM_LEN) — the "dummy" slots that hold
+// chunk1's own (not-yet-computed-from-chunk1's-own-perspective) data; chunk2
+// leaves this region unmasked since it holds chunk1's REAL K/V there.
+static void nncp_precompute_attn_tables(OnlineTrainer* tr) {
+    if (tr->attn_tables_ready) return;
+    const int T = BPTT_CHUNK_LEN;
+    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;   // 256
+    const int MEM_LEN = MEM_LEN_TRUE + T;                    // 288 (unified)
+    const int EXT_LEN = MEM_LEN + T;                         // 320
+    const int D_POS = (int)tr->d_pos;
+    const int B_REL_STRIDE = (int)tr->ext_len;               // 320 (== EXT_LEN)
+
+    auto build_variant = [&](int abs_query_offset, bool extra_mask,
+                              id<MTLBuffer>& out_mask, id<MTLBuffer>& out_p_all_q,
+                              id<MTLBuffer>& out_q_all_b) {
+        std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
+        std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
+        for (int t = 0; t < T; t++) {
+            for (int k = 0; k < EXT_LEN; k++) {
+                int d;
+                if (k < MEM_LEN) {
+                    d = abs_query_offset + MEM_LEN_TRUE + t - k;
+                    if (extra_mask && k >= MEM_LEN_TRUE) mask_data[(size_t)t * EXT_LEN + k] = -1e9f;
+                } else {
+                    int kk = k - MEM_LEN;
+                    d = t - kk;
+                    if (kk > t) mask_data[(size_t)t * EXT_LEN + k] = -1e9f;
+                }
+                q_dist_vec[(size_t)t * EXT_LEN + k] = ((d % D_POS) + D_POS) % D_POS;
+                b_dist_vec[(size_t)t * EXT_LEN + k] = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
+            }
+        }
+        size_t p_total = (size_t)T * D_POS * EXT_LEN;
+        std::vector<float> p_all(p_total, 0.f);
+        for (int ti = 0; ti < T; ti++)
+            for (int kk = 0; kk < EXT_LEN; kk++)
+                p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[(size_t)ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
+        size_t b_total = (size_t)T * EXT_LEN * B_REL_STRIDE;
+        std::vector<float> b_all(b_total, 0.f);
+        for (int ti = 0; ti < T; ti++)
+            for (int kk = 0; kk < EXT_LEN; kk++)
+                b_all[(size_t)ti * EXT_LEN * B_REL_STRIDE + (size_t)kk * B_REL_STRIDE
+                      + b_dist_vec[(size_t)ti * EXT_LEN + kk]] = 1.f;
+
+        out_mask = [tr->device newBufferWithBytes:mask_data.data()
+                                            length:mask_data.size() * sizeof(float)
+                                           options:MTLResourceStorageModeShared];
+        out_p_all_q = [tr->device newBufferWithBytes:p_all.data()
+                                               length:p_total * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+        out_q_all_b = [tr->device newBufferWithBytes:b_all.data()
+                                               length:b_total * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+    };
+
+    build_variant(0, true,  tr->causal_mask_buf_c1, tr->p_all_q_buf_c1, tr->q_all_b_buf_c1);
+    build_variant(T, false, tr->causal_mask_buf_c2, tr->p_all_q_buf_c2, tr->q_all_b_buf_c2);
+    tr->attn_tables_ready = true;
+
+    // [ATTN_TABLE_DUMP] (2026-07-05, final500 regression triage — candidate ③:
+    // is chunk1's dummy-tail [256:288) actually masked with -1e9 in the buffer
+    // that's really fed to the graph?). Direct byte-level check of the
+    // persistent MTLBuffer right after upload — t=0, boundary k indices only.
+    if (getenv("NNCP_ATTN_TABLE_DUMP")) {
+        const float* m1 = (const float*)[tr->causal_mask_buf_c1 contents];
+        const float* m2v = (const float*)[tr->causal_mask_buf_c2 contents];
+        fprintf(stderr, "[ATTN_TABLE_DUMP] c1(t=0) k=254..289: ");
+        for (int k = 254; k <= 289; k++) fprintf(stderr, "%.0f ", m1[0 * EXT_LEN + k]);
+        fprintf(stderr, "\n[ATTN_TABLE_DUMP] c2(t=0) k=254..289: ");
+        for (int k = 254; k <= 289; k++) fprintf(stderr, "%.0f ", m2v[0 * EXT_LEN + k]);
+        fprintf(stderr, "\n");
+    }
+}
+
 static void build_per_layer_fwd(OnlineTrainer* tr) {
     const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
-    const int MEM_LEN = g_nncp_profile.mem_len;
+    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): MEM_LEN is now
+    // the UNIFIED mem-placeholder width (true mem_len + T_CHUNK = 288), shared
+    // by chunk1 (mem[256:288) dummy/masked) and chunk2 (mem[256:288) = chunk1's
+    // real K/V, concatenated not slid) — see nncp_precompute_attn_tables for
+    // the per-chunk distance-table variants this enables. EXT_LEN (320) is
+    // MEM_LEN+T_CHUNK, and now equals B_REL_STRIDE exactly (both = mem_len +
+    // seg_len = tr->ext_len) — no separate B_REL_STRIDE constant needed anymore.
+    const int MEM_LEN = (int)g_nncp_profile.mem_len + T;
     const int EXT_LEN = MEM_LEN + T;
+    const int B_REL_STRIDE = (int)tr->ext_len;  // == EXT_LEN now; kept named for clarity at call sites
     const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
     const uint32_t D_POS = tr->d_pos;
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
@@ -3138,71 +3458,51 @@ static void build_per_layer_fwd(OnlineTrainer* tr) {
     ctx.b_ffn2  = [g placeholderWithShape:@[@(H)]                  dataType:MPSDataTypeFloat32 name:@"pl_bf2"];
     ctx.w_ln    = [g placeholderWithShape:@[@4, @(H)]              dataType:MPSDataTypeFloat32 name:@"pl_wln"];
     ctx.w_rel_r = [g placeholderWithShape:@[@(NH), @(HD), @(D_POS)] dataType:MPSDataTypeFloat32 name:@"pl_wr"];
-    ctx.b_rel_r = [g placeholderWithShape:@[@(NH), @(EXT_LEN)]     dataType:MPSDataTypeFloat32 name:@"pl_br"];
+    ctx.b_rel_r = [g placeholderWithShape:@[@(NH), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"pl_br"];
     ctx.kv_k    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvk"];
     ctx.kv_v    = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"pl_kvv"];
+    // Bug 8 fix (B): causal_mask/P_all_q/Q_all_b are now placeholders, fed
+    // per-chunk from one of the two precomputed variants (see
+    // nncp_precompute_attn_tables + run_per_layer_bptt_chunk's feed selection).
+    ctx.causal_mask = [g placeholderWithShape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"pl_mask"];
+    ctx.P_all_q     = [g placeholderWithShape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"pl_pallq"];
+    ctx.Q_all_b     = [g placeholderWithShape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"pl_qallb"];
 
-    // Build constants (causal mask + relative PE tables)
-    std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
-    for (int t = 0; t < T; t++)
-        for (int k = MEM_LEN; k < EXT_LEN; k++)
-            if (k - MEM_LEN > t) mask_data[t * EXT_LEN + k] = -1e9f;
-    MPSGraphTensor* causal_mask = [g constantWithData:
-        [NSData dataWithBytes:mask_data.data() length:mask_data.size() * sizeof(float)]
-        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-
-    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
-    for (int t = 0; t < T; t++)
-        for (int k = 0; k < EXT_LEN; k++) {
-            int d = MEM_LEN + t - k;
-            q_dist_vec[t * EXT_LEN + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
-            b_dist_vec[t * EXT_LEN + k] = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
-        }
-
-    // P_all_q [1, T, D_POS, EXT_LEN]
-    size_t p_total = (size_t)T * D_POS * EXT_LEN;
-    std::vector<float> p_all(p_total, 0.f);
-    for (int ti = 0; ti < T; ti++)
-        for (int kk = 0; kk < EXT_LEN; kk++)
-            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
-    MPSGraphTensor* P_all_q = [g constantWithData:
-        [NSData dataWithBytes:p_all.data() length:p_total * sizeof(float)]
-        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-
-    // Q_all_b [T, EXT_LEN, EXT_LEN]
-    size_t b_total = (size_t)T * EXT_LEN * EXT_LEN;
-    std::vector<float> b_all(b_total, 0.f);
-    for (int ti = 0; ti < T; ti++)
-        for (int kk = 0; kk < EXT_LEN; kk++)
-            b_all[(size_t)ti * EXT_LEN * EXT_LEN + (size_t)kk * EXT_LEN + b_dist_vec[ti * EXT_LEN + kk]] = 1.f;
-    MPSGraphTensor* Q_all_b = [g constantWithData:
-        [NSData dataWithBytes:b_all.data() length:b_total * sizeof(float)]
-        shape:@[@(T), @(EXT_LEN), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-
-    // b_rt_h: slice b_rel_r to [NH, EXT_LEN] → transpose → [1, EXT_LEN, NH]
-    MPSGraphTensor* b_r_sliced = [g sliceTensor:ctx.b_rel_r dimension:1 start:0 length:EXT_LEN name:nil];
+    // b_rt_h: [NH, B_REL_STRIDE] → transpose → [1, B_REL_STRIDE, NH].
     MPSGraphTensor* b_rt_h = [g reshapeTensor:
-        [g transposeTensor:b_r_sliced dimension:0 withDimension:1 name:nil]
-        withShape:@[@1, @(EXT_LEN), @(NH)] name:nil];
+        [g transposeTensor:ctx.b_rel_r dimension:0 withDimension:1 name:nil]
+        withShape:@[@1, @(B_REL_STRIDE), @(NH)] name:nil];
 
     // Initialize intermediate tensor handles to nil; build_single_layer fills them.
     ctx.t_x_ln1 = nil; ctx.t_Q_saved = nil; ctx.t_attn_prob = nil;
     ctx.t_attn_out = nil; ctx.t_geglu_val = nil; ctx.t_geglu_gate = nil;
     ctx.t_x_ln2 = nil; ctx.t_x_mid = nil;
+    ctx.t_K_saved = nil; ctx.t_V_saved = nil; ctx.t_ffn_act = nil; ctx.t_attn_pre_o = nil;
+
+    // Dropout spike: placeholders only when enabled, so the graph is
+    // structurally unchanged (byte-identical) at rate=0.
+    ctx.mask_attn = nil; ctx.mask_ffn2 = nil;
+    if (nncp_dropout_rate() > 0.0f) {
+        ctx.mask_attn = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_attn"];
+        ctx.mask_ffn2 = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_ffn2"];
+    }
 
     ctx.x_out = build_single_layer(g, ctx.x_in,
         ctx.w_q, ctx.w_k, ctx.w_v, ctx.w_o,
         ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
-        causal_mask, P_all_q, Q_all_b, b_rt_h, &ctx);
+        ctx.causal_mask, ctx.P_all_q, ctx.Q_all_b, b_rt_h, &ctx,
+        ctx.mask_attn, ctx.mask_ffn2);
 }
 
 // Build per-layer backward graph (proxy loss method, compiled once)
 static void build_per_layer_bwd(OnlineTrainer* tr) {
     const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
-    const int MEM_LEN = g_nncp_profile.mem_len;
+    // Bug 8 fix (B) — see build_per_layer_fwd's comment for the full rationale.
+    const int MEM_LEN = (int)g_nncp_profile.mem_len + T;
     const int EXT_LEN = MEM_LEN + T;
+    const int B_REL_STRIDE = (int)tr->ext_len;
     const uint32_t H = tr->H, NH = tr->NH, HD = tr->HD, F = tr->F;
     const uint32_t D_POS = tr->d_pos;
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
@@ -3225,46 +3525,28 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
     ctx.b_ffn2   = [g placeholderWithShape:@[@(H)]                  dataType:MPSDataTypeFloat32 name:@"plb_bf2"];
     ctx.w_ln     = [g placeholderWithShape:@[@4, @(H)]              dataType:MPSDataTypeFloat32 name:@"plb_wln"];
     ctx.w_rel_r  = [g placeholderWithShape:@[@(NH), @(HD), @(D_POS)] dataType:MPSDataTypeFloat32 name:@"plb_wr"];
-    ctx.b_rel_r  = [g placeholderWithShape:@[@(NH), @(EXT_LEN)]     dataType:MPSDataTypeFloat32 name:@"plb_br"];
+    ctx.b_rel_r  = [g placeholderWithShape:@[@(NH), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"plb_br"];
     ctx.kv_k     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvk"];
     ctx.kv_v     = [g placeholderWithShape:@[@(B*MEM_LEN), @(H)]    dataType:MPSDataTypeFloat32 name:@"plb_kvv"];
+    // Bug 8 fix (B) — placeholders now, same rationale as build_per_layer_fwd.
+    ctx.causal_mask = [g placeholderWithShape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"plb_mask"];
+    ctx.P_all_q     = [g placeholderWithShape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"plb_pallq"];
+    ctx.Q_all_b     = [g placeholderWithShape:@[@(T), @(EXT_LEN), @(B_REL_STRIDE)] dataType:MPSDataTypeFloat32 name:@"plb_qallb"];
 
-    // Same constants as fwd
-    std::vector<float> mask_data((size_t)T * EXT_LEN, 0.0f);
-    for (int t = 0; t < T; t++)
-        for (int k = MEM_LEN; k < EXT_LEN; k++)
-            if (k - MEM_LEN > t) mask_data[t * EXT_LEN + k] = -1e9f;
-    MPSGraphTensor* causal_mask = [g constantWithData:
-        [NSData dataWithBytes:mask_data.data() length:mask_data.size() * sizeof(float)]
-        shape:@[@(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-
-    std::vector<int32_t> q_dist_vec((size_t)T * EXT_LEN), b_dist_vec((size_t)T * EXT_LEN);
-    for (int t = 0; t < T; t++)
-        for (int k = 0; k < EXT_LEN; k++) {
-            int d = MEM_LEN + t - k;
-            q_dist_vec[t * EXT_LEN + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
-            b_dist_vec[t * EXT_LEN + k] = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
-        }
-    size_t p_total = (size_t)T * D_POS * EXT_LEN;
-    std::vector<float> p_all(p_total, 0.f);
-    for (int ti = 0; ti < T; ti++)
-        for (int kk = 0; kk < EXT_LEN; kk++)
-            p_all[(size_t)ti * D_POS * EXT_LEN + (size_t)q_dist_vec[ti * EXT_LEN + kk] * EXT_LEN + kk] = 1.f;
-    MPSGraphTensor* P_all_q = [g constantWithData:
-        [NSData dataWithBytes:p_all.data() length:p_total * sizeof(float)]
-        shape:@[@1, @(T), @(D_POS), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-    size_t b_total = (size_t)T * EXT_LEN * EXT_LEN;
-    std::vector<float> b_all(b_total, 0.f);
-    for (int ti = 0; ti < T; ti++)
-        for (int kk = 0; kk < EXT_LEN; kk++)
-            b_all[(size_t)ti * EXT_LEN * EXT_LEN + (size_t)kk * EXT_LEN + b_dist_vec[ti * EXT_LEN + kk]] = 1.f;
-    MPSGraphTensor* Q_all_b = [g constantWithData:
-        [NSData dataWithBytes:b_all.data() length:b_total * sizeof(float)]
-        shape:@[@(T), @(EXT_LEN), @(EXT_LEN)] dataType:MPSDataTypeFloat32];
-    MPSGraphTensor* b_r_sliced = [g sliceTensor:ctx.b_rel_r dimension:1 start:0 length:EXT_LEN name:nil];
     MPSGraphTensor* b_rt_h = [g reshapeTensor:
-        [g transposeTensor:b_r_sliced dimension:0 withDimension:1 name:nil]
-        withShape:@[@1, @(EXT_LEN), @(NH)] name:nil];
+        [g transposeTensor:ctx.b_rel_r dimension:0 withDimension:1 name:nil]
+        withShape:@[@1, @(B_REL_STRIDE), @(NH)] name:nil];
+
+    // Dropout spike: same mask placeholders as build_per_layer_fwd — fed at
+    // call time from the SAME saved per-layer mask buffer the forward pass
+    // used (never regenerated here), so this forward-recompute reproduces
+    // bit-identical dropout for gradientForPrimaryTensor to differentiate
+    // through correctly.
+    ctx.mask_attn = nil; ctx.mask_ffn2 = nil;
+    if (nncp_dropout_rate() > 0.0f) {
+        ctx.mask_attn = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_attn"];
+        ctx.mask_ffn2 = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_ffn2"];
+    }
 
     // Forward recompute
     MPSGraphTensor* h_out = build_single_layer(g, ctx.x_in,
@@ -3272,7 +3554,8 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
         ctx.w_ffn1, ctx.w_ffn2, ctx.b_ffn1, ctx.b_ffn2,
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
-        causal_mask, P_all_q, Q_all_b, b_rt_h);
+        ctx.causal_mask, ctx.P_all_q, ctx.Q_all_b, b_rt_h, nullptr,
+        ctx.mask_attn, ctx.mask_ffn2);
 
     // Proxy loss
     MPSGraphTensor* proxy = [g reductionSumWithTensor:
@@ -3924,6 +4207,7 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     if ((int)tr->L > 8) {
         build_per_layer_fwd(tr);
         build_per_layer_bwd(tr);
+        nncp_precompute_attn_tables(tr);  // bug 8 fix (B)
         build_loss_bwd(tr);
         // Allocate h[0..L] buffers for saved hidden states
         const size_t h_size = (size_t)BPTT_CHUNK_BT * tr->H;
@@ -4050,8 +4334,13 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
     }
 
     // Phase E2.3: KV memory staging buffers (zeroed) — [SEG_TRAIN_STREAMS * MEM_LEN, H] per layer
+    // Bug 8 fix (B): MEM_LEN here is the unified 288-wide width (mem_len+
+    // T_CHUNK), NOT SEG_TRAIN_MEM(256) — kv_mem_buf_k/v must hold pre_seg_mem
+    // AND chunk1's concatenated K/V. kv_pre_seg_buf_k/v (a few lines above,
+    // separate allocation) correctly stays SEG_TRAIN_MEM-wide — it's decode's
+    // true mem_len latch, unrelated to this unification.
     {
-        const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+        const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
         for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
             tr->kv_mem_buf_k[li] = [device newBufferWithLength:MEM_SLOTS * H * sizeof(float) options:opts];
             tr->kv_mem_buf_v[li] = [device newBufferWithLength:MEM_SLOTS * H * sizeof(float) options:opts];
@@ -4075,6 +4364,23 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
             memset([tr->kv_pre_seg_buf_v[li] contents], 0, pre_seg_kv_size);
         }
         tr->kv_pre_seg_valid = false;
+    }
+
+    // Bug 6 fix (chunk-mem-fix-design.md): chunk1's own K/V, [B*T_CHUNK, H] per
+    // layer — sized like BPTT_CHUNK_BT (== SEG_TRAIN_STREAMS * BPTT_CHUNK_LEN).
+    {
+        const size_t chunk1_kv_size = (size_t)BPTT_CHUNK_BT * H * sizeof(float);
+        for (int li = 0; li < SEG_MAX_LAYERS; li++) {
+            tr->chunk1_kv_buf_k[li] = [device newBufferWithLength:chunk1_kv_size options:opts];
+            tr->chunk1_kv_buf_v[li] = [device newBufferWithLength:chunk1_kv_size options:opts];
+            if (!tr->chunk1_kv_buf_k[li] || !tr->chunk1_kv_buf_v[li]) {
+                NSLog(@"online_trainer_create: failed to alloc chunk1_kv buffers layer %d", li);
+                online_trainer_destroy(tr);
+                return NULL;
+            }
+            memset([tr->chunk1_kv_buf_k[li] contents], 0, chunk1_kv_size);
+            memset([tr->chunk1_kv_buf_v[li] contents], 0, chunk1_kv_size);
+        }
     }
 
     // Checkpoint hidden state buffers (only allocated for L > 8)
@@ -4145,7 +4451,10 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         const bool is_enwik8_m2 = (g_nncp_profile.h == 1024);
         const uint32_t BT_m2     = (uint32_t)BPTT_CHUNK_BT;
         const uint32_t T_CHUNK_m2= (uint32_t)BPTT_CHUNK_LEN;
-        const uint32_t MEM_LEN_m2= (uint32_t)g_nncp_profile.mem_len;
+        // Bug 8(B): unified window — MEM_LEN_m2 is mem_len_true + T_CHUNK
+        // (288), TL_m2 is the full EXT_LEN (320), matching the MPSGraph
+        // side's unified causal_mask/P_all_q/Q_all_b width exactly.
+        const uint32_t MEM_LEN_m2= (uint32_t)g_nncp_profile.mem_len + T_CHUNK_m2;
         const uint32_t TL_m2     = MEM_LEN_m2 + T_CHUNK_m2;
         const uint32_t D_POS_m2  = tr->d_pos;
         tr->m2 = metal_bw_init(device, metalLib,
@@ -4960,11 +5269,18 @@ static inline M2WeightOffsets m2_weight_offsets(uint32_t layer,
 // Build qdist/bdist tables [T, TL] (TL = MEM_LEN + T_CHUNK), matching the MPSGraph
 // formula at L2208-2214. d = MEM_LEN + ti - k.
 static void m2_fill_relpe_dist_tables(int32_t* qdist, int32_t* bdist,
-                                       uint32_t T, uint32_t MEM_LEN, uint32_t TL,
-                                       uint32_t D_POS) {
+                                       uint32_t T, uint32_t MEM_LEN_TRUE, uint32_t MEM_LEN, uint32_t TL,
+                                       uint32_t D_POS, int abs_query_offset) {
+    // Bug 8(B): mem-portion (k < MEM_LEN) distance depends on which BPTT
+    // chunk this is — chunk1's absolute query position is `ti`, chunk2's is
+    // `T_CHUNK+ti` (T_CHUNK == abs_query_offset here). Current-portion
+    // (k >= MEM_LEN) distance is chunk-independent (always `ti - (k-MEM_LEN)`).
+    // Mirrors fwd_dump_cpu_verify_layer's `d` formula exactly.
     for (uint32_t ti = 0; ti < T; ti++) {
         for (uint32_t k = 0; k < TL; k++) {
-            int d = (int)MEM_LEN + (int)ti - (int)k;
+            int d = (k < MEM_LEN)
+                ? (abs_query_offset + (int)MEM_LEN_TRUE + (int)ti - (int)k)
+                : ((int)ti - ((int)k - (int)MEM_LEN));
             qdist[ti*TL + k] = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
             bdist[ti*TL + k] = d < 0 ? 0 : (d >= (int)TL ? (int)TL-1 : d);
         }
@@ -5298,7 +5614,10 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     const uint32_t D_POS   = tr->d_pos;
     const uint32_t T       = (uint32_t)BPTT_CHUNK_LEN;
     const uint32_t B       = (uint32_t)g_nncp_profile.num_streams;
-    const uint32_t MEM_LEN = (uint32_t)g_nncp_profile.mem_len;
+    // Bug 8(B): unified window — MEM_LEN is now mem_len_true+T_CHUNK (288,
+    // matching tr->kv_mem_buf_k/v[i]'s unified allocation width), TL is the
+    // full EXT_LEN (320, matching attn_prob[i]/d_scores' m2 init sizing).
+    const uint32_t MEM_LEN = (uint32_t)g_nncp_profile.mem_len + T;
     const uint32_t TL      = MEM_LEN + T;
     const uint32_t BT      = B * T;
     const uint32_t B_NH    = B * NH;
@@ -5622,8 +5941,11 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         // dispatch_rel_pe_br_bw_all_rows — see metal-bw-speed-static-analysis.md
         // §8.3/§8.5. bw_verify: rel_pe_br_scatter_bw_batched bit-exact vs the
         // non-batched kernel (max_abs=0, max_rel=0).
+        // Bug 8(B): chunk-dependent distance table (accumulate_weight_grads
+        // is false only on the first BPTT chunk — see metal_bw_train_step).
+        id<MTLBuffer> bdist_sel = accumulate_weight_grads ? m2->bdist_buf_c2 : m2->bdist_buf_c1;
         dispatch_rel_pe_br_bw_batched(enc, m2->ps_rel_pe_br_bw_batched,
-                                       m2->d_scores, tr->grad_b_rel_r, m2->bdist_buf,
+                                       m2->d_scores, tr->grad_b_rel_r, bdist_sel,
                                        TL, NH, B, T, sqrtf((float)H));
         barrier();
     }
@@ -5654,8 +5976,9 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // dispatch_rel_pe_q_bw_all_rows — see metal-bw-speed-static-analysis.md
     // §8.2/§8.5. bw_verify: rel_pe_q_scatter_bw_batched bit-exact vs the
     // non-batched kernel (max_abs=0, max_rel=0).
+    id<MTLBuffer> qdist_sel = accumulate_weight_grads ? m2->qdist_buf_c2 : m2->qdist_buf_c1;
     dispatch_rel_pe_q_bw_batched(enc, m2->ps_rel_pe_q_bw_batched,
-                                  m2->d_scores, m2->d_q_rel_raw, m2->qdist_buf,
+                                  m2->d_scores, m2->d_q_rel_raw, qdist_sel,
                                   TL, D_POS, B_NH, T);
     barrier();
 
@@ -5877,12 +6200,17 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
                                       uint32_t layer, M2BwContext* m2,
                                       int B, int T, uint32_t H, uint32_t NH, uint32_t HD,
                                       uint32_t F, uint32_t D_POS, int MEM_LEN, int EXT_LEN,
-                                      bool is_enwik8, size_t FFN1_MULT)
+                                      bool is_enwik8, size_t FFN1_MULT,
+                                      int abs_query_offset /* bug 8 fix (B): 0 for chunk1, T_CHUNK for chunk2 */)
 {
     const int BT = B * T;
     const float eps   = 1e-5f;
     const float scale = 1.0f / sqrtf((float)HD);
     const size_t ffn1_dim = FFN1_MULT * F;
+    // Bug 8 fix (B): MEM_LEN_TRUE_ = decode's true mem_len (256); MEM_LEN
+    // (param) is the unified 288-wide placeholder. extra_mask = chunk1 only.
+    const int MEM_LEN_TRUE_ = (int)g_nncp_profile.mem_len;
+    const bool extra_mask = (abs_query_offset == 0);
 
     const float* x     = (const float*)[tr->pl_h[layer] contents];
     const float* w_q   = (const float*)[wb->attn_q   contents] + (size_t)layer * H * H;
@@ -5898,7 +6226,11 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
     const float* w_rel_r = (is_enwik8 && wb->w_rel_r_all)
         ? (const float*)[wb->w_rel_r_all contents] + (size_t)layer * NH * HD * D_POS
         : (const float*)[wb->w_rel_r contents];
-    const float* b_rel_r = (const float*)[wb->b_rel_r contents]; // [NH, EXT_LEN] (per-chunk shape, see shape_br)
+    // Bug 7 fix (2026-07-05): b_rel_r's true per-head stride is tr->ext_len
+    // (mem_len+seg_len), NOT EXT_LEN (mem_len+THIS CHUNK's T) — see
+    // build_per_layer_fwd's B_REL_STRIDE comment for the full rationale.
+    const int B_REL_STRIDE = (int)tr->ext_len;
+    const float* b_rel_r = (const float*)[wb->b_rel_r contents]; // [NH, B_REL_STRIDE]
     const float* kv_k = (layer < (uint32_t)SEG_MAX_LAYERS && tr->kv_mem_buf_k[layer])
         ? (const float*)[tr->kv_mem_buf_k[layer] contents] : nullptr;
     const float* kv_v = (layer < (uint32_t)SEG_MAX_LAYERS && tr->kv_mem_buf_v[layer])
@@ -5967,17 +6299,29 @@ static void fwd_dump_cpu_verify_layer(OnlineTrainer* tr, const MPSTransformerWei
                     if (krow) for (uint32_t hd = 0; hd < HD; hd++) dot += (double)qrow[hd] * krow[hd];
                     float raw = scale * (float)dot;
 
-                    int d  = MEM_LEN + t - kx;
+                    // Bug 8 fix (B): unified-window distance formula — see
+                    // nncp_precompute_attn_tables's comment for the full
+                    // derivation. mem-portion keys (kx<MEM_LEN) use the TRUE
+                    // mem_len (256) + abs_query_offset (0 for chunk1, T_CHUNK
+                    // for chunk2); own-chunk keys (kx>=MEM_LEN) use a simple
+                    // offset-independent intra-chunk distance.
+                    int d = (kx < MEM_LEN)
+                        ? (abs_query_offset + MEM_LEN_TRUE_ + t - kx)
+                        : (t - (kx - MEM_LEN));
                     int qd = ((d % (int)D_POS) + (int)D_POS) % (int)D_POS;
                     double qrel = 0.0;
                     for (uint32_t hd = 0; hd < HD; hd++)
                         qrel += (double)qrow[hd] * w_rel_r[((size_t)nh * HD + hd) * D_POS + qd];
                     raw += scale * (float)qrel;
 
-                    int bd = d < 0 ? 0 : (d >= EXT_LEN ? EXT_LEN - 1 : d);
-                    raw += sqrtf((float)H) * b_rel_r[(size_t)nh * EXT_LEN + bd];
+                    int bd = d < 0 ? 0 : (d >= B_REL_STRIDE ? B_REL_STRIDE - 1 : d);
+                    raw += sqrtf((float)H) * b_rel_r[(size_t)nh * B_REL_STRIDE + bd];
 
-                    if (kx - MEM_LEN > t) raw += -1e9f;
+                    // Bug 8 fix (B): mask out kx in [MEM_LEN_TRUE_, MEM_LEN) for
+                    // chunk1 (extra_mask) — dummy slots, no real data there yet.
+                    // Standard intra-chunk causal mask for kx>=MEM_LEN unchanged.
+                    if (extra_mask && kx >= MEM_LEN_TRUE_ && kx < MEM_LEN) raw += -1e9f;
+                    if (kx >= MEM_LEN && (kx - MEM_LEN) > t) raw += -1e9f;
                     scores[kx] = raw;
                 }
                 float mx = scores[0];
@@ -6167,18 +6511,22 @@ static void nncp_state_norm_dump(OnlineTrainer* tr, const MPSTransformerWeightBu
     float wbout  = nncp_l2norm_buf(wb.b_out, (size_t)V);
 
     // --- ② KV memory buffers (aggregate over all layers) ---
-    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+    // Bug 8 fix (B): kv_mem_buf_k/v are now 288-wide (unified) per stream,
+    // while kv_pre_seg_buf_k/v stay 256-wide (decode's true mem_len latch) —
+    // separate slot counts, not the single shared MEM_SLOTS this used to be.
+    const size_t MEM_SLOTS_UNIFIED = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
+    const size_t MEM_SLOTS_TRUE    = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
     double kvmem_k_sq = 0.0, kvmem_v_sq = 0.0, kvpseg_k_sq = 0.0, kvpseg_v_sq = 0.0;
     for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-        auto accum = [&](id<MTLBuffer> b, double& acc) {
+        auto accum = [&](id<MTLBuffer> b, double& acc, size_t n_slots) {
             if (!b) return;
             const float* p = (const float*)[b contents];
-            for (size_t i = 0; i < MEM_SLOTS * H; i++) acc += (double)p[i] * (double)p[i];
+            for (size_t i = 0; i < n_slots * H; i++) acc += (double)p[i] * (double)p[i];
         };
-        accum(tr->kv_mem_buf_k[li],     kvmem_k_sq);
-        accum(tr->kv_mem_buf_v[li],     kvmem_v_sq);
-        accum(tr->kv_pre_seg_buf_k[li], kvpseg_k_sq);
-        accum(tr->kv_pre_seg_buf_v[li], kvpseg_v_sq);
+        accum(tr->kv_mem_buf_k[li],     kvmem_k_sq,  MEM_SLOTS_UNIFIED);
+        accum(tr->kv_mem_buf_v[li],     kvmem_v_sq,  MEM_SLOTS_UNIFIED);
+        accum(tr->kv_pre_seg_buf_k[li], kvpseg_k_sq, MEM_SLOTS_TRUE);
+        accum(tr->kv_pre_seg_buf_v[li], kvpseg_v_sq, MEM_SLOTS_TRUE);
     }
     float kvmem_k  = sqrtf((float)kvmem_k_sq);
     float kvmem_v  = sqrtf((float)kvmem_v_sq);
@@ -6217,6 +6565,36 @@ static void nncp_state_norm_dump(OnlineTrainer* tr, const MPSTransformerWeightBu
         vq, vk, vv, vo, vf1, vf2, vbf1, vbf2, vln, vlnf, vrelr, vbrelr, vembed, vout, vbout);
 }
 
+// Cross-implementation comparison (2026-07-05, seg450d): decode_dump.inc
+// (mps_transformer_graph.mm, a separate TU) captures decode's x_out for the
+// dumped token/layers; these accessors let this file diff train's own forward
+// against it. No shared header — this is a one-off diagnostic, not a stable API.
+bool nncp_decode_dump_get_x_out(uint32_t layer, uint32_t H, float* out);
+bool nncp_decode_dump_get_x_ln1(uint32_t layer, uint32_t H, float* out);
+bool nncp_decode_dump_get_q(uint32_t layer, uint32_t H, float* out);
+bool nncp_decode_dump_get_attn_out(uint32_t layer, uint32_t H, float* out);
+bool nncp_decode_dump_get_ffn_act(uint32_t layer, uint32_t F, float* out);
+int nncp_decode_dump_get_captured_seg();
+int nncp_decode_dump_get_tok_idx();
+int nncp_decode_dump_get_target_tok_offset();  // xctrl fix: use this, not tok_idx (see decode_dump.inc)
+
+static bool nncp_xcmp_enabled() {
+    static int v = -1;
+    if (v < 0) v = getenv("NNCP_DECODE_DUMP") ? 1 : 0;
+    return v != 0;
+}
+
+// Segment counter local to this file: online_trainer_train_segment_batch is
+// called exactly once per compress-loop segment, immediately after that same
+// segment's mps_transformer_execute_segment(decode)+write_sym(encode) calls
+// (see neural_bridge_lossless_cuda.mm) — so this counter's Nth increment
+// always corresponds to the SAME segment as mps_transformer_graph.mm's own
+// s_decode_dump_seg_counter's Nth increment. Comparing the two (rather than
+// trusting g_decode_dump_state.layers' mere non-emptiness, which would still
+// be true — and WRONG — on every segment after the target one) is what makes
+// the XCMP check segment-exact instead of a false-positive-prone "close enough".
+static int s_xcmp_train_seg_counter = 0;
+
 static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const MPSTransformerWeightBuffers& wb,
     const int32_t* seg_inputs, const int32_t* seg_targets,
@@ -6226,7 +6604,11 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const int T       = SEG_TRAIN_LEN;
     const int T_CHUNK = (int)BPTT_CHUNK_LEN;
     const int BT      = (int)BPTT_CHUNK_BT;
-    const int MEM_LEN = g_nncp_profile.mem_len;
+    // Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): MEM_LEN is now
+    // the UNIFIED mem-placeholder width (mem_len_true + T_CHUNK = 288), shared
+    // by chunk1 and chunk2 — see nncp_precompute_attn_tables's own comment.
+    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;  // 256, kv_pre_seg_buf's true width
+    const int MEM_LEN      = MEM_LEN_TRUE + T_CHUNK;         // 288, kv_mem_buf's unified width
     const int BM      = B * MEM_LEN;
     uint32_t L = tr->L, H = tr->H, F = tr->F, V = tr->V;
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
@@ -6246,17 +6628,43 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     }
 
     // 2. Reset KV memory
-    {
-        const size_t buf_slots = (size_t)B * (size_t)MEM_LEN;
+    // Bug 6 fix (chunk-mem-fix-design.md): this reset must ONLY happen for
+    // chunk1 (t_start==0) — chunk1's mem is genuinely "the segment hasn't
+    // started yet", so it correctly restores the pre-segment latch. Chunk2
+    // (t_start==T_CHUNK) must NOT reset here: online_trainer_train_segment_
+    // batch already slid chunk1's own K/V into kv_mem_buf_k/v (via
+    // nncp_chunk_mem_slide, called between the chunk1 and chunk2
+    // run_per_layer_bptt_chunk calls) — resetting unconditionally here, as
+    // this code did before the fix, silently discarded that slide every time
+    // and left chunk2 seeing only the pre-segment mem (the root cause XCMP
+    // caught: all 20 layers FAIL, layer0 max_abs~3.4).
+    // Bug 8 fix (B): kv_mem_buf is now 288-wide per stream (MEM_LEN), while
+    // kv_pre_seg_buf stays 256-wide (MEM_LEN_TRUE, decode's true mem_len) — a
+    // per-stream copy (not one flat memcpy) into the FIRST MEM_LEN_TRUE slots,
+    // plus a zero-fill of the dummy tail [MEM_LEN_TRUE:MEM_LEN) (masked out
+    // for chunk1 by nncp_precompute_attn_tables's causal_mask_buf_c1, so its
+    // content never actually reaches softmax — zeroed defensively anyway).
+    if (t_start == 0) {
+        const size_t pre_seg_stride = (size_t)MEM_LEN_TRUE * H;
+        const size_t mem_stride     = (size_t)MEM_LEN * H;
+        const size_t dummy_floats   = (size_t)(MEM_LEN - MEM_LEN_TRUE) * H;
         for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li])
-                memcpy([tr->kv_mem_buf_k[li] contents], [tr->kv_pre_seg_buf_k[li] contents], buf_slots * H * sizeof(float));
-            else
-                memset([tr->kv_mem_buf_k[li] contents], 0, buf_slots * H * sizeof(float));
-            if (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_v[li])
-                memcpy([tr->kv_mem_buf_v[li] contents], [tr->kv_pre_seg_buf_v[li] contents], buf_slots * H * sizeof(float));
-            else
-                memset([tr->kv_mem_buf_v[li] contents], 0, buf_slots * H * sizeof(float));
+            float* dst_k = (float*)[tr->kv_mem_buf_k[li] contents];
+            float* dst_v = (float*)[tr->kv_mem_buf_v[li] contents];
+            const float* src_k = (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_k[li])
+                ? (const float*)[tr->kv_pre_seg_buf_k[li] contents] : nullptr;
+            const float* src_v = (tr->kv_pre_seg_valid && tr->kv_pre_seg_buf_v[li])
+                ? (const float*)[tr->kv_pre_seg_buf_v[li] contents] : nullptr;
+            for (int s = 0; s < B; s++) {
+                float* dk = dst_k + (size_t)s * mem_stride;
+                float* dv = dst_v + (size_t)s * mem_stride;
+                if (src_k) memcpy(dk, src_k + (size_t)s * pre_seg_stride, pre_seg_stride * sizeof(float));
+                else       memset(dk, 0, pre_seg_stride * sizeof(float));
+                if (src_v) memcpy(dv, src_v + (size_t)s * pre_seg_stride, pre_seg_stride * sizeof(float));
+                else       memset(dv, 0, pre_seg_stride * sizeof(float));
+                memset(dk + pre_seg_stride, 0, dummy_floats * sizeof(float));
+                memset(dv + pre_seg_stride, 0, dummy_floats * sizeof(float));
+            }
         }
     }
 
@@ -6303,8 +6711,19 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     NSArray<NSNumber*>* shape_bf2 = @[@(H)];
     NSArray<NSNumber*>* shape_wln = @[@4, @(H)];
     NSArray<NSNumber*>* shape_wr  = @[@(tr->NH), @(tr->HD), @(tr->d_pos)];
-    NSArray<NSNumber*>* shape_br  = @[@(tr->NH), @(EXT_LEN)]; // must match graph placeholder (MEM+T, not mem+seg)
+    // Bug 7 fix (2026-07-05, ATTN3 STRIDE_MISMATCH finding): must be
+    // tr->ext_len (= mem_len + seg_len, b_rel_r's TRUE per-head width), not
+    // EXT_LEN (mem_len + THIS CHUNK's T) — the old comment here ("must match
+    // graph placeholder (MEM+T, not mem+seg)") was describing the BUG, not a
+    // real constraint: the graph placeholder (ctx.b_rel_r, both fwd/bwd) is
+    // now fixed to tr->ext_len width too (build_per_layer_fwd/bwd's
+    // B_REL_STRIDE), so this must match THAT, which is mem+seg.
+    NSArray<NSNumber*>* shape_br  = @[@(tr->NH), @((int)tr->ext_len)];
     NSArray<NSNumber*>* shape_kv  = @[@(BM), @(H)];
+    // Bug 8 fix (B): shapes for the now-placeholder causal_mask/P_all_q/Q_all_b.
+    NSArray<NSNumber*>* shape_mask  = @[@(T_CHUNK), @(EXT_LEN)];
+    NSArray<NSNumber*>* shape_p_all_q = @[@1, @(T_CHUNK), @(tr->d_pos), @(EXT_LEN)];
+    NSArray<NSNumber*>* shape_q_all_b = @[@(T_CHUNK), @(EXT_LEN), @((int)tr->ext_len)];
 
     // Per-trainer persistent slice view cache. Views are created once per
     // (buffer, layer, size) and reused across all training segments. This avoids
@@ -6382,6 +6801,55 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             feeds[fg.kv_k] = floatTD(tr->kv_mem_buf_k[layer], shape_kv);
         if (layer < SEG_MAX_LAYERS && tr->kv_mem_buf_v[layer])
             feeds[fg.kv_v] = floatTD(tr->kv_mem_buf_v[layer], shape_kv);
+        // Bug 8 fix (B): select the chunk1 or chunk2 precomputed variant —
+        // zero-copy feed, no per-call CPU recompute (nncp_precompute_attn_tables
+        // built both once, up front).
+        {
+            const bool is_chunk1 = (t_start == 0);
+            feeds[fg.causal_mask] = floatTD(is_chunk1 ? tr->causal_mask_buf_c1 : tr->causal_mask_buf_c2, shape_mask);
+            feeds[fg.P_all_q]     = floatTD(is_chunk1 ? tr->p_all_q_buf_c1     : tr->p_all_q_buf_c2,     shape_p_all_q);
+            feeds[fg.Q_all_b]     = floatTD(is_chunk1 ? tr->q_all_b_buf_c1     : tr->q_all_b_buf_c2,     shape_q_all_b);
+        }
+        // Dropout spike: only meaningful when this graph actually has mask
+        // placeholders (built when NNCP_DROPOUT>0 — see build_per_layer_fwd/
+        // bwd). Freshly GENERATED here (forward pass is where a layer's mask
+        // for this chunk is decided) and saved into tr->dropout_mask_attn/
+        // ffn2[layer] so the backward-recompute graph can read the same
+        // values back later — see buildLayerFeedsBwd below.
+        if ((fg.mask_attn || fg.mask_ffn2) && layer < SEG_MAX_LAYERS) {
+            const float rate = nncp_dropout_rate();
+            const size_t n = (size_t)BT * H;
+            if (!tr->dropout_mask_attn[layer])
+                tr->dropout_mask_attn[layer] = [tr->device newBufferWithLength:n * sizeof(float)
+                                                                        options:MTLResourceStorageModeShared];
+            if (!tr->dropout_mask_ffn2[layer])
+                tr->dropout_mask_ffn2[layer] = [tr->device newBufferWithLength:n * sizeof(float)
+                                                                        options:MTLResourceStorageModeShared];
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_attn[layer] contents], n, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/0));
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_ffn2[layer] contents], n, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/1));
+            if (fg.mask_attn) feeds[fg.mask_attn] = floatTD(tr->dropout_mask_attn[layer], shape_h);
+            if (fg.mask_ffn2) feeds[fg.mask_ffn2] = floatTD(tr->dropout_mask_ffn2[layer], shape_h);
+        }
+    };
+
+    // Same as buildLayerFeeds but for the backward-recompute graph (pl_bwd),
+    // and — critically — REUSES the mask saved by buildLayerFeeds above
+    // rather than regenerating it, so the forward-recompute inside pl_bwd's
+    // autodiff differentiates through the exact dropout pattern that
+    // actually produced pl_h[layer+1] during the forward pass.
+    auto feedDropoutMasksBwd = [&](NSMutableDictionary* feeds, PerLayerBwdGraph& bg, uint32_t layer) {
+        if ((bg.mask_attn || bg.mask_ffn2) && layer < SEG_MAX_LAYERS) {
+            if (bg.mask_attn && tr->dropout_mask_attn[layer])
+                feeds[bg.mask_attn] = floatTD(tr->dropout_mask_attn[layer], shape_h);
+            if (bg.mask_ffn2 && tr->dropout_mask_ffn2[layer])
+                feeds[bg.mask_ffn2] = floatTD(tr->dropout_mask_ffn2[layer], shape_h);
+        }
     };
 
     // ---- Forward pass: 20 layers ----
@@ -6422,6 +6890,15 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             // persistent buffers instead of leaving results in reusable scratch.
             NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
             fwd_out[tr->pl_fwd.x_out] = floatTD(tr->pl_h[i + 1], shape_h);
+            // Bug 6 fix (chunk-mem-fix-design.md step 3): during chunk1's own
+            // forward (t_start==0), save this layer's K/V straight into
+            // chunk1_kv_buf_k/v — ALWAYS, not just under NNCP_FWD_DUMP/dump_inter,
+            // since chunk2's mem-slide (step 4, below this loop) depends on it
+            // for production correctness, not just diagnostics.
+            if (t_start == 0 && i < (uint32_t)SEG_MAX_LAYERS) {
+                if (tr->pl_fwd.t_K_saved) fwd_out[tr->pl_fwd.t_K_saved] = floatTD(tr->chunk1_kv_buf_k[i], shape_h);
+                if (tr->pl_fwd.t_V_saved) fwd_out[tr->pl_fwd.t_V_saved] = floatTD(tr->chunk1_kv_buf_v[i], shape_h);
+            }
             if (dump_inter && i < SEG_MAX_LAYERS) {
                 // Decisive-verification marker (2026-07-03, temporary — remove once
                 // the live dump site is confirmed): the q_from_mh fix (build_single_
@@ -6456,6 +6933,38 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 if (tr->pl_fwd.t_x_mid     && m2_dump->x_mid[i])
                     fwd_out[tr->pl_fwd.t_x_mid]      = floatTD(m2_dump->x_mid[i],     shape_h);
             }
+            // XCMP_SUB (2026-07-05, repair — placed AFTER dump_inter's own
+            // bindings, not before): dump_inter rebinds t_x_ln1/t_Q_saved/
+            // t_attn_out to m2_dump->x_ln1[i]/Q_saved[i]/attn_out[i] whenever
+            // it's active (m2_dump->allocated, which is independent of
+            // NNCP_FWD_DUMP — it's the Metal-backward dump buffer allocation
+            // flag, not the CPU-verify opt-in). NSMutableDictionary keys are
+            // unique: whichever assignment to fwd_out[t_x_ln1] etc. happens
+            // LAST wins. The original placement (before dump_inter) meant
+            // dump_inter silently overwrote these 3 diagnostic bindings with
+            // ITS OWN buffers, leaving xcmp_x_ln1_buf/xcmp_q_buf/
+            // xcmp_attn_out_buf never written (still zero-filled from
+            // allocation) — exactly the "max_rel==1.000e+00" (diff==|ref|,
+            // i.e. got==0) symptom observed. t_ffn_act/pl_h[i+1] were never
+            // touched by dump_inter, so they worked from the start. Moving
+            // this block to run LAST fixes all three without needing to
+            // special-case dump_inter's own state.
+            if (t_start == 0 && i == 0 && nncp_xcmp_enabled()) {
+                auto lazyAlloc = [&](id<MTLBuffer>& buf, size_t n_floats) {
+                    if (!buf) buf = [tr->device newBufferWithLength:n_floats * sizeof(float)
+                                                             options:MTLResourceStorageModeShared];
+                };
+                lazyAlloc(tr->xcmp_x_ln1_buf,     (size_t)BT * H);
+                lazyAlloc(tr->xcmp_q_buf,         (size_t)BT * H);
+                lazyAlloc(tr->xcmp_attn_out_buf,  (size_t)BT * H);
+                lazyAlloc(tr->xcmp_ffn_act_buf,   (size_t)BT * F);
+                lazyAlloc(tr->xcmp_attn_pre_o_buf,(size_t)BT * H);
+                if (tr->pl_fwd.t_x_ln1)     fwd_out[tr->pl_fwd.t_x_ln1]     = floatTD(tr->xcmp_x_ln1_buf,     shape_h);
+                if (tr->pl_fwd.t_Q_saved)   fwd_out[tr->pl_fwd.t_Q_saved]   = floatTD(tr->xcmp_q_buf,         shape_h);
+                if (tr->pl_fwd.t_attn_out)  fwd_out[tr->pl_fwd.t_attn_out]  = floatTD(tr->xcmp_attn_out_buf,  shape_h);
+                if (tr->pl_fwd.t_ffn_act)   fwd_out[tr->pl_fwd.t_ffn_act]   = floatTD(tr->xcmp_ffn_act_buf,   shape_ff_dump);
+                if (tr->pl_fwd.t_attn_pre_o)fwd_out[tr->pl_fwd.t_attn_pre_o]= floatTD(tr->xcmp_attn_pre_o_buf,shape_h);
+            }
             [tr->pl_fwd.graph runWithMTLCommandQueue:tr->cmdQueue
                                                feeds:feeds
                                     targetOperations:nil
@@ -6466,6 +6975,300 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 id<MTLCommandBuffer> fwd_fence = [tr->cmdQueue commandBuffer];
                 [fwd_fence commit];
                 [fwd_fence waitUntilCompleted];
+            }
+
+            // [XCMP] (2026-07-05, seg450d; extended 2026-07-05 memfix500 control
+            // experiment): cross-implementation comparison. decode_ce/layer-
+            // parity/KV-parity all checked decode against ITS OWN CPU-textbook
+            // recompute — self-consistent but blind to any decode-vs-train
+            // SEMANTIC difference. Originally hard-coded to chunk2
+            // (t_start==T_CHUNK) only, since every prior run dumped decode at
+            // TOK_OFFSET==T_CHUNK. Generalized here to ALSO fire for chunk1
+            // (t_start==0) when the decode dump's own captured absolute token
+            // (nncp_decode_dump_get_target_tok_offset() — the FIXED offset saved
+            // once when `layers` was populated; NOT tok_idx, which the xctrl
+            // triage found gets overwritten every t in decode's per-token loop
+            // and so holds the last-processed t, e.g. 63, not the dumped one)
+            // matches THIS chunk's t_start — i.e. whichever chunk boundary
+            // happens to equal the dumped absolute position, not always chunk2.
+            // This lets t=0 (TOK_OFFSET=0)
+            // serve as a CONTROL: at t=0, decode and train's contexts are
+            // DEFINITIONALLY identical (pre-seg mem only, zero in-seg keys,
+            // same token, same weights) — if XCMP still FAILs there, the
+            // comparator itself (row selection / layout / timing) is broken and
+            // bug 6's "all-layers-FAIL" evidence needs re-examination; if XCMP
+            // PASSes at t=0 but still FAILs at t=32, the comparator is healthy
+            // and the t=32 divergence is a genuine remaining semantic gap
+            // (decode's 288-key context vs train chunk2's 256-key context, e.g.).
+            // Segment-matched via s_xcmp_train_seg_counter vs. decode's exposed
+            // captured_seg so this can't accidentally compare against a stale
+            // (different-segment) decode dump.
+            // Input/weight/mem preconditions (confirmed by code read, not
+            // assumed): both decode and this forward run BEFORE this segment's
+            // optimizer step (decode forward → encode → THIS train call, in that
+            // order, per neural_bridge_lossless_cuda.mm) — same pre-update
+            // weights. Tokens are the same seg_inputs the encode loop consumed.
+            // "mem" (positions before this segment) is loaded here from
+            // tr->kv_pre_seg_buf_k/v, latched via online_trainer_latch_kv_memory
+            // BEFORE decode's own forward for this segment — same source decode's
+            // kv_cache "memory" half reflects at segment start.
+            // xctrl no-fire triage (2026-07-05): unconditional breadcrumb showing
+            // every term of the XCMP gate, printed once per layer0 call only
+            // (i==0) to avoid flooding — pinpoints exactly which term is false.
+            if (i == 0 && nncp_xcmp_enabled()) {
+                fprintf(stderr, "[XCMP_DBG] t_start=%d T_CHUNK=%d enabled=%d captured_seg=%d "
+                        "train_seg_counter=%d tok_idx=%d target_tok_offset=%d\n",
+                        t_start, T_CHUNK, (int)nncp_xcmp_enabled(),
+                        nncp_decode_dump_get_captured_seg(), s_xcmp_train_seg_counter,
+                        nncp_decode_dump_get_tok_idx(), nncp_decode_dump_get_target_tok_offset());
+            }
+            if ((t_start == 0 || t_start == T_CHUNK) && nncp_xcmp_enabled()
+                && (nncp_decode_dump_get_captured_seg() == s_xcmp_train_seg_counter)
+                && (nncp_decode_dump_get_target_tok_offset() == t_start)) {
+                std::vector<float> decode_xout(H);
+                if (nncp_decode_dump_get_x_out(i, H, decode_xout.data())) {
+                    const float* train_xout = (const float*)[tr->pl_h[i + 1] contents];  // row 0 = b=0,t=0-in-chunk
+                    float max_abs = 0.0f, max_rel = 0.0f;
+                    fwd_dump_max_err(decode_xout.data(), train_xout, H, &max_abs, &max_rel);
+                    fprintf(stderr, "[XCMP] t_start=%d layer=%u rel_err=%.3e max_abs=%.3e  %s\n",
+                            t_start, i, max_rel, max_abs, max_rel < 1e-3f ? "PASS" : "FAIL");
+                    // [XCMP_RAW] (2026-07-05, comparator-fault triage): raw
+                    // values, layer0 only, so a scale/definition mismatch
+                    // (embed_scale sqrt(H), residual-included-or-not, wrong
+                    // row) is visible by eye rather than inferred from rel_err.
+                    if (i == 0) {
+                        const uint32_t n_show = (H < 8) ? H : 8;
+                        fprintf(stderr, "[XCMP_RAW] t_start=%d layer=0 decode_x_out[0..%u]=",
+                                t_start, n_show - 1);
+                        for (uint32_t k = 0; k < n_show; k++) fprintf(stderr, "%.6f ", decode_xout[k]);
+                        fprintf(stderr, "\n[XCMP_RAW] t_start=%d layer=0 train_pl_h[1]_row0[0..%u]=",
+                                t_start, n_show - 1);
+                        for (uint32_t k = 0; k < n_show; k++) fprintf(stderr, "%.6f ", train_xout[k]);
+                        fprintf(stderr, "\n");
+                    }
+                    // [XCMP_SUB] (2026-07-05, injection-point triage): bisect
+                    // layer0 into 5 stages — x_ln1 → q → attn_out (FP16-mem
+                    // read exit) → ffn_act (GeGLU exit) → x_out — to find
+                    // exactly where the confirmed-real ~1e-2 abs divergence
+                    // (already shown NOT a comparator artifact, via [XCMP_RAW])
+                    // first appears. Only meaningful at t_start==0 (this
+                    // subtask's control point) and layer0, matching the
+                    // xcmp_*_buf bindings above (which only fire there).
+                    if (i == 0 && t_start == 0) {
+                        auto compareStage = [&](const char* stage, bool (*getter)(uint32_t, uint32_t, float*),
+                                                 id<MTLBuffer> train_buf, uint32_t dim) {
+                            if (!train_buf) return;
+                            std::vector<float> dv(dim);
+                            if (!getter(i, dim, dv.data())) return;
+                            const float* tv = (const float*)[train_buf contents];  // row 0
+                            float ma = 0.0f, mr = 0.0f;
+                            fwd_dump_max_err(dv.data(), tv, dim, &ma, &mr);
+                            fprintf(stderr, "[XCMP_SUB] t_start=%d stage=%-9s max_abs=%.3e max_rel=%.3e\n",
+                                    t_start, stage, ma, mr);
+                        };
+                        compareStage("x_ln1",    nncp_decode_dump_get_x_ln1,    tr->xcmp_x_ln1_buf,    H);
+                        compareStage("q",        nncp_decode_dump_get_q,        tr->xcmp_q_buf,        H);
+                        // Definition audit (2026-07-05): decode_dump.inc's dumped
+                        // attn_out (dec_buf_attn_val) is captured PRE-O-proj.
+                        // t_attn_out has always been captured POST-O-proj (see
+                        // build_single_layer) — an apples-to-oranges comparison.
+                        // "attn_pre_o" below is the fair, same-definition one
+                        // (new t_attn_pre_o tensor); "attn_out_postO" is kept for
+                        // visibility into how much the O-projection itself
+                        // changes the picture, but is NOT a same-definition diff.
+                        compareStage("attn_pre_o",    nncp_decode_dump_get_attn_out, tr->xcmp_attn_pre_o_buf, H);
+                        compareStage("attn_out_postO", nncp_decode_dump_get_attn_out, tr->xcmp_attn_out_buf,  H);
+                        compareStage("ffn_act",  nncp_decode_dump_get_ffn_act,  tr->xcmp_ffn_act_buf,  F);
+                        // x_out stage reuses the already-computed decode_xout/train_xout above.
+                        fprintf(stderr, "[XCMP_SUB] t_start=%d stage=%-9s max_abs=%.3e max_rel=%.3e\n",
+                                t_start, "x_out", max_abs, max_rel);
+
+                        // [ATTN3] (2026-07-05, attn-term-level dissection): x_ln1/q
+                        // bit-exact, attn_out max_abs=0.355 → the divergence is
+                        // inside the attention math itself. Direct read of
+                        // build_single_layer (train) vs the decode kernel/CPU-ref
+                        // (decode_dump.inc) side by side found a STRIDE mismatch in
+                        // how BOTH read the SAME shared b_rel_r weight buffer
+                        // (declared [NH, total_len] in mps_transformer_graph.h):
+                        // decode indexes b_rel_r[h*total_len + dist] (total_len =
+                        // MEM_LEN + seg_len = 320 for enwik8); train's graph feeds
+                        // wb.b_rel_r as shape [NH, EXT_LEN] (EXT_LEN = MEM_LEN +
+                        // T_CHUNK = 288) and fwd_dump_cpu_verify_layer's own CPU
+                        // reference mirrors that same 288 stride
+                        // (b_rel_r[nh*EXT_LEN+bd]) — i.e. train treats a per-head
+                        // stride of 288 where the buffer's TRUE per-head stride is
+                        // 320. This only coincides for head 0 (same base offset);
+                        // for head>=1 train reads 32*head floats into the WRONG
+                        // head's (or a straddling) row. This block reads the same
+                        // wb.b_rel_r buffer both ways and prints the values side by
+                        // side — a stride bug shows up as head>=1 rows disagreeing
+                        // while head 0 (coincidentally) agrees.
+                        {
+                            const float* b_rel_r_buf = (const float*)[wb.b_rel_r contents];
+                            const int total_len = MEM_LEN + (int)g_nncp_profile.seg_len;  // decode's stride (320)
+                            for (uint32_t h = 0; h < tr->NH && h < 2; h++) {
+                                for (int dist = 0; dist < 2; dist++) {
+                                    float decode_stride_val = b_rel_r_buf[(size_t)h * total_len + dist];
+                                    float train_stride_val  = b_rel_r_buf[(size_t)h * EXT_LEN + dist];
+                                    fprintf(stderr, "[ATTN3] head=%u dist=%d b_rel(decode_stride=%d)=%.6f "
+                                            "b_rel(train_stride=%d)=%.6f  %s\n",
+                                            h, dist, total_len, decode_stride_val, EXT_LEN, train_stride_val,
+                                            (decode_stride_val == train_stride_val) ? "MATCH" : "STRIDE_MISMATCH");
+                                }
+                            }
+                        }
+
+                        // [ATTN_PROB_TAIL] (2026-07-05, final500 regression triage —
+                        // candidate ③: is chunk1's dummy-tail [MEM_LEN_TRUE:MEM_LEN)
+                        // actually masked to ~0 probability in the REAL softmax output
+                        // the forward graph produced, not just in the mask table?).
+                        // m2_dump->attn_prob[0] is populated unconditionally by the
+                        // dump_inter binding above (fwd_out[t_attn_prob]) whenever
+                        // NNCP_METAL_BW is compiled in, independent of
+                        // NNCP_METAL_BW_DISABLE — so this reads the actual softmax
+                        // output the training step just consumed, b=0/head=0/t=0.
+                        if (dump_inter && m2_dump->attn_prob[0]) {
+                            const float* ap = (const float*)[m2_dump->attn_prob[0] contents];
+                            const int MEM_LEN_TRUE_ = (int)g_nncp_profile.mem_len;
+                            fprintf(stderr, "[ATTN_PROB_TAIL] t_start=%d b=0 head=0 t=0 "
+                                    "prob[k=%d..%d](dummy-tail)=", t_start, MEM_LEN_TRUE_, MEM_LEN - 1);
+                            for (int k = MEM_LEN_TRUE_; k < MEM_LEN; k++) fprintf(stderr, "%.3e ", ap[k]);
+                            fprintf(stderr, "\n[ATTN_PROB_TAIL] t_start=%d b=0 head=0 t=0 "
+                                    "prob[k=%d..%d](real-mem-tail)=", t_start, MEM_LEN_TRUE_ - 4, MEM_LEN_TRUE_ - 1);
+                            for (int k = MEM_LEN_TRUE_ - 4; k < MEM_LEN_TRUE_; k++) fprintf(stderr, "%.3e ", ap[k]);
+                            fprintf(stderr, "\n");
+                        }
+
+                        // [ATTN_ARB] (2026-07-05, third-party arbiter): full attention
+                        // (all keys, all heads) at t=0/layer0, computed on the CPU in
+                        // FP64-accumulated FP32 from BIT-EXACT inputs (x_ln1, q —
+                        // already confirmed via XCMP_SUB) and the SAME weight/mem/self
+                        // K-V every implementation shares (tr->kv_mem_buf_k/v[0] =
+                        // mem, tr->chunk1_kv_buf_k/v[0] row0 = self/this-token — both
+                        // independently verified: KV_DUMP 201/201, C1KV all-PASS).
+                        // Formula: train's post-bug-7-fix convention (dist =
+                        // MEM_LEN+t-kx, b_rel stride = tr->ext_len). Produces the
+                        // PRE-O-proj attn_out, diffed against BOTH real
+                        // implementations' actual captures — whichever real value is
+                        // farther from this arbiter is the one carrying the extra
+                        // ~5e-2/layer error.
+                        {
+                            const uint32_t NH_ = tr->NH, HD_ = tr->HD, D_POS_ = tr->d_pos;
+                            const int B_REL_STRIDE_ = (int)tr->ext_len;
+                            const float scale = 1.0f / sqrtf((float)HD_);
+                            // [ATTN_CONST] train side — same-formula counterpart to
+                            // decode's dispatch-site print (mps_transformer_graph.mm).
+                            // b_rel_scale here is a LITERAL sqrtf((float)H) at every
+                            // call site in build_single_layer (grep-confirmed, no
+                            // separate hardcoded constant) — H is this function's own
+                            // tr->H-derived parameter, so it tracks the profile the
+                            // same way decode's sqrtf((float)H) does; printed for
+                            // direct side-by-side confirmation, not because a
+                            // discrepancy was suspected here specifically.
+                            fprintf(stderr, "[ATTN_CONST] train: NH=%u HD=%u H=%u attn_scale=%.8f b_rel_scale=%.8f "
+                                    "d_pos=%u B_REL_STRIDE(=tr->ext_len)=%d EXT_LEN=%d MEM_LEN=%d\n",
+                                    NH_, HD_, H, scale, sqrtf((float)H), D_POS_, B_REL_STRIDE_, EXT_LEN, MEM_LEN);
+                            std::vector<float> q_bitexact(H);
+                            if (nncp_decode_dump_get_q(i, H, q_bitexact.data())) {
+                                const float* kv_mem_k = (const float*)[tr->kv_mem_buf_k[i] contents];  // [MEM_LEN,H] b=0
+                                const float* kv_mem_v = (const float*)[tr->kv_mem_buf_v[i] contents];
+                                const float* self_k   = (const float*)[tr->chunk1_kv_buf_k[i] contents]; // row0 = [H]
+                                const float* self_v   = (const float*)[tr->chunk1_kv_buf_v[i] contents];
+                                const float* w_rel_r_ = (const float*)[wb.w_rel_r_all contents] + (size_t)i * NH_ * HD_ * D_POS_;
+                                const float* b_rel_r_ = (const float*)[wb.b_rel_r contents];
+                                const int kv_len = MEM_LEN + 1;  // t=0: mem + self only
+                                // FP16-quantization hypothesis (2026-07-05): decode's
+                                // REAL kernel reads K/V from its FP16 kv_cache; this
+                                // arbiter's kv_mem_buf/chunk1_kv_buf are pure FP32 —
+                                // i.e. even a mathematically-identical formula would
+                                // still differ from decode's real output by however
+                                // much FP16 rounding on K/V compounds through a
+                                // 257-key softmax-weighted sum (NOT the same thing as
+                                // the ~1e-3 per-element K/V rounding baseline2k already
+                                // ruled out as too small for the AGGREGATE bpc gap —
+                                // this is the effect on ONE position's raw vector,
+                                // which can compound differently). Computed twice:
+                                // fp32 (as before) and fp16-round-tripped, both vs
+                                // decode's real capture, to isolate this specific effect.
+                                auto quant16 = [](float x) -> float { return (float)(__fp16)x; };
+                                std::vector<float> arb_attn(H, 0.0f), arb_attn_fp16(H, 0.0f);
+                                std::vector<float> scores_(kv_len), scores_fp16(kv_len);
+                                for (uint32_t h = 0; h < NH_; h++) {
+                                    const float* qh = &q_bitexact[h * HD_];
+                                    const float* w_rel_h = w_rel_r_ + (size_t)h * HD_ * D_POS_;
+                                    float mx = -1e9f, mx16 = -1e9f;
+                                    for (int kx = 0; kx < kv_len; kx++) {
+                                        const float* kh = (kx < MEM_LEN) ? (kv_mem_k + (size_t)kx * H + h * HD_)
+                                                                          : (self_k + h * HD_);
+                                        int d = MEM_LEN + 0 - kx;
+                                        int qd = ((d % (int)D_POS_) + (int)D_POS_) % (int)D_POS_;
+                                        int bd = d < 0 ? 0 : (d >= B_REL_STRIDE_ ? B_REL_STRIDE_ - 1 : d);
+                                        double dot = 0.0, qrel = 0.0, dot16 = 0.0;
+                                        for (uint32_t hd = 0; hd < HD_; hd++) {
+                                            dot   += (double)qh[hd] * kh[hd];
+                                            dot16 += (double)qh[hd] * quant16(kh[hd]);
+                                            qrel  += (double)qh[hd] * w_rel_h[(size_t)hd * D_POS_ + qd];
+                                        }
+                                        float brel_term = sqrtf((float)H) * b_rel_r_[(size_t)h * B_REL_STRIDE_ + bd];
+                                        float qrel_term = scale * (float)qrel;
+                                        float qk_term   = scale * (float)dot;
+                                        float s   = qk_term + qrel_term + brel_term;
+                                        float s16 = scale * (float)dot16 + qrel_term + brel_term;
+                                        // [ATTN_TERM]: literal per-term breakdown for the
+                                        // 2 nearest keys, head 0 — QK/q_rel/b_rel each
+                                        // named, so whichever term produces the 0.14 is
+                                        // directly visible (not inferred from a diff).
+                                        if (h == 0 && (kx == MEM_LEN - 1 || kx == MEM_LEN)) {
+                                            fprintf(stderr, "[ATTN_TERM] kx=%d(%s) d=%d QK=%.6f q_rel=%.6f "
+                                                    "b_rel=%.6f score=%.6f\n",
+                                                    kx, (kx == MEM_LEN) ? "self" : "mem_closest",
+                                                    d, qk_term, qrel_term, brel_term, s);
+                                        }
+                                        scores_[kx] = s;
+                                        scores_fp16[kx] = s16;
+                                        if (s > mx) mx = s;
+                                        if (s16 > mx16) mx16 = s16;
+                                    }
+                                    double sum = 0.0, sum16 = 0.0;
+                                    for (int kx = 0; kx < kv_len; kx++) { scores_[kx] = expf(scores_[kx] - mx); sum += scores_[kx]; }
+                                    for (int kx = 0; kx < kv_len; kx++) scores_[kx] = (float)(scores_[kx] / sum);
+                                    for (int kx = 0; kx < kv_len; kx++) { scores_fp16[kx] = expf(scores_fp16[kx] - mx16); sum16 += scores_fp16[kx]; }
+                                    for (int kx = 0; kx < kv_len; kx++) scores_fp16[kx] = (float)(scores_fp16[kx] / sum16);
+                                    for (uint32_t hd = 0; hd < HD_; hd++) {
+                                        double acc = 0.0, acc16 = 0.0;
+                                        for (int kx = 0; kx < kv_len; kx++) {
+                                            const float* vh = (kx < MEM_LEN) ? (kv_mem_v + (size_t)kx * H + h * HD_)
+                                                                              : (self_v + h * HD_);
+                                            acc   += (double)scores_[kx] * vh[hd];
+                                            acc16 += (double)scores_fp16[kx] * quant16(vh[hd]);
+                                        }
+                                        arb_attn[h * HD_ + hd] = (float)acc;
+                                        arb_attn_fp16[h * HD_ + hd] = (float)acc16;
+                                    }
+                                }
+                                std::vector<float> decode_attn_out(H);
+                                bool have_decode = nncp_decode_dump_get_attn_out(i, H, decode_attn_out.data());
+                                const float* train_pre_o = (const float*)[tr->xcmp_attn_pre_o_buf contents];  // row0
+                                float ma_decode = 0.0f, mr_decode = 0.0f, ma_train = 0.0f, mr_train = 0.0f;
+                                if (have_decode) fwd_dump_max_err(arb_attn.data(), decode_attn_out.data(), H, &ma_decode, &mr_decode);
+                                fwd_dump_max_err(arb_attn.data(), train_pre_o, H, &ma_train, &mr_train);
+                                if (have_decode) {
+                                    float ma_fp16 = 0.0f, mr_fp16 = 0.0f;
+                                    fwd_dump_max_err(arb_attn_fp16.data(), decode_attn_out.data(), H, &ma_fp16, &mr_fp16);
+                                    fprintf(stderr, "[ATTN_ARB_FP16] layer=%u vs_decode_max_abs(fp32_kv)=%.3e "
+                                            "vs_decode_max_abs(fp16_kv)=%.3e  %s\n",
+                                            i, ma_decode, ma_fp16,
+                                            (ma_fp16 < ma_decode * 0.5f) ? "FP16-KV-QUANTIZATION EXPLAINS MOST OF THE GAP"
+                                                                         : "fp16 quantization does NOT explain the gap");
+                                }
+                                fprintf(stderr, "[ATTN_ARB] layer=%u vs_decode_max_abs=%.3e vs_train_max_abs=%.3e "
+                                        "  %s\n", i, ma_decode, ma_train,
+                                        (ma_decode < ma_train) ? "train deviates more from arbiter"
+                                                               : "decode deviates more from arbiter");
+                            }
+                        }
+                    }
+                }
             }
 #else
             // Phase A: bind pl_h[i+1] directly; runWithMTLCommandQueue submits async
@@ -6510,7 +7313,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 if (nncp_fwd_dump_verify_enabled()) {
                     fwd_dump_cpu_verify_layer(tr, &wb, i, m2_dump,
                         B, T_CHUNK, H, tr->NH, tr->HD, F, tr->d_pos,
-                        MEM_LEN, EXT_LEN, is_enwik8, FFN1_MULT);
+                        MEM_LEN, EXT_LEN, is_enwik8, FFN1_MULT, t_start);
                 }
             }
 #endif
@@ -6601,7 +7404,31 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // nncp_metal_bw_disabled()'s comment): unlike verify mode it doesn't
         // also enable the BW_VERIFY_L1 shadow/reference machinery, it just
         // forces every step down the MPSGraph path.
-        if (!nncp_bw_verify_l1_enabled() && !nncp_metal_bw_disabled() &&
+        //
+        // Safety fuse (2026-07-04, dropout spike): metal_bw_layer has no
+        // dropout mask wiring yet (see plan-A-quality-first (b) — the
+        // mask-multiply dropout implemented so far only feeds tr->pl_fwd /
+        // tr->pl_bwd, MPSGraph-side graphs). If NNCP_DROPOUT>0 and the fast
+        // Metal path ran anyway, its forward-recompute-free per-layer
+        // backward would implicitly assume NO dropout was applied, while
+        // the actual forward pass (which produced pl_h[i+1] and the loss)
+        // DID apply it — forward/backward would silently disagree on what
+        // function was differentiated. Force the MPSGraph fallback (which
+        // always plumbs the mask correctly) whenever dropout is active.
+        // Remove this condition once metal_bw_layer gets its own mask
+        // dispatch (see metal_bw_loss/metal_bw_layer's forward-value
+        // consumers — this needs the same tr->dropout_mask_attn/ffn2[i]
+        // buffers this file already saves for MPSGraph's benefit).
+        const bool dropout_active_no_metal_wiring = (nncp_dropout_rate() > 0.0f);
+        if (dropout_active_no_metal_wiring) {
+            static bool logged_once = false;
+            if (!logged_once) {
+                NSLog(@"[M2] NNCP_DROPOUT>0: forcing MPSGraph fallback for per-layer backward "
+                      @"(metal_bw_layer has no dropout mask wiring yet)");
+                logged_once = true;
+            }
+        }
+        if (!nncp_bw_verify_l1_enabled() && !nncp_metal_bw_disabled() && !dropout_active_no_metal_wiring &&
             cmd_buf && metal_bw_train_step(tr, &wb, cmd_buf, accumulate_weight_grads)) {
             [cmd_buf commit];
             [cmd_buf waitUntilCompleted];
@@ -6678,6 +7505,16 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 feeds[bg.kv_k] = floatTD(tr->kv_mem_buf_k[i], shape_kv);
             if ((uint32_t)i < SEG_MAX_LAYERS && tr->kv_mem_buf_v[i])
                 feeds[bg.kv_v] = floatTD(tr->kv_mem_buf_v[i], shape_kv);
+            // Bug 8 fix (B): same chunk1/chunk2 variant selection as the
+            // forward graph's buildLayerFeeds — this is the backward-recompute
+            // graph, must see the SAME tables the forward pass used.
+            {
+                const bool is_chunk1 = (t_start == 0);
+                feeds[bg.causal_mask] = floatTD(is_chunk1 ? tr->causal_mask_buf_c1 : tr->causal_mask_buf_c2, shape_mask);
+                feeds[bg.P_all_q]     = floatTD(is_chunk1 ? tr->p_all_q_buf_c1     : tr->p_all_q_buf_c2,     shape_p_all_q);
+                feeds[bg.Q_all_b]     = floatTD(is_chunk1 ? tr->q_all_b_buf_c1     : tr->q_all_b_buf_c2,     shape_q_all_b);
+            }
+            feedDropoutMasksBwd(feeds, bg, (uint32_t)i);
 
             NSDictionary* res = nil;
             if (use_gpu_readback) {
@@ -7239,6 +8076,145 @@ static float run_chunked_bptt_chunk(OnlineTrainer* tr,
     return loss_val;
 }
 
+// Bug 6 fix (2026-07-05, chunk-mem-fix-design.md step 4): Transformer-XL-style
+// mem FIFO slide at the chunk1→chunk2 boundary. Mirrors original nncp.c's
+// mem_update (per Pane 1's line-numbered audit: mem_len > train_len case) —
+// "shift the old mem left by T_CHUNK positions, append this chunk's own
+// hidden state at the tail" — generalized here from h to K/V directly (see
+// design doc's equivalence proof: no optimizer step runs between chunk1's
+// forward and chunk2's forward, so W_k/W_v are unchanged and K/V-caching is
+// equivalent to h-caching + re-projection at this point).
+// Scope: only handles T_CHUNK <= MEM_LEN (true for every current profile,
+// e.g. enwik8: MEM_LEN=256, T_CHUNK=32) — the T_CHUNK > MEM_LEN case (chunk1
+// itself longer than the memory window) is out of scope per the design doc.
+// [C1KV_DUMP] (2026-07-05, memfix500b — fence made no difference, ruling out
+// the race hypothesis; this is now the last unverified point per the report
+// chain: the slide algorithm itself is unit-tested and PASSes, so the only
+// remaining suspect is whether chunk1_kv_buf_k/v[i]'s resultsDictionary
+// capture actually holds the K/V build_single_layer computed, or a stale/
+// aliased scratch value). Recomputes K=x_ln1@W_k, V=x_ln1@W_v on the CPU from
+// tr->pl_h[layer] (chunk1's own input — same tensor fwd_dump_cpu_verify_layer
+// already trusts) and diffs against the captured buffer for b=0's first few
+// rows. If this FAILs while the graph math looks right, it's the same class
+// of bug t_Q_saved hit (MPSGraph reusing a same-shape [BT,H] scratch
+// allocation for a non-terminal, repeatedly-invoked-graph output) — k/v's
+// downstream consumer shape (toMH → k_ext concat with kv_mem_buf) differs
+// from q_mh's (toMH → scores matmul), so the SAME identityWithTensor: fix may
+// not suffice here; the fix would need investigating this file's own
+// dump_inter/resultsDictionary binding order or an additional
+// materialization barrier.
+static bool nncp_c1kv_verify_enabled() {
+    static int v = -1;
+    if (v < 0) v = getenv("NNCP_C1KV_VERIFY") ? 1 : 0;
+    return v != 0;
+}
+
+static void nncp_c1kv_verify_layer(OnlineTrainer* tr, const MPSTransformerWeightBuffers* wb,
+                                    uint32_t layer, uint32_t H) {
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
+    const bool is_enwik8 = (g_nncp_profile.h == 1024);
+    const float* x    = (const float*)[tr->pl_h[layer] contents];  // row = b*T_CHUNK+t (chunk1's input)
+    const float* wln  = (const float*)[wb->ln contents] + (size_t)layer * 4 * H;
+    const float* gam1 = wln;
+    const float* w_k  = (const float*)[wb->attn_k contents] + (size_t)layer * H * H;
+    const float* w_v  = (const float*)[wb->attn_v contents] + (size_t)layer * H * H;
+    const float* k_got_buf = (const float*)[tr->chunk1_kv_buf_k[layer] contents];
+    const float* v_got_buf = (const float*)[tr->chunk1_kv_buf_v[layer] contents];
+
+    const int n_rows = (T_CHUNK < 3) ? T_CHUNK : 3;  // b=0's first few rows: row = 0*T_CHUNK+t = t
+    for (int t = 0; t < n_rows; t++) {
+        const float* xr = x + (size_t)t * H;
+        std::vector<float> x_ln1(H);
+        if (is_enwik8) {
+            double s = 0.0;
+            for (uint32_t c = 0; c < H; c++) s += (double)xr[c] * xr[c];
+            float inv = 1.0f / sqrtf((float)(s / H) + 1e-5f);
+            for (uint32_t c = 0; c < H; c++) x_ln1[c] = xr[c] * inv * gam1[c];
+        } else {
+            std::copy(xr, xr + H, x_ln1.begin());
+        }
+        std::vector<float> k_ref(H), v_ref(H);
+        for (uint32_t n = 0; n < H; n++) {
+            double sk = 0.0, sv = 0.0;
+            for (uint32_t kk = 0; kk < H; kk++) {
+                sk += (double)x_ln1[kk] * w_k[(size_t)kk * H + n];
+                sv += (double)x_ln1[kk] * w_v[(size_t)kk * H + n];
+            }
+            k_ref[n] = (float)sk;
+            v_ref[n] = (float)sv;
+        }
+        const float* k_got = k_got_buf + (size_t)t * H;
+        const float* v_got = v_got_buf + (size_t)t * H;
+        float k_abs, k_rel, v_abs, v_rel;
+        fwd_dump_max_err(k_ref.data(), k_got, H, &k_abs, &k_rel);
+        fwd_dump_max_err(v_ref.data(), v_got, H, &v_abs, &v_rel);
+        fprintf(stderr, "[C1KV_DUMP] layer=%u row(b=0,t=%d) k_rel_err=%.3e v_rel_err=%.3e  %s\n",
+                layer, t, k_rel, v_rel, (k_rel < 1e-3f && v_rel < 1e-3f) ? "PASS" : "FAIL");
+    }
+}
+
+// Bug 8 fix (B) (2026-07-05, window-symmetry-fix-design.md): supersedes bug
+// 6's FIFO slide. The original nncp.c never discards pre_seg_mem mid-segment
+// — mem is frozen for the WHOLE segment, and the "current" region simply
+// grows. Reproducing that exactly with a chunked (chunk1/chunk2) BPTT split
+// means chunk2's mem view must be [pre_seg_mem(256, UNCHANGED) ++ chunk1's
+// real K/V(32)] = 288 total, NOT a FIFO-discard-then-append back down to 256
+// (which is what the superseded nncp_chunk_mem_slide_core did). Concat is
+// simpler than slide: no overlapping read/write, so no memmove/race concerns
+// — chunk1's K/V is just appended into the ALREADY-CORRECT (never touched)
+// tail slots [mem_len_true : mem_len_true+T_CHUNK) that chunk1's own "Reset
+// KV memory" step (run_per_layer_bptt_chunk) zero-filled as a placeholder.
+static void nncp_chunk_mem_concat(OnlineTrainer* tr, uint32_t H) {
+    const int MEM_LEN_TRUE = (int)g_nncp_profile.mem_len;
+    const int MEM_LEN      = MEM_LEN_TRUE + (int)BPTT_CHUNK_LEN;  // 288, unified width
+    const int T_CHUNK      = (int)BPTT_CHUNK_LEN;
+    const int B            = SEG_TRAIN_STREAMS;
+    auto concat_one = [&](id<MTLBuffer> mem_buf, id<MTLBuffer> chunk1_buf) {
+        if (!mem_buf || !chunk1_buf) return;
+        float* mem = (float*)[mem_buf contents];
+        const float* c1 = (const float*)[chunk1_buf contents];
+        for (int s = 0; s < B; s++) {
+            float* mem_s = mem + (size_t)s * MEM_LEN * H;         // [0:MEM_LEN) per stream
+            const float* c1_s = c1 + (size_t)s * T_CHUNK * H;     // [0:T_CHUNK) per stream
+            // [0:MEM_LEN_TRUE) is pre_seg_mem — untouched, left exactly as
+            // chunk1's own "Reset KV memory" step wrote it.
+            memcpy(mem_s + (size_t)MEM_LEN_TRUE * H, c1_s, (size_t)T_CHUNK * H * sizeof(float));
+        }
+    };
+    for (uint32_t li = 0; li < tr->L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
+        concat_one(tr->kv_mem_buf_k[li], tr->chunk1_kv_buf_k[li]);
+        concat_one(tr->kv_mem_buf_v[li], tr->chunk1_kv_buf_v[li]);
+    }
+}
+
+// [SLIDE_VERIFY] (2026-07-05, memfix500c — C1KV_DUMP passed, so capture is
+// correct; this checks the NEXT link in the chain): after the slide, mem's
+// LAST slot (b=0, position MEM_LEN-1 — the most-recent memory entry) must be
+// bit-identical to chunk1_kv_buf's LAST row (b=0, t=T_CHUNK-1) — a direct
+// buffer-to-buffer equality check (no CPU recompute needed, both sides are
+// already-verified-correct buffers) that catches anything between the slide
+// itself and chunk2's graph feed silently reverting/corrupting kv_mem_buf
+// (e.g. an unnoticed second reset, or a stale cached MPSGraphTensorData
+// wrapping the OLD buffer contents from before the slide).
+static void nncp_slide_verify_layer(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
+    // Bug 8 fix (B): MEM_LEN is now the unified 288-wide kv_mem_buf width
+    // (was 256) — the "last slot" check below still holds unchanged under
+    // concat (mem[MEM_LEN-1] == chunk1_kv[T_CHUNK-1] either way).
+    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
+    const int MEM_LEN = (int)g_nncp_profile.mem_len + T_CHUNK;
+    const float* mem = (const float*)[tr->kv_mem_buf_k[layer] contents];
+    const float* c1  = (const float*)[tr->chunk1_kv_buf_k[layer] contents];
+    const float* mem_last = mem + (size_t)(MEM_LEN - 1) * H;      // b=0, pos=MEM_LEN-1
+    const float* c1_last  = c1  + (size_t)(T_CHUNK - 1) * H;      // b=0, t=T_CHUNK-1
+    float max_abs = 0.0f;
+    for (uint32_t h = 0; h < H; h++) {
+        float d = fabsf(mem_last[h] - c1_last[h]);
+        if (d > max_abs) max_abs = d;
+    }
+    fprintf(stderr, "[SLIDE_VERIFY] layer=%u mem[last]-vs-chunk1_kv[last] max_abs=%.3e  %s\n",
+            layer, max_abs, (max_abs == 0.0f) ? "PASS" : "FAIL");
+}
+
 // ---------------------------------------------------------------------------
 // Segment-level training: run ONE backward pass over a full [B, T] segment
 // ---------------------------------------------------------------------------
@@ -7258,6 +8234,7 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
     if ((int)tr->L > 8 && tr->pl_ready) {
         // @autoreleasepool: releases MTLCommandBuffer/Encoder from optimizer step and any
         // ObjC objects created by run_chunked_bptt_chunk that escape its inner pools.
+        ++s_xcmp_train_seg_counter;  // see comment at declaration: 1:1 with decode's own seg counter
         @autoreleasepool {
         MPSTransformerWeightBuffers wb;
         if (!mps_transformer_get_weight_buffers(tr->ctx, &wb)) return false;
@@ -7268,6 +8245,32 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
 
         float loss1 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, 0,       true);
+        if (nncp_c1kv_verify_enabled()) {
+            static const uint32_t kC1KVLayers[3] = {0, 10, 19};
+            for (uint32_t li : kC1KVLayers) if (li < L) nncp_c1kv_verify_layer(tr, &wb, li, H);
+        }
+        // memfix500 regression triage (2026-07-05): defensive full-drain fence
+        // before the CPU-side slide touches kv_mem_buf/chunk1_kv_buf. Chunk1's
+        // own command queue submissions (forward AND backward) should already
+        // be synchronously drained by the time run_per_layer_bptt_chunk returns
+        // (its trailing leaf/embedding-gradient step uses the blocking
+        // runWithFeeds:targetTensors: API on the same serial tr->cmdQueue,
+        // which only returns once everything submitted before it on that
+        // queue has completed) — but this fence removes any doubt: unified
+        // memory means a CPU write racing an in-flight GPU read on the same
+        // buffer would corrupt results silently (no crash), which is
+        // consistent with the observed regression (worse loss/CE, not a
+        // crash). Cheap (one empty command buffer) relative to a whole chunk.
+        {
+            id<MTLCommandBuffer> drain = [tr->cmdQueue commandBuffer];
+            [drain commit];
+            [drain waitUntilCompleted];
+        }
+        nncp_chunk_mem_concat(tr, H);  // bug 8 fix (B): chunk1's K/V → chunk2's mem, concat (not slide)
+        if (nncp_c1kv_verify_enabled()) {
+            static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
+            for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
+        }
         float loss2 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
         float avg_loss = (loss1 + loss2) * 0.5f;
 
@@ -7775,12 +8778,15 @@ void online_trainer_reset_session(OnlineTrainer* tr, bool deterministic_init) {
         zeroBuf(tr->v_rel_r, (size_t)tr->NH * tr->HD * tr->d_pos);
     }
     zeroBuf(tr->v_b_rel_r,  (size_t)tr->NH * tr->ext_len);
-    const size_t MEM_SLOTS = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
+    // Bug 8 fix (B): kv_mem_buf_k/v are 288-wide (unified) now; kv_pre_seg_buf_k/v
+    // stay 256-wide (decode's true mem_len latch).
+    const size_t MEM_SLOTS_UNIFIED = (size_t)SEG_TRAIN_STREAMS * ((size_t)SEG_TRAIN_MEM + (size_t)BPTT_CHUNK_LEN);
+    const size_t MEM_SLOTS_TRUE    = (size_t)SEG_TRAIN_STREAMS * (size_t)SEG_TRAIN_MEM;
     for (int li = 0; li < SEG_MAX_LAYERS; li++) {
-        zeroBuf(tr->kv_mem_buf_k[li],     MEM_SLOTS * rH);
-        zeroBuf(tr->kv_mem_buf_v[li],     MEM_SLOTS * rH);
-        zeroBuf(tr->kv_pre_seg_buf_k[li], MEM_SLOTS * rH);
-        zeroBuf(tr->kv_pre_seg_buf_v[li], MEM_SLOTS * rH);
+        zeroBuf(tr->kv_mem_buf_k[li],     MEM_SLOTS_UNIFIED * rH);
+        zeroBuf(tr->kv_mem_buf_v[li],     MEM_SLOTS_UNIFIED * rH);
+        zeroBuf(tr->kv_pre_seg_buf_k[li], MEM_SLOTS_TRUE * rH);
+        zeroBuf(tr->kv_pre_seg_buf_v[li], MEM_SLOTS_TRUE * rH);
     }
 
     if (!deterministic_init) return; // leave weights as-is

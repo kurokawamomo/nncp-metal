@@ -116,7 +116,13 @@ struct MPSTransformerContext {
     bool          kv_cache_valid;       // true after successful alloc
 
     uint32_t kv_memory_len;  // = max_seq_len (= MEM_LEN = 32): tokens kept as "memory" after a shift
-    uint32_t kv_total_len;   // = kv_memory_len * 2 (= 64): total slots in cache
+    // Bug 8 fix (2026-07-05, window-symmetry-fix-design.md): was kv_memory_len*2,
+    // which made the "current" region kv_memory_len-wide — a shift then only
+    // fired every (kv_total_len-kv_memory_len)=kv_memory_len tokens (4 segments
+    // for enwik8), not every segment as the original nncp.c resets. Now
+    // kv_memory_len + seg_len, so "current" is exactly one segment wide and
+    // the shift fires once per segment, matching the original exactly.
+    uint32_t kv_total_len;   // = kv_memory_len + seg_len: total slots in cache
 
     // Pipeline states for KV cache operations
     id<MTLComputePipelineState> ps_kv_cache_write;
@@ -124,6 +130,13 @@ struct MPSTransformerContext {
     id<MTLComputePipelineState> ps_attn_decode_cached;
     id<MTLComputePipelineState> ps_attn_decode_cached_online;  // Wave4: online-softmax variant
     id<MTLComputePipelineState> ps_kv_memory_shift;
+    // Bug 8 fix: generalized 2-pass shift (current_len == seg_len != memory_len
+    // now, so the single in-place kernel above would race — see the kernels'
+    // own comments in neural_net.metal for the full rationale).
+    id<MTLComputePipelineState> ps_kv_memory_shift_to_scratch;
+    id<MTLComputePipelineState> ps_kv_memory_shift_from_scratch;
+    id<MTLBuffer> kv_shift_scratch_k;  // [num_lb * kv_memory_len * H] half, lazily sized
+    id<MTLBuffer> kv_shift_scratch_v;
 
     bool decode_pipeline_ready;
     uint32_t kv_cache_batch_size;  // batch size used when decode pipeline was allocated
@@ -184,6 +197,10 @@ struct MPSTransformerContext {
     NSMutableArray<id<MTLBuffer>>* spf_mem_k_scratch;
     NSMutableArray<id<MTLBuffer>>* spf_mem_v_scratch;
 };
+
+// NNCP_DECODE_DUMP=1 decode-forward parity harness (needs MPSTransformerContext
+// and g_nncp_profile, both in scope from this point on).
+#include "decode_dump.inc"
 
 // ---------------------------------------------------------------------------
 // Public: create / set_weights / destroy
@@ -443,6 +460,20 @@ static bool alloc_kv_cache(MPSTransformerContext* ctx, uint32_t batch_size) {
     memset([ctx->kv_cache_v contents], 0, kv_size);
     memset([ctx->dec_buf_scores_decode contents], 0, scores_size);
 
+    // Bug 8 fix: scratch buffers for the 2-pass generalized memory shift
+    // (kv_memory_shift_to_scratch/from_scratch) — sized [num_lb, memory_len, H],
+    // NOT [.., total_len, H] like kv_cache_k/v itself (scratch only ever holds
+    // the shifted MEMORY region, never the current/segment region).
+    {
+        const uint32_t MEM = ctx->kv_memory_len;
+        size_t scratch_size = (size_t)L * batch_size * MEM * H * sizeof(uint16_t);
+        ctx->kv_shift_scratch_k = [ctx->device newBufferWithLength:scratch_size
+                                                            options:MTLResourceStorageModeShared];
+        ctx->kv_shift_scratch_v = [ctx->device newBufferWithLength:scratch_size
+                                                            options:MTLResourceStorageModeShared];
+        if (!ctx->kv_shift_scratch_k || !ctx->kv_shift_scratch_v) return false;
+    }
+
     ctx->kv_cache_pos        = 0;
     ctx->kv_cache_valid      = true;
     ctx->kv_cache_batch_size = batch_size;
@@ -510,6 +541,8 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
     ctx->ps_attn_decode_cached   = makePSO(@"transformer_attention_decode_cached");
     ctx->ps_attn_decode_cached_online = makePSO(@"transformer_attention_decode_cached_online");
     ctx->ps_kv_memory_shift      = makePSO(@"kv_memory_shift");
+    ctx->ps_kv_memory_shift_to_scratch   = makePSO(@"kv_memory_shift_to_scratch");
+    ctx->ps_kv_memory_shift_from_scratch = makePSO(@"kv_memory_shift_from_scratch");
 
     // Wave 4: env-selected fused LN (threadgroup-staged 1-pass). Default OFF
     // until bit-exact roundtrip is verified. Set NNCP_FUSED_LN=1 to enable.
@@ -524,13 +557,18 @@ static bool setup_decode_pipeline(MPSTransformerContext* ctx, uint32_t batch_siz
         !ctx->ps_attn_score  || !ctx->ps_attn_value || !ctx->ps_geglu || !ctx->ps_gelu ||
         !ctx->ps_element_add || !ctx->ps_element_scale || !ctx->ps_kv_cache_write   ||
         !ctx->ps_kv_cache_write_batch || !ctx->ps_attn_decode_cached ||
-        !ctx->ps_kv_memory_shift) {
+        !ctx->ps_kv_memory_shift || !ctx->ps_kv_memory_shift_to_scratch ||
+        !ctx->ps_kv_memory_shift_from_scratch) {
         return false;
     }
 
-    // Transformer-XL: memory_len = max_seq_len, total = memory + current = 2 * max_seq_len
+    // Bug 8 fix (2026-07-05, window-symmetry-fix-design.md): total = memory +
+    // seg_len (was memory*2 — see kv_total_len's own comment for why that was
+    // wrong). "current" is now exactly one segment wide, so the shift below
+    // fires once per segment, matching the original nncp.c's per-segment
+    // reset cadence.
     ctx->kv_memory_len = ctx->config.max_seq_len;
-    ctx->kv_total_len  = ctx->kv_memory_len * 2;
+    ctx->kv_total_len  = ctx->kv_memory_len + (uint32_t)g_nncp_profile.seg_len;
 
     // Allocate KV cache buffers (Transformer-XL layout: [L, batch, kv_total_len, H])
     if (!alloc_kv_cache(ctx, batch_size)) {
@@ -1150,7 +1188,8 @@ static bool execute_decode_mgd(MPSTransformerContext* ctx,
 // Encode one decode step onto an existing encoder (no commit).
 // The caller manages the command buffer lifecycle.
 static void encode_decode_step(MPSTransformerContext* ctx,
-                                id<MTLComputeCommandEncoder> enc,
+                                id<MTLComputeCommandEncoder>& enc,  // by-ref: NNCP_DECODE_DUMP may swap in a fresh encoder mid-step
+                                id<MTLCommandBuffer>& cmd,          // by-ref: paired with enc for the mid-step commit+wait
                                 id<MTLBuffer> token_buf,   // [batch] int32 for this step
                                 id<MTLBuffer> logit_buf,   // [batch*V] float output for this step
                                 uint32_t batch_size,
@@ -1210,10 +1249,29 @@ static void dispatch_linear_residual(id<MTLComputeCommandEncoder> enc,
     }
 }
 
+// NNCP_DECODE_SCORE_CLAMP A/B switch for decode attention score clamp.
+// Unset -> 50.0f (current behavior). <=0 -> disabled (large bound; both decode
+// kernels are already overflow-safe via max-subtraction / online running-max,
+// so a large bound is numerically equivalent to "no clamp"). Other -> |value|.
+static float nncp_decode_score_clamp_bound(void) {
+    static float bound = -1.0f;
+    if (bound < 0.0f) {
+        const char* v = getenv("NNCP_DECODE_SCORE_CLAMP");
+        if (!v) {
+            bound = 50.0f;
+        } else {
+            float f = strtof(v, nullptr);
+            bound = (f <= 0.0f) ? 1e9f : fabsf(f);
+        }
+    }
+    return bound;
+}
+
 // Encode one decode step into an existing command encoder.
 // Does NOT commit — caller batches multiple steps into one command buffer.
 static void encode_decode_step(MPSTransformerContext* ctx,
-                                id<MTLComputeCommandEncoder> enc,
+                                id<MTLComputeCommandEncoder>& enc,
+                                id<MTLCommandBuffer>& cmd,
                                 id<MTLBuffer> token_buf,
                                 id<MTLBuffer> logit_buf,
                                 uint32_t batch_size,
@@ -1255,7 +1313,17 @@ static void encode_decode_step(MPSTransformerContext* ctx,
     const bool use_post_ln = (g_nncp_profile.h != 1024);
     const uint32_t ffn1_dec_out = (g_nncp_profile.h == 1024) ? 2u * FFN : FFN;
 
+    // DEC_DUMP silent-body triage (2026-07-05, round 3): prove the loop itself
+    // runs (and how many times) independent of g_decode_dump_state.active —
+    // capture_layer's own DBG showed zero hits even after confirming this
+    // function is reached and its per-token caller took the right branch.
+    if (nncp_decode_dump_enabled())
+        fprintf(stderr, "[DEC_DUMP_DBG] encode_decode_step L(loop bound)=%u dump_active=%d\n",
+                L, (int)g_decode_dump_state.active);
+
     for (uint32_t layer = 0; layer < L; layer++) {
+        if (nncp_decode_dump_enabled() && g_decode_dump_state.active)
+            fprintf(stderr, "[DEC_DUMP_DBG] layer_loop_iter ENTER layer=%u\n", layer);
         const NSUInteger off_HH    = (NSUInteger)layer * H * H * sizeof(float);
         const NSUInteger off_FFN1  = (NSUInteger)layer * H * ffn1_dec_out * sizeof(float);
         const NSUInteger off_FFN2  = (NSUInteger)layer * FFN * H * sizeof(float);
@@ -1287,6 +1355,20 @@ static void encode_decode_step(MPSTransformerContext* ctx,
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
         id<MTLBuffer> qkv_src = use_post_ln ? x_buf : ctx->dec_buf_ln1;
+
+        // NNCP_DECODE_DUMP=1 KV-content parity (2026-07-05): capture this
+        // position's x_ln1 for the 3 representative layers, independent of
+        // (and wider than) the per-layer full-parity NTOK window — needed so
+        // nncp_kv_dump_check can recompute K/V for every in-seg position, not
+        // just the dumped tokens'.
+        if (!use_post_ln && g_kv_history.active && nncp_kv_dump_layer_slot(layer) >= 0) {
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            nncp_kv_history_capture(ctx, layer, H, kv_pos - g_kv_history.kv_pos_seg_start);
+            cmd = [ctx->commandQueue commandBufferWithUnretainedReferences];
+            enc = [cmd computeCommandEncoder];
+        }
 
         // QKV
         dispatch_linear(enc, ctx, qkv_src, 0, ctx->w_attn_q, off_HH, ctx->dec_zero_H, 0, ctx->dec_buf_q, 0, batch_size, H, H);
@@ -1351,6 +1433,22 @@ static void encode_decode_step(MPSTransformerContext* ctx,
         [enc setBytes:&d_pos_val length:sizeof(uint32_t) atIndex:12];
         [enc setBytes:&total_len_v length:sizeof(uint32_t) atIndex:13];
         [enc setBytes:&b_rel_scale length:sizeof(float) atIndex:14];
+        float score_clamp_bound = nncp_decode_score_clamp_bound();
+        [enc setBytes:&score_clamp_bound length:sizeof(float) atIndex:15];
+        // [ATTN_CONST] (2026-07-05, decode-deviates-more triage): print the
+        // ACTUAL constants this dispatch is handing the attention kernel,
+        // layer0 of the dumped token only — for direct comparison against
+        // train's corresponding build-time constants (scale=1/sqrt(HD),
+        // b_rel_scale=sqrt(H), both computed the same formula way but from
+        // this file's tr->NH/HD vs online_trainer.mm's own H/HD, which SHOULD
+        // be numerically identical if both read the same profile — this
+        // print settles whether a profile-non-tracking hardcode (e.g. a
+        // literal 16 instead of sqrt(H)) exists here.
+        if (g_decode_dump_state.active && layer == 0) {
+            fprintf(stderr, "[ATTN_CONST] decode: NH=%u HD=%u H=%u attn_scale=%.8f b_rel_scale=%.8f "
+                    "d_pos=%u total_len=%u score_clamp_bound=%.3f kv_len=%u\n",
+                    NH, HD, H, attn_scale, b_rel_scale, d_pos_val, total_len_v, score_clamp_bound, kv_len);
+        }
         [enc dispatchThreads:MTLSizeMake(NH * 32u, batch_size, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -1438,6 +1536,28 @@ static void encode_decode_step(MPSTransformerContext* ctx,
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
         x_buf = ctx->dec_buf_embed;
+
+        // NNCP_DECODE_DUMP=1: readback this layer's intermediates before the
+        // next layer's dispatches overwrite the reused dec_buf_ln1/q/attn_val
+        // buffers. Costs a mid-step commit+wait, so it only runs for the
+        // handful of tokens the harness targets (see decode_dump.inc).
+        // 2026-07-05 correction: this call was originally (wrongly) inserted
+        // into mps_transformer_execute_decode_fast — a near-identical but
+        // DEAD-for-enwik8 decode implementation (used only by the separate
+        // mps_transformer_execute() seq_len==1 path, which
+        // mps_transformer_execute_segment() never calls). THIS loop (the
+        // short ~267-line encode_decode_step actually invoked per-token from
+        // mps_transformer_execute_segment) is the real production body —
+        // confirmed at runtime via layer_loop_iter ENTER firing 20x per
+        // dumped token while the misplaced capture_layer stayed at 0.
+        if (g_decode_dump_state.active) {
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            nncp_decode_dump_capture_layer(ctx, layer, H, FFN);
+            cmd = [ctx->commandQueue commandBufferWithUnretainedReferences];
+            enc = [cmd computeCommandEncoder];
+        }
     }
 
     // LN_FINAL
@@ -1669,6 +1789,8 @@ static bool mps_transformer_execute_decode_fast(MPSTransformerContext* ctx,
         [enc setBytes:&d_pos_val      length:sizeof(uint32_t) atIndex:12];
         [enc setBytes:&total_len_v    length:sizeof(uint32_t) atIndex:13];
         [enc setBytes:&b_rel_r_scale  length:sizeof(float)    atIndex:14];
+        float score_clamp_bound = nncp_decode_score_clamp_bound();
+        [enc setBytes:&score_clamp_bound length:sizeof(float) atIndex:15];
         [enc dispatchThreads:MTLSizeMake(NH * 32u, batch_size, 1)
             threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
 
@@ -2716,6 +2838,27 @@ void mps_transformer_execute_segment(
 {
     if (!ctx || !input_tokens || !logits_out || n_streams <= 0 || seg_len <= 0) return;
 
+    // DEC_DUMP silent-body triage (2026-07-05): capture_layer's own DBG lines
+    // showed zero hits even though the per-token loop's header print (further
+    // down this function) DID fire — meaning encode_decode_step's per-layer
+    // capture block is compiled but not reached at runtime, or this function
+    // itself isn't the code path actually driving enwik8 decode. Unconditional
+    // entry/branch breadcrumbs below settle which.
+    if (nncp_decode_dump_enabled()) {
+        fprintf(stderr, "[DEC_DUMP_DBG] execute_segment ENTRY n_streams=%d seg_len=%d "
+                "num_layers=%u kv_cache_valid=%d spf_ready=%d spf_skipped=%d "
+                "decode_pipeline_ready=%d mgd_ready=%d mgd_skipped=%d SPF_ENABLE=%d\n",
+                n_streams, seg_len, ctx->config.num_layers, (int)ctx->kv_cache_valid,
+                (int)ctx->spf_ready, (int)ctx->spf_skipped, (int)ctx->decode_pipeline_ready,
+                (int)ctx->mgd_ready, (int)ctx->mgd_skipped,
+#if SPF_ENABLE
+                1
+#else
+                0
+#endif
+                );
+    }
+
     // NOTE: Segment prefill graph (spf_*) is implemented but disabled.
     // Lossless compression requires bit-identical logits between compress (prefill, M=B*T)
     // and decompress (per-token, M=B). GEMM accumulation order differs → roundtrip fails.
@@ -2725,6 +2868,8 @@ void mps_transformer_execute_segment(
         if (!ctx->spf_ready)
             build_segment_prefill_graph(ctx, (uint32_t)n_streams, (uint32_t)seg_len);
         if (ctx->spf_ready) {
+            if (nncp_decode_dump_enabled())
+                fprintf(stderr, "[DEC_DUMP_DBG] execute_segment TAKING spf branch (returns before per-token loop)\n");
             if (execute_segment_prefill(ctx, input_tokens, n_streams, seg_len, logits_out))
                 return;
         }
@@ -2743,11 +2888,38 @@ void mps_transformer_execute_segment(
         }
     }
 
+    if (nncp_decode_dump_enabled())
+        fprintf(stderr, "[DEC_DUMP_DBG] execute_segment TAKING per-token encode_decode_step loop, seg_len=%d\n", seg_len);
+
     // Reusable token buffer (allocated once, reused per step)
     MTLResourceOptions sharedOpts = MTLResourceStorageModeShared;
     if (!ctx->dec_buf_input || [ctx->dec_buf_input length] < B * sizeof(int32_t)) {
         ctx->dec_buf_input = [ctx->device newBufferWithLength:B * sizeof(int32_t) options:sharedOpts];
     }
+
+    // NNCP_DECODE_DUMP=1: identify the target full-segment call (seg_len>1 —
+    // this excludes the separate per-token decompress call variant, which
+    // isn't comparable to [LOSS]'s own compress-side forward pass anyway).
+    // A single static counter is process-wide: a given binary invocation only
+    // ever runs one of compress/decompress, so this can't double-count across
+    // modes within one run.
+    static int s_decode_dump_seg_counter = 0;
+    bool decode_dump_this_seg = false;
+    if (seg_len > 1) {
+        ++s_decode_dump_seg_counter;
+        decode_dump_this_seg = nncp_decode_dump_enabled()
+            && (s_decode_dump_seg_counter == nncp_decode_dump_target_seg());
+    }
+    // KV-content parity (seg450c follow-up): capture x_ln1 history for the
+    // WHOLE target segment (every t), not just the NTOK dump window — the
+    // parity check needs every in-seg position, and the window may start
+    // well past t=0 via NNCP_DECODE_DUMP_TOK_OFFSET.
+    g_kv_history.active = decode_dump_this_seg;
+    if (decode_dump_this_seg) {
+        g_kv_history.kv_pos_seg_start = (uint32_t)ctx->kv_cache_pos;
+        for (int i = 0; i < 3; i++) g_kv_history.x_ln1_hist[i].clear();
+    }
+    const int tok_offset = nncp_decode_dump_tok_offset();
 
     // Per-step execution with @autoreleasepool to prevent ObjC object accumulation
     for (int t = 0; t < seg_len; t++) {
@@ -2757,15 +2929,40 @@ void mps_transformer_execute_segment(
         for (int s = 0; s < n_streams; s++)
             tok[s] = input_tokens[s * seg_len + t];
 
+        const bool dump_this_tok = decode_dump_this_seg
+            && (t >= tok_offset) && (t < tok_offset + nncp_decode_dump_ntok());
+        g_decode_dump_state.active = dump_this_tok;
+        g_decode_dump_state.tok_idx = t;
+        if (dump_this_tok) {
+            g_decode_dump_state.layers.clear();
+            g_decode_dump_state.captured_seg = s_decode_dump_seg_counter;
+            g_decode_dump_state.target_tok_offset = t;
+        }
+        const uint32_t kv_pos_before = (uint32_t)ctx->kv_cache_pos;
+
         id<MTLCommandBuffer> cmd = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-        encode_decode_step(ctx, enc, ctx->dec_buf_input, ctx->dec_buf_logits, B,
-                           (uint32_t)ctx->kv_cache_pos);
+        encode_decode_step(ctx, enc, cmd, ctx->dec_buf_input, ctx->dec_buf_logits, B,
+                           kv_pos_before);
 
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
+
+        if (dump_this_tok) {
+            fprintf(stderr, "[DEC_DUMP] === seg=%d tok=%d token_id=%d kv_pos_before=%u ===\n",
+                    s_decode_dump_seg_counter, t, tok[0], kv_pos_before);
+            nncp_decode_dump_cpu_verify(ctx, tok[0], kv_pos_before);
+            // 案2: decode's own CE for this token, from the real GPU logits.
+            // next_token is stream 0's input at t+1 (== the byte this step is
+            // predicting; see neural_bridge_lossless_cuda.mm's encode loop:
+            // target(t) = input_data[data_off] = seg_tokens[t+1]'s "input" by
+            // construction). Unavailable for the last token of a segment.
+            const int32_t next_token = (t + 1 < seg_len) ? input_tokens[0 * seg_len + (t + 1)] : -1;
+            nncp_decode_dump_ce(ctx, t, next_token);
+            nncp_kv_dump_check(ctx, kv_pos_before);
+        }
 
         // Copy logits for this step
         float* src = (float*)[ctx->dec_buf_logits contents];
@@ -2778,22 +2975,45 @@ void mps_transformer_execute_segment(
         } // @autoreleasepool
     }
 
-    // KV memory shift if needed
+    // Bug 8 fix (2026-07-05, window-symmetry-fix-design.md, design (A)): KV
+    // memory shift if needed — now a 2-pass generalized shift since current_len
+    // (= seg_len) != memory_len anymore (see kv_memory_shift_to_scratch/
+    // from_scratch's own comments in neural_net.metal for the race this avoids).
     if (ctx->kv_cache_pos >= (NSUInteger)ctx->kv_total_len) {
         uint32_t num_lb    = ctx->config.num_layers * ctx->kv_cache_batch_size;
         uint32_t total_len = ctx->kv_total_len;
         uint32_t mem_len   = ctx->kv_memory_len;
+        uint32_t seg_len_u = (uint32_t)g_nncp_profile.seg_len;
         uint32_t n_shift   = num_lb * mem_len * ctx->config.hidden_size;
         id<MTLCommandBuffer> sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
-        [se setComputePipelineState:ctx->ps_kv_memory_shift];
+
+        [se setComputePipelineState:ctx->ps_kv_memory_shift_to_scratch];
         [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
         [se setBuffer:ctx->kv_cache_v offset:0 atIndex:1];
-        [se setBytes:&total_len length:sizeof(uint32_t) atIndex:2];
-        [se setBytes:&mem_len   length:sizeof(uint32_t) atIndex:3];
-        [se setBytes:&ctx->config.hidden_size length:sizeof(uint32_t) atIndex:4];
+        [se setBuffer:ctx->kv_shift_scratch_k offset:0 atIndex:2];
+        [se setBuffer:ctx->kv_shift_scratch_v offset:0 atIndex:3];
+        [se setBytes:&num_lb    length:sizeof(uint32_t) atIndex:4];
+        [se setBytes:&total_len length:sizeof(uint32_t) atIndex:5];
+        [se setBytes:&mem_len   length:sizeof(uint32_t) atIndex:6];
+        [se setBytes:&seg_len_u length:sizeof(uint32_t) atIndex:7];
+        [se setBytes:&ctx->config.hidden_size length:sizeof(uint32_t) atIndex:8];
         [se dispatchThreads:MTLSizeMake(n_shift, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(MIN(n_shift, 64u), 1, 1)];
+        [se memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [se setComputePipelineState:ctx->ps_kv_memory_shift_from_scratch];
+        [se setBuffer:ctx->kv_cache_k offset:0 atIndex:0];
+        [se setBuffer:ctx->kv_cache_v offset:0 atIndex:1];
+        [se setBuffer:ctx->kv_shift_scratch_k offset:0 atIndex:2];
+        [se setBuffer:ctx->kv_shift_scratch_v offset:0 atIndex:3];
+        [se setBytes:&num_lb    length:sizeof(uint32_t) atIndex:4];
+        [se setBytes:&total_len length:sizeof(uint32_t) atIndex:5];
+        [se setBytes:&mem_len   length:sizeof(uint32_t) atIndex:6];
+        [se setBytes:&ctx->config.hidden_size length:sizeof(uint32_t) atIndex:7];
+        [se dispatchThreads:MTLSizeMake(n_shift, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n_shift, 64u), 1, 1)];
+
         [se endEncoding]; [sc commit]; [sc waitUntilCompleted];
         ctx->kv_cache_pos = ctx->kv_memory_len;
     }
