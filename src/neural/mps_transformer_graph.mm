@@ -2985,6 +2985,31 @@ void mps_transformer_execute_segment(
         uint32_t mem_len   = ctx->kv_memory_len;
         uint32_t seg_len_u = (uint32_t)g_nncp_profile.seg_len;
         uint32_t n_shift   = num_lb * mem_len * ctx->config.hidden_size;
+
+        // [SHIFT_CALL] (2026-07-05, A-only regression triage): dump the actual
+        // runtime parameters + call-frequency (mps_transformer_execute_segment
+        // calls, i.e. segments, since the last shift fired) for the first 3
+        // firings only — confirms whether the shift fires the intended
+        // once-per-segment cadence, and whether num_lb/total_len/mem_len/
+        // seg_len match the profile's true values. s_decode_dump_seg_counter
+        // (declared above, incremented once per execute_segment call) is
+        // reused as the segment tick — no new global needed.
+        {
+            static int s_shift_call_count = 0;
+            static int s_seg_counter_at_last_fire = -1;
+            if (s_shift_call_count < 3) {
+                int segs_since_last = (s_seg_counter_at_last_fire < 0)
+                    ? -1 : (s_decode_dump_seg_counter - s_seg_counter_at_last_fire);
+                fprintf(stderr, "[SHIFT_CALL] call#%d num_lb=%u total_len=%u mem_len=%u seg_len=%u "
+                        "n_shift=%u kv_cache_pos_before=%llu hidden_size=%u seg_counter=%d segs_since_last_fire=%d\n",
+                        s_shift_call_count, num_lb, total_len, mem_len, seg_len_u, n_shift,
+                        (unsigned long long)ctx->kv_cache_pos, ctx->config.hidden_size,
+                        s_decode_dump_seg_counter, segs_since_last);
+                s_seg_counter_at_last_fire = s_decode_dump_seg_counter;
+                s_shift_call_count++;
+            }
+        }
+
         id<MTLCommandBuffer> sc = [ctx->commandQueue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> se = [sc computeCommandEncoder];
 
