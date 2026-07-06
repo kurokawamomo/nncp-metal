@@ -6014,6 +6014,58 @@ static bool metal_bw_layer(OnlineTrainer* tr,
 #include "online_trainer_verify_l1.inc"
 #endif // NNCP_METAL_BW
 
+// Bug fix (2026-07-03, metric hypothesis): the original `denom = max(|ref|, 1e-6)`
+// floor is far too small. For zero-crossing tensors (q ~ N(0, small var) at init,
+// GELU's near-zero region for geglu_val, linear residual outputs) a handful of
+// elements sit within FP32-rounding distance of 0. FP32 summation is not
+// associative, so a K=1024-term reduction done via CPU (this file's double-
+// accumulated `matmulHH`) vs GPU (MPSGraph's own reduction-tree/warp order) will
+// legitimately differ by ~1e-6..1e-5 ABSOLUTE — completely normal FP32 noise —
+// but dividing that by a denom near 1e-6 for a near-zero ref element inflates the
+// relative error to >>1e-4, tripping FAIL on an otherwise-correct tensor. This is
+// consistent with every prior observation: (a) the FAIL values were bit-identical
+// across v1 (targetTensors:)/v2 (resultsDictionary:)/clean rebuild — a real formula
+// or fetch bug would not reproduce to the exact same float bits build-over-build
+// this reliably, but a deterministic FP32 reduction-order difference would;
+// (b) attn_prob (softmax output, bounded away from the exact zero-crossing that
+// bites q/geglu/linear-residual tensors) and x_ln1 (RMSNorm output, scaled by a
+// nonzero gamma) PASS, while zero-crossing tensors (q, geglu_val/gate, and
+// attn_out/x_mid which inherit near-zero residual entries) FAIL.
+// Report both a max_abs diagnostic and an eps-floored relative error
+// (eps=1e-3, i.e. treat |ref|<1e-3 elements by absolute rather than relative
+// tolerance) so a genuine formula/wiring bug (large absolute error on a
+// meaningfully-sized element) can still be distinguished from this near-zero
+// relative-error artifact.
+//
+// Not gated behind NNCP_METAL_BW: used by both the METAL_BW-only FWD_DUMP
+// harness below and by the always-available NNCP_DISABLE_SLIDE bisect path
+// (bug6 chunk-mem-slide diagnostics) in run_per_layer_bptt_chunk().
+static void fwd_dump_max_err(const float* ref, const float* got, size_t n,
+                             float* out_max_abs, float* out_max_rel_eps) {
+    const float eps = 1e-3f;
+    float max_abs = 0.0f, max_rel_eps = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float diff = fabsf(ref[i] - got[i]);
+        if (diff > max_abs) max_abs = diff;
+        float denom = fmaxf(fabsf(ref[i]), eps);
+        float rel   = diff / denom;
+        if (rel > max_rel_eps) max_rel_eps = rel;
+    }
+    *out_max_abs     = max_abs;
+    *out_max_rel_eps = max_rel_eps;
+}
+
+// [BISECT④] (2026-07-05, loss-trajectory bisect): retrain-contamination
+// hypothesis (bisect③, is_retrain-gated slide skip) is dead — noslide_rt was
+// byte-identical to aonly. Toggle disables nncp_chunk_mem_slide (bug6 fix)
+// unconditionally for further isolation; unset (default) always runs it.
+// Not gated behind NNCP_METAL_BW: consumed by the MPSGraph-only train path too.
+static bool nncp_chunk_slide_disabled() {
+    static int v = -1;
+    if (v < 0) v = (getenv("NNCP_DISABLE_SLIDE") && getenv("NNCP_DISABLE_SLIDE")[0] == '1') ? 1 : 0;
+    return v != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Phase A verify: NNCP_FWD_DUMP=1 runtime opt-in.
 // CPU-recomputes the 8 forward intermediates that build_single_layer() exposes
@@ -6044,57 +6096,6 @@ static bool nncp_metal_bw_disabled() {
     static int v = -1;
     if (v < 0) v = (getenv("NNCP_METAL_BW_DISABLE") && getenv("NNCP_METAL_BW_DISABLE")[0] == '1') ? 1 : 0;
     return v != 0;
-}
-
-// [BISECT④] (2026-07-05, loss-trajectory bisect): retrain-contamination
-// hypothesis (bisect③, is_retrain-gated slide skip) is dead — noslide_rt was
-// byte-identical to aonly. Next bisect: disable nncp_chunk_mem_slide
-// UNCONDITIONALLY, reverting train to bug6-before frozen-mem (chunk2 never
-// sees chunk1's own K/V at all — same pre-seg mem for both chunks). bug7
-// (B_REL_STRIDE) and bug8(A) (decode side) stay untouched. If loss recovers
-// to ~2.4-2.6, the bug is somewhere in slide's actual data movement; if not,
-// suspect bug7 or A next.
-static bool nncp_chunk_slide_disabled() {
-    static int v = -1;
-    if (v < 0) v = (getenv("NNCP_DISABLE_SLIDE") && getenv("NNCP_DISABLE_SLIDE")[0] == '1') ? 1 : 0;
-    return v != 0;
-}
-
-// Bug fix (2026-07-03, metric hypothesis): the original `denom = max(|ref|, 1e-6)`
-// floor is far too small. For zero-crossing tensors (q ~ N(0, small var) at init,
-// GELU's near-zero region for geglu_val, linear residual outputs) a handful of
-// elements sit within FP32-rounding distance of 0. FP32 summation is not
-// associative, so a K=1024-term reduction done via CPU (this file's double-
-// accumulated `matmulHH`) vs GPU (MPSGraph's own reduction-tree/warp order) will
-// legitimately differ by ~1e-6..1e-5 ABSOLUTE — completely normal FP32 noise —
-// but dividing that by a denom near 1e-6 for a near-zero ref element inflates the
-// relative error to >>1e-4, tripping FAIL on an otherwise-correct tensor. This is
-// consistent with every prior observation: (a) the FAIL values were bit-identical
-// across v1 (targetTensors:)/v2 (resultsDictionary:)/clean rebuild — a real formula
-// or fetch bug would not reproduce to the exact same float bits build-over-build
-// this reliably, but a deterministic FP32 reduction-order difference would;
-// (b) attn_prob (softmax output, bounded away from the exact zero-crossing that
-// bites q/geglu/linear-residual tensors) and x_ln1 (RMSNorm output, scaled by a
-// nonzero gamma) PASS, while zero-crossing tensors (q, geglu_val/gate, and
-// attn_out/x_mid which inherit near-zero residual entries) FAIL.
-// Report both a max_abs diagnostic and an eps-floored relative error
-// (eps=1e-3, i.e. treat |ref|<1e-3 elements by absolute rather than relative
-// tolerance) so a genuine formula/wiring bug (large absolute error on a
-// meaningfully-sized element) can still be distinguished from this near-zero
-// relative-error artifact.
-static void fwd_dump_max_err(const float* ref, const float* got, size_t n,
-                             float* out_max_abs, float* out_max_rel_eps) {
-    const float eps = 1e-3f;
-    float max_abs = 0.0f, max_rel_eps = 0.0f;
-    for (size_t i = 0; i < n; i++) {
-        float diff = fabsf(ref[i] - got[i]);
-        if (diff > max_abs) max_abs = diff;
-        float denom = fmaxf(fabsf(ref[i]), eps);
-        float rel   = diff / denom;
-        if (rel > max_rel_eps) max_rel_eps = rel;
-    }
-    *out_max_abs     = max_abs;
-    *out_max_rel_eps = max_rel_eps;
 }
 
 static void fwd_dump_check(uint32_t layer, const char* name,
@@ -8210,13 +8211,9 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [drain commit];
             [drain waitUntilCompleted];
         }
-        // [BISECT③/④] retrain-only gate (bisect③, now confirmed dead —
-        // noslide_rt was byte-identical to aonly) kept as an inert special
-        // case of the more general bisect④ gate below (is_retrain implies
-        // slide-disabled either way once NNCP_DISABLE_SLIDE isn't set, so
-        // this condition alone no longer changes behavior — the real
-        // toggle is nncp_chunk_slide_disabled()).
-        if (!tr->is_retrain && !nncp_chunk_slide_disabled()) {
+        // NNCP_DISABLE_SLIDE bisect toggle retained for future investigation;
+        // default (env unset) always runs the slide, train and retrain alike.
+        if (!nncp_chunk_slide_disabled()) {
             static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
             if (nncp_c1kv_verify_enabled()) {
                 for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify2_capture_before(tr, li, H);
