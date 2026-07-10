@@ -151,6 +151,26 @@ static float nncp_dropout_rate() {
     return cached;
 }
 
+// 7-site dropout expansion (2026-07-11, dropout-7site-spec-20260711.md):
+// nncp.c uses a SEPARATE rate for the post-softmax attention-probability
+// dropout (site #3, `dropout_att_prob`) vs every other site (`dropout_prob`).
+// NNCP_DROPOUT_ATT=<rate> overrides it; unset falls back to NNCP_DROPOUT
+// (same value, but tracked as its own parameter per the spec).
+static float nncp_dropout_att_rate() {
+    static float cached = -1.0f;
+    if (cached < 0.0f) {
+        const char* e = getenv("NNCP_DROPOUT_ATT");
+        if (e && e[0] != '\0') {
+            char* end = nullptr;
+            float parsed = strtof(e, &end);
+            cached = (end != e && parsed > 0.0f && parsed < 1.0f) ? parsed : 0.0f;
+        } else {
+            cached = nncp_dropout_rate();
+        }
+    }
+    return cached;
+}
+
 // Deterministic per-element Bernoulli mask fill, inverted-dropout convention
 // (Pane 4's audit of nncp.c's dropout_mul/nc_tensor_set_dropout): kept
 // elements scaled by 1/(1-rate), dropped elements zero. `seed` must be
@@ -332,6 +352,23 @@ struct PerLayerFwdGraph {
     // attn_out's and ff(FF2 out)'s shape at the residual-add point.
     MPSGraphTensor*  mask_attn;   // hook #4 (Pane 4's original-nncp numbering)
     MPSGraphTensor*  mask_ffn2;   // hook #6
+    // 7-site expansion (2026-07-11): remaining per-layer hooks. #1 embed and
+    // #7 final are NOT per-layer (see PerLayerFwdGraph doesn't own them —
+    // #1 is applied on the CPU to pl_h[0] before layer 0's graph call, #7 is
+    // a new placeholder on the LossBwdGraph, right before the output
+    // projection). mask_q/mask_v: [BT, H], applied to Q/V right after their
+    // matmul (before multi-head split — matches nncp.c L712-716's placement,
+    // "no need to apply w_k on key"). mask_att_prob: [B, NH, T, EXT_LEN],
+    // same shape as softmax output, applied right after softmax (nncp.c
+    // L796-798, uses dropout_att_prob not dropout_prob). mask_ff1: [BT,
+    // FFN1_DIM] (F for default GELU, 2F for enwik8 GeGLU) — nncp.c L932-933
+    // applies dropout to FF1's raw matmul+bias output BEFORE the
+    // GELU/GeGLU activation/split (verified by direct read of nncp.c
+    // L929-944, not after as one might assume from the site list ordering).
+    MPSGraphTensor*  mask_q;      // hook #2 (query half)
+    MPSGraphTensor*  mask_v;      // hook #2 (value half)
+    MPSGraphTensor*  mask_att_prob; // hook #3
+    MPSGraphTensor*  mask_ff1;    // hook #5
 };
 
 struct PerLayerBwdGraph {
@@ -351,6 +388,7 @@ struct PerLayerBwdGraph {
     // to what actually produced pl_h[i+1], which autodiff needs to be
     // correct. NULL when dropout is disabled.
     MPSGraphTensor*  mask_attn, *mask_ffn2;
+    MPSGraphTensor*  mask_q, *mask_v, *mask_att_prob, *mask_ff1;  // 7-site expansion
     // Outputs
     MPSGraphTensor*  grad_in;    // [BT, H]
     MPSGraphTensor*  dw_q, *dw_k, *dw_v, *dw_o;
@@ -367,6 +405,11 @@ struct LossBwdGraph {
     MPSGraphTensor*  w_ln_final; // [2, H]
     MPSGraphTensor*  w_out;      // [H, V]
     MPSGraphTensor*  b_out;      // [V]
+    // 7-site expansion (2026-07-11), hook #7: nncp.c L992-1001 applies
+    // dropout AFTER LN_FINAL, BEFORE the output projection (embed_out
+    // matmul) — this is the final layer_input right before it becomes
+    // logits. [BT, H], NULL when dropout is disabled (rate=0 bit-exact).
+    MPSGraphTensor*  mask_final;
     // Outputs
     MPSGraphTensor*  loss;       // scalar
     MPSGraphTensor*  grad_in;    // [BT, H]
@@ -1222,6 +1265,19 @@ struct OnlineTrainer {
     // (nil until first use) only when NNCP_DROPOUT > 0.
     id<MTLBuffer>   dropout_mask_attn[SEG_MAX_LAYERS];
     id<MTLBuffer>   dropout_mask_ffn2[SEG_MAX_LAYERS];
+    // 7-site expansion (2026-07-11): remaining per-layer masks, same
+    // save-at-fwd/reuse-at-bwd pattern. mask_q/v: [BT,H]. mask_att_prob:
+    // [B,NH,T,EXT_LEN] (same shape as softmax output — large, ~9.4MB/layer
+    // at enwik8 T=32/EXT_LEN=288/NH=8, ~190MB total across 20 layers,
+    // accepted per spec). mask_ff1: [BT,FFN1_DIM] (FFN1_DIM=2F for enwik8
+    // GeGLU). Non-per-layer masks (#1 embed, #7 final) live in their own
+    // single buffers below, not per-layer arrays.
+    id<MTLBuffer>   dropout_mask_q[SEG_MAX_LAYERS];
+    id<MTLBuffer>   dropout_mask_v[SEG_MAX_LAYERS];
+    id<MTLBuffer>   dropout_mask_att_prob[SEG_MAX_LAYERS];
+    id<MTLBuffer>   dropout_mask_ff1[SEG_MAX_LAYERS];
+    id<MTLBuffer>   dropout_mask_embed;  // [BT, H] — hook #1, chunk input (layer 0), not per-layer
+    id<MTLBuffer>   dropout_mask_final;  // [BT, H] — hook #7, post-LN_FINAL pre-output-proj, not per-layer
 
     // ---- Layer-chunked gradient checkpointing (L > 8, e.g. enwik8) ----
     // 4 groups × 5 layers each; group g covers layers [g*5 .. g*5+4].
@@ -3103,7 +3159,15 @@ static MPSGraphTensor* build_single_layer(
     // Dropout spike (plan-A (b)): hook #4 (attn_out, pre-residual) and #6
     // (ff/FF2-out, pre-residual). NULL ⇒ skipped entirely (rate=0 bit-exact).
     MPSGraphTensor* mask_attn = nullptr,
-    MPSGraphTensor* mask_ffn2 = nullptr)
+    MPSGraphTensor* mask_ffn2 = nullptr,
+    // 7-site expansion (2026-07-11): hooks #2 (q/v, pre-multihead-split),
+    // #3 (post-softmax attention probability, dropout_att_prob rate), #5
+    // (FF1 pre-activation output). All NULL ⇒ skipped entirely, identical
+    // to the mask_attn/mask_ffn2 rate=0 bit-exact guarantee.
+    MPSGraphTensor* mask_q = nullptr,
+    MPSGraphTensor* mask_v = nullptr,
+    MPSGraphTensor* mask_att_prob = nullptr,
+    MPSGraphTensor* mask_ff1 = nullptr)
 {
     const bool is_enwik8 = (g_nncp_profile.h == 1024);
     const NSInteger FFN1_DIM = is_enwik8 ? (NSInteger)(2*F) : (NSInteger)F;
@@ -3125,6 +3189,11 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* q = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_q name:nil];
     MPSGraphTensor* k = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_k name:nil];
     MPSGraphTensor* v = [g matrixMultiplicationWithPrimaryTensor:x_ln secondaryTensor:w_v name:nil];
+    // Dropout hook #2 (nncp.c L712-716): applied to query and value right
+    // after their matmul, BEFORE multi-head split. Key is deliberately
+    // untouched ("no need to apply w_k on key" — nncp.c L714 comment).
+    if (mask_q) q = [g multiplicationWithPrimaryTensor:q secondaryTensor:mask_q name:nil];
+    if (mask_v) v = [g multiplicationWithPrimaryTensor:v secondaryTensor:mask_v name:nil];
     if (out_intermediates) {
         // Chunk-boundary mem fix (chunk-mem-fix-design.md step 1): k/v are
         // live, non-terminal tensors here (consumed below by toMH/k_ext concat),
@@ -3213,7 +3282,15 @@ static MPSGraphTensor* build_single_layer(
 
     scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
     scores = [g softMaxWithTensor:scores axis:-1 name:nil];
+    // t_attn_prob records the pre-dropout softmax output (decode has no
+    // dropout, so this stays the fair comparison point for XCMP/decode-dump
+    // parity checks — matching #4/#6's "dump before mask" convention).
     if (out_intermediates) { out_intermediates->t_attn_prob = scores; }
+
+    // Dropout hook #3 (nncp.c L796-798): post-softmax attention probability,
+    // dropout_att_prob rate (separate from dropout_prob — see
+    // nncp_dropout_att_rate()).
+    if (mask_att_prob) scores = [g multiplicationWithPrimaryTensor:scores secondaryTensor:mask_att_prob name:nil];
 
     MPSGraphTensor* attn = [g matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v_ext name:nil];
     attn = [g transposeTensor:attn dimension:1 withDimension:2 name:nil];
@@ -3252,6 +3329,12 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* fp = [g additionWithPrimaryTensor:
         [g matrixMultiplicationWithPrimaryTensor:x_ln2 secondaryTensor:w_ffn1 name:nil]
         secondaryTensor:b_ffn1 name:nil];
+    // Dropout hook #5 (nncp.c L929-933): applied to FF1's raw matmul+bias
+    // output, BEFORE the GELU/GeGLU activation/split (verified by direct
+    // read — dropout_mul happens immediately after ff_bias1 add, before the
+    // ff_act switch statement). [BT, FFN1_DIM] — FFN1_DIM=2F for enwik8
+    // GeGLU, F for default GELU.
+    if (mask_ff1) fp = [g multiplicationWithPrimaryTensor:fp secondaryTensor:mask_ff1 name:nil];
     MPSGraphTensor* ff;
     if (is_enwik8) {
         MPSGraphTensor* fv = [g sliceTensor:fp dimension:1 start:0 length:(NSInteger)F name:nil];
@@ -3376,9 +3459,19 @@ static void build_per_layer_fwd(OnlineTrainer* tr) {
     // Dropout spike: placeholders only when enabled, so the graph is
     // structurally unchanged (byte-identical) at rate=0.
     ctx.mask_attn = nil; ctx.mask_ffn2 = nil;
+    ctx.mask_q = nil; ctx.mask_v = nil; ctx.mask_att_prob = nil; ctx.mask_ff1 = nil;
     if (nncp_dropout_rate() > 0.0f) {
         ctx.mask_attn = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_attn"];
         ctx.mask_ffn2 = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_ffn2"];
+        ctx.mask_q    = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_q"];
+        ctx.mask_v    = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pl_mask_v"];
+        ctx.mask_ff1  = [g placeholderWithShape:@[@(BT), @(FFN1_DIM)] dataType:MPSDataTypeFloat32 name:@"pl_mask_ff1"];
+    }
+    // Independent rate — nncp_dropout_att_rate() falls back to
+    // nncp_dropout_rate() when NNCP_DROPOUT_ATT is unset, but a caller could
+    // in principle set one without the other, so gate on att_prob's own rate.
+    if (nncp_dropout_att_rate() > 0.0f) {
+        ctx.mask_att_prob = [g placeholderWithShape:@[@(B), @(NH), @(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"pl_mask_attprob"];
     }
 
     ctx.x_out = build_single_layer(g, ctx.x_in,
@@ -3387,7 +3480,8 @@ static void build_per_layer_fwd(OnlineTrainer* tr) {
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
         causal_mask, P_all_q, Q_all_b, b_rt_h, &ctx,
-        ctx.mask_attn, ctx.mask_ffn2);
+        ctx.mask_attn, ctx.mask_ffn2,
+        ctx.mask_q, ctx.mask_v, ctx.mask_att_prob, ctx.mask_ff1);
 }
 
 // Build per-layer backward graph (proxy loss method, compiled once)
@@ -3466,9 +3560,16 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
     // bit-identical dropout for gradientForPrimaryTensor to differentiate
     // through correctly.
     ctx.mask_attn = nil; ctx.mask_ffn2 = nil;
+    ctx.mask_q = nil; ctx.mask_v = nil; ctx.mask_att_prob = nil; ctx.mask_ff1 = nil;
     if (nncp_dropout_rate() > 0.0f) {
         ctx.mask_attn = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_attn"];
         ctx.mask_ffn2 = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_ffn2"];
+        ctx.mask_q    = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_q"];
+        ctx.mask_v    = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"plb_mask_v"];
+        ctx.mask_ff1  = [g placeholderWithShape:@[@(BT), @(FFN1_DIM)] dataType:MPSDataTypeFloat32 name:@"plb_mask_ff1"];
+    }
+    if (nncp_dropout_att_rate() > 0.0f) {
+        ctx.mask_att_prob = [g placeholderWithShape:@[@(B), @(NH), @(T), @(EXT_LEN)] dataType:MPSDataTypeFloat32 name:@"plb_mask_attprob"];
     }
 
     // Forward recompute
@@ -3478,7 +3579,8 @@ static void build_per_layer_bwd(OnlineTrainer* tr) {
         ctx.w_ln, ctx.w_rel_r, ctx.b_rel_r, ctx.kv_k, ctx.kv_v,
         B, T, BT, H, NH, HD, F, D_POS, MEM_LEN, EXT_LEN,
         causal_mask, P_all_q, Q_all_b, b_rt_h, nullptr,
-        ctx.mask_attn, ctx.mask_ffn2);
+        ctx.mask_attn, ctx.mask_ffn2,
+        ctx.mask_q, ctx.mask_v, ctx.mask_att_prob, ctx.mask_ff1);
 
     // Proxy loss
     MPSGraphTensor* proxy = [g reductionSumWithTensor:
@@ -3521,11 +3623,19 @@ static void build_loss_bwd(OnlineTrainer* tr) {
     ctx.w_ln_final = [g placeholderWithShape:@[@2, @(H)]     dataType:MPSDataTypeFloat32 name:@"pll_wlnf"];
     ctx.w_out      = [g placeholderWithShape:@[@(H), @(V)]   dataType:MPSDataTypeFloat32 name:@"pll_wout"];
     ctx.b_out      = [g placeholderWithShape:@[@(V)]         dataType:MPSDataTypeFloat32 name:@"pll_bout"];
+    // 7-site expansion (2026-07-11), hook #7: nncp.c L992-1001 — dropout is
+    // applied to layer_input AFTER LN_FINAL, BEFORE the output (embed_out)
+    // projection matmul (verified by direct read of nncp.c L992-1001).
+    ctx.mask_final = nil;
+    if (nncp_dropout_rate() > 0.0f) {
+        ctx.mask_final = [g placeholderWithShape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32 name:@"pll_mask_final"];
+    }
 
     // LN_FINAL
     MPSGraphTensor* gf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* bf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* x = tr_layer_norm(g, ctx.x_in, gf, bf);
+    if (ctx.mask_final) x = [g multiplicationWithPrimaryTensor:x secondaryTensor:ctx.mask_final name:nil];
 
     // Output projection + clamp
     MPSGraphTensor* logits = [g additionWithPrimaryTensor:
@@ -6557,6 +6667,29 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             float* d = dst + (size_t)i * H;
             for (uint32_t j = 0; j < H; j++) d[j] = src[j] * embed_scale;
         }
+        // Dropout hook #1 (nncp.c L628-632): applied to the embedding
+        // output (post embed_mult scale), BEFORE the layer loop — i.e.
+        // this is layer 0's input, computed entirely on the CPU here
+        // (unlike the other 6 sites which live inside the MPSGraph
+        // per-layer graph). Applied in-place on pl_h[0] directly, since
+        // this CPU path has no autodiff to differentiate through — the
+        // per-element multiply is its own gradient (mask itself, same as
+        // inverted dropout everywhere else here), applied manually to
+        // tr->pl_dh after layer 0's backward produces d(pl_h[0]) (see the
+        // embed-gradient CPU/metal_bw_embed call sites below).
+        const float rate1 = nncp_dropout_rate();
+        if (rate1 > 0.0f) {
+            const size_t n = (size_t)BT * H;
+            if (!tr->dropout_mask_embed)
+                tr->dropout_mask_embed = [tr->device newBufferWithLength:n * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_embed contents], n, rate1,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, /*layer_idx=*/0, /*hook_id=*/2));
+            const float* mask = (const float*)[tr->dropout_mask_embed contents];
+            for (size_t i = 0; i < n; i++) dst[i] *= mask[i];
+        }
     }
 
     // Helpers
@@ -6596,6 +6729,10 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     // B_REL_STRIDE), so this must match THAT, which is mem+seg.
     NSArray<NSNumber*>* shape_br  = @[@(tr->NH), @((int)tr->ext_len)];
     NSArray<NSNumber*>* shape_kv  = @[@(BM), @(H)];
+    // 7-site expansion: mask shapes for hooks #3 (att_prob, same shape as
+    // softmax output) and #5 (ff1, FFN1_DIM-wide — 2F for enwik8 GeGLU).
+    NSArray<NSNumber*>* shape_att_prob_mask = @[@(B), @(tr->NH), @(T_CHUNK), @(EXT_LEN)];
+    NSArray<NSNumber*>* shape_ff1_mask      = @[@(BT), @((int)(FFN1_MULT * F))];
 
     // Per-trainer persistent slice view cache. Views are created once per
     // (buffer, layer, size) and reused across all training segments. This avoids
@@ -6699,6 +6836,50 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (fg.mask_attn) feeds[fg.mask_attn] = floatTD(tr->dropout_mask_attn[layer], shape_h);
             if (fg.mask_ffn2) feeds[fg.mask_ffn2] = floatTD(tr->dropout_mask_ffn2[layer], shape_h);
         }
+        // 7-site expansion: hooks #2 (q/v), #5 (ff1). Same generate-at-fwd/
+        // reuse-at-bwd pattern as #4/#6 above.
+        if ((fg.mask_q || fg.mask_v || fg.mask_ff1) && layer < SEG_MAX_LAYERS) {
+            const float rate = nncp_dropout_rate();
+            const size_t n_h = (size_t)BT * H;
+            const size_t n_ff1 = (size_t)BT * FFN1_MULT * F;
+            if (!tr->dropout_mask_q[layer])
+                tr->dropout_mask_q[layer] = [tr->device newBufferWithLength:n_h * sizeof(float)
+                                                                      options:MTLResourceStorageModeShared];
+            if (!tr->dropout_mask_v[layer])
+                tr->dropout_mask_v[layer] = [tr->device newBufferWithLength:n_h * sizeof(float)
+                                                                      options:MTLResourceStorageModeShared];
+            if (!tr->dropout_mask_ff1[layer])
+                tr->dropout_mask_ff1[layer] = [tr->device newBufferWithLength:n_ff1 * sizeof(float)
+                                                                        options:MTLResourceStorageModeShared];
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_q[layer] contents], n_h, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/3));
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_v[layer] contents], n_h, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/4));
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_ff1[layer] contents], n_ff1, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/5));
+            if (fg.mask_q)   feeds[fg.mask_q]   = floatTD(tr->dropout_mask_q[layer],   shape_h);
+            if (fg.mask_v)   feeds[fg.mask_v]   = floatTD(tr->dropout_mask_v[layer],   shape_h);
+            if (fg.mask_ff1) feeds[fg.mask_ff1] = floatTD(tr->dropout_mask_ff1[layer], shape_ff1_mask);
+        }
+        // Hook #3 (att_prob): independent rate (nncp_dropout_att_rate()).
+        if (fg.mask_att_prob && layer < SEG_MAX_LAYERS) {
+            const float rate_att = nncp_dropout_att_rate();
+            const size_t n = (size_t)B * tr->NH * T_CHUNK * EXT_LEN;
+            if (!tr->dropout_mask_att_prob[layer])
+                tr->dropout_mask_att_prob[layer] = [tr->device newBufferWithLength:n * sizeof(float)
+                                                                             options:MTLResourceStorageModeShared];
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_att_prob[layer] contents], n, rate_att,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, layer, /*hook_id=*/8));
+            feeds[fg.mask_att_prob] = floatTD(tr->dropout_mask_att_prob[layer], shape_att_prob_mask);
+        }
     };
 
     // Same as buildLayerFeeds but for the backward-recompute graph (pl_bwd),
@@ -6713,6 +6894,13 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (bg.mask_ffn2 && tr->dropout_mask_ffn2[layer])
                 feeds[bg.mask_ffn2] = floatTD(tr->dropout_mask_ffn2[layer], shape_h);
         }
+        if ((bg.mask_q || bg.mask_v || bg.mask_ff1) && layer < SEG_MAX_LAYERS) {
+            if (bg.mask_q   && tr->dropout_mask_q[layer])   feeds[bg.mask_q]   = floatTD(tr->dropout_mask_q[layer],   shape_h);
+            if (bg.mask_v   && tr->dropout_mask_v[layer])   feeds[bg.mask_v]   = floatTD(tr->dropout_mask_v[layer],   shape_h);
+            if (bg.mask_ff1 && tr->dropout_mask_ff1[layer]) feeds[bg.mask_ff1] = floatTD(tr->dropout_mask_ff1[layer], shape_ff1_mask);
+        }
+        if (bg.mask_att_prob && layer < SEG_MAX_LAYERS && tr->dropout_mask_att_prob[layer])
+            feeds[bg.mask_att_prob] = floatTD(tr->dropout_mask_att_prob[layer], shape_att_prob_mask);
     };
 
     // ---- Forward pass: 20 layers ----
@@ -7290,6 +7478,24 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         feeds[lg.w_ln_final] = floatTD(wb.ln_final, @[@2, @(H)]);
         feeds[lg.w_out]      = floatTD(wb.out_proj, @[@(H), @(V)]);
         feeds[lg.b_out]      = floatTD(wb.b_out, @[@(V)]);
+        // Dropout hook #7 (2026-07-11, 7-site expansion): generated fresh
+        // here (this is the only place LossBwdGraph runs per chunk — no
+        // separate fwd/bwd split like the per-layer masks need, since this
+        // graph computes loss AND its own gradient in one call) and saved
+        // so any later re-derivation in this chunk would be reproducible,
+        // though nothing currently re-reads it.
+        if (lg.mask_final) {
+            const float rate = nncp_dropout_rate();
+            const size_t n = (size_t)BT * H;
+            if (!tr->dropout_mask_final)
+                tr->dropout_mask_final = [tr->device newBufferWithLength:n * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            nncp_fill_dropout_mask((float*)[tr->dropout_mask_final contents], n, rate,
+                                    nncp_dropout_seed(tr->is_retrain,
+                                        tr->is_retrain ? tr->retrain_train_step : tr->train_step,
+                                        t_start, /*layer_idx=*/0, /*hook_id=*/7));
+            feeds[lg.mask_final] = floatTD(tr->dropout_mask_final, shape_h);
+        }
 
         NSMutableArray* targets = [NSMutableArray array];
         [targets addObject:lg.loss];
@@ -7345,7 +7551,13 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // dispatch (see metal_bw_loss/metal_bw_layer's forward-value
         // consumers — this needs the same tr->dropout_mask_attn/ffn2[i]
         // buffers this file already saves for MPSGraph's benefit).
-        const bool dropout_active_no_metal_wiring = (nncp_dropout_rate() > 0.0f);
+        // 7-site expansion (2026-07-11): also check nncp_dropout_att_rate()
+        // — a caller could in principle set NNCP_DROPOUT_ATT without
+        // NNCP_DROPOUT, activating hook #3 alone; metal_bw_layer has no
+        // wiring for any of the 7 sites, so either rate being active must
+        // force the same fallback.
+        const bool dropout_active_no_metal_wiring =
+            (nncp_dropout_rate() > 0.0f) || (nncp_dropout_att_rate() > 0.0f);
         if (dropout_active_no_metal_wiring) {
             static bool logged_once = false;
             if (!logged_once) {
@@ -7614,6 +7826,21 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     if (!metal_bw_ok)
 #endif
     {
+        // Dropout hook #1's chain rule: pl_h[0] was computed as
+        // embed_row*embed_scale*mask (an elementwise multiply applied
+        // outside any autodiff graph, on the CPU, at embedding time —
+        // see "3. CPU embedding → pl_h[0]" above). d(loss)/d(embed_row) =
+        // d(loss)/d(pl_h[0]) * embed_scale * mask — same inverted-dropout
+        // mask, since a plain elementwise multiply is its own local
+        // gradient. tr->pl_dh here IS d(pl_h[0]) (this is the terminus of
+        // the whole L-layer backward chain), so multiply it by the SAME
+        // mask buffer generated at forward time before using it below.
+        if (tr->dropout_mask_embed) {
+            float* dh_mut = (float*)[tr->pl_dh contents];
+            const float* mask = (const float*)[tr->dropout_mask_embed contents];
+            const size_t n = (size_t)BT * H;
+            for (size_t i = 0; i < n; i++) dh_mut[i] *= mask[i];
+        }
         const float embed_scale = sqrtf((float)H);
         const int32_t* tokens = (const int32_t*)[tr->seg_buf_input contents];
         const float* dh = (const float*)[tr->pl_dh contents];
