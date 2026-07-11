@@ -1267,6 +1267,41 @@ static inline size_t get_block_len() {
 }
 #define BLOCK_LEN    get_block_len()
 
+// retrain-blocks (2026-07-11, retrain-blocks-spec-20260711.md): original
+// nncp.c's enwik8 profile uses a PIECE-WISE block_len schedule, not a flat
+// constant — parse_interp_param(&np->block_len, "100000,500000,100000,
+// 500000,500000") (nncp.c L2524) decodes (per get_interp_param, cp_utils.c
+// L380-410) to: block_len=100000 for file_pos<500000 (first block small),
+// then flat 500000 thereafter. This makes the FIRST block boundary/retrain
+// fire much earlier than a flat-500000 schedule would. NNCP_BLOCK_LEN (if
+// set) overrides this ENTIRE schedule with a flat value, same as before —
+// this function is only consulted when the env var is unset.
+static inline size_t get_interp_block_len(size_t file_pos) {
+    if (g_nncp_profile.h == 1024 && file_pos < 500000) return 100000;
+    return 500000;
+}
+static inline size_t get_block_len_for_pos(size_t file_pos) {
+    if (g_block_len != 0) return g_block_len;  // explicit override, flat
+    const char* e = getenv("NNCP_BLOCK_LEN");
+    if (e && atoi(e) > 0) { g_block_len = (size_t)atoi(e); return g_block_len; }
+    return get_interp_block_len(file_pos);
+}
+
+// retrain-blocks: nncp.c's enwik8 profile uses retrain_len=15,000,000
+// (nncp.c L2531) — this had been halved to 7.5M in our port as an
+// unlabeled speed optimization ("A2"). NNCP_RETRAIN_LEN restores the
+// ability to match the original exactly (default) while keeping the
+// override for anyone wanting the old 7.5M behavior back.
+static inline size_t get_retrain_buf_size() {
+    static size_t v = 0;
+    if (v == 0) {
+        const char* e = getenv("NNCP_RETRAIN_LEN");
+        v = (e && atol(e) > 0) ? (size_t)atol(e) : 15000000;
+        if (v != 15000000) fprintf(stderr, "[CFG] NNCP_RETRAIN_LEN=%zu\n", v);
+    }
+    return v;
+}
+
 static mach_timebase_info_data_t g_tb = {};
 
 // NNCP_DECODE_DUMP=1 companion (2026-07-05, "配膳の皿違い" triage): decode_dump.inc
@@ -1374,14 +1409,16 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         return 0;
     }
 
-    // ---- Block-level loop (Transformer-XL: BLOCK_LEN bytes per stream before memory shift) ----
-    const size_t total_blocks = (stride + BLOCK_LEN - 1) / BLOCK_LEN;
+    // ---- Block-level loop (Transformer-XL: block_len bytes per stream before
+    // memory shift). block_len follows nncp.c's piece-wise schedule (see
+    // get_block_len_for_pos) unless NNCP_BLOCK_LEN overrides it flat. ----
     size_t file_pos  = 0;
     size_t block_num = 0;
 
     while (file_pos < stride) {
-        const size_t block_bytes = ((stride - file_pos) < (size_t)BLOCK_LEN)
-                                   ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        const size_t this_block_len = get_block_len_for_pos(file_pos);
+        const size_t block_bytes = ((stride - file_pos) < this_block_len)
+                                   ? (stride - file_pos) : this_block_len;
 
         // Original NNCP trf_reset(): zero KV memory at each block boundary (fresh context per block).
         mps_transformer_reset_kv_cache(mps_ctx);
@@ -1567,9 +1604,9 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
 
         // ---- Retrain: re-train on accumulated past data (enwik8 profile) ----
         // Original nncp: retrain_period=1 (every block), retrain_len=15M
-        // Ours: 7.5M (A2 optimization — halves retrain cost; effect measurement).
+        // (nncp.c L2531) — default here, override via NNCP_RETRAIN_LEN.
         if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
-            static const size_t RETRAIN_BUF_SIZE = 7500000; // 7.5M bytes (was 15M)
+            const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;
@@ -1824,13 +1861,13 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
     mps_transformer_reset_kv_cache(mps_ctx);
 
     // ---- Block-level loop (mirrors compress) ----
-    const size_t total_blocks = (stride + BLOCK_LEN - 1) / BLOCK_LEN;
     size_t file_pos  = 0;
     size_t block_num = 0;
 
     while (file_pos < stride) {
-        const size_t block_bytes = ((stride - file_pos) < (size_t)BLOCK_LEN)
-                                   ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        const size_t this_block_len = get_block_len_for_pos(file_pos);
+        const size_t block_bytes = ((stride - file_pos) < this_block_len)
+                                   ? (stride - file_pos) : this_block_len;
 
         // Original NNCP trf_reset(): zero KV memory at each block boundary (fresh context per block).
         mps_transformer_reset_kv_cache(mps_ctx);
@@ -1954,7 +1991,7 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
 
         // ---- Retrain (decompress side, must mirror compress) ----
         if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
-            static const size_t RETRAIN_BUF_SIZE = 7500000; // must match compress side (A2)
+            const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();  // must match compress side
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;

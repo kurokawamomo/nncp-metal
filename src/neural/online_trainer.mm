@@ -171,6 +171,39 @@ static float nncp_dropout_att_rate() {
     return cached;
 }
 
+// retrain-blocks (2026-07-11, retrain-blocks-spec-20260711.md): nncp.c's
+// trf_set_retrain (nncp.c L1236-1240) enables dropout ONLY while retrain is
+// active — `s->dropout_enabled = (enabled && s->dropout_prob != 0)` — and
+// online (per-segment) training always runs with dropout OFF. This is the
+// OPPOSITE of this port's prior behavior (dropout applied unconditionally
+// whenever NNCP_DROPOUT was set, online and retrain alike). NNCP_DROPOUT_
+// ONLINE=1 restores the old (non-original) behavior for experimentation.
+static bool nncp_dropout_online_forced() {
+    static int v = -1;
+    if (v < 0) v = (getenv("NNCP_DROPOUT_ONLINE") && getenv("NNCP_DROPOUT_ONLINE")[0] == '1') ? 1 : 0;
+    return v != 0;
+}
+
+// Effective per-call rate: the graph placeholder (built once at trainer
+// creation, see build_per_layer_fwd/bwd/build_loss_bwd) exists whenever the
+// CONFIGURED rate (nncp_dropout_rate()/nncp_dropout_att_rate()) is > 0 —
+// that decision is structural and can't vary per call. But since the
+// placeholder is fed EVERY call regardless of chunk/mode, the actual DROPOUT
+// BEHAVIOR can still vary per call: feeding nncp_fill_dropout_mask a rate of
+// 0.0 produces an all-ones (keep_scale=1, nothing dropped) identity mask —
+// see nncp_fill_dropout_mask below — which is mathematically a no-op
+// multiply, achieving "dropout OFF this call" without touching graph shape.
+// This is what lets online calls skip dropout while retrain calls apply it,
+// using the exact same compiled graphs.
+static inline float nncp_effective_dropout_rate(bool is_retrain) {
+    if (is_retrain) return nncp_dropout_rate();
+    return nncp_dropout_online_forced() ? nncp_dropout_rate() : 0.0f;
+}
+static inline float nncp_effective_dropout_att_rate(bool is_retrain) {
+    if (is_retrain) return nncp_dropout_att_rate();
+    return nncp_dropout_online_forced() ? nncp_dropout_att_rate() : 0.0f;
+}
+
 // Deterministic per-element Bernoulli mask fill, inverted-dropout convention
 // (Pane 4's audit of nncp.c's dropout_mul/nc_tensor_set_dropout): kept
 // elements scaled by 1/(1-rate), dropped elements zero. `seed` must be
@@ -6677,7 +6710,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // inverted dropout everywhere else here), applied manually to
         // tr->pl_dh after layer 0's backward produces d(pl_h[0]) (see the
         // embed-gradient CPU/metal_bw_embed call sites below).
-        const float rate1 = nncp_dropout_rate();
+        const float rate1 = nncp_effective_dropout_rate(tr->is_retrain);
         if (rate1 > 0.0f) {
             const size_t n = (size_t)BT * H;
             if (!tr->dropout_mask_embed)
@@ -6817,7 +6850,12 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // ffn2[layer] so the backward-recompute graph can read the same
         // values back later — see buildLayerFeedsBwd below.
         if ((fg.mask_attn || fg.mask_ffn2) && layer < SEG_MAX_LAYERS) {
-            const float rate = nncp_dropout_rate();
+            // retrain-blocks: effective rate is 0 for online calls (unless
+            // NNCP_DROPOUT_ONLINE=1) — nncp_fill_dropout_mask(rate=0)
+            // produces an all-ones identity mask, so the graph structure
+            // (placeholder always exists once NNCP_DROPOUT is configured)
+            // stays fixed while the actual dropout behavior toggles per call.
+            const float rate = nncp_effective_dropout_rate(tr->is_retrain);
             const size_t n = (size_t)BT * H;
             if (!tr->dropout_mask_attn[layer])
                 tr->dropout_mask_attn[layer] = [tr->device newBufferWithLength:n * sizeof(float)
@@ -6839,7 +6877,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // 7-site expansion: hooks #2 (q/v), #5 (ff1). Same generate-at-fwd/
         // reuse-at-bwd pattern as #4/#6 above.
         if ((fg.mask_q || fg.mask_v || fg.mask_ff1) && layer < SEG_MAX_LAYERS) {
-            const float rate = nncp_dropout_rate();
+            const float rate = nncp_effective_dropout_rate(tr->is_retrain);
             const size_t n_h = (size_t)BT * H;
             const size_t n_ff1 = (size_t)BT * FFN1_MULT * F;
             if (!tr->dropout_mask_q[layer])
@@ -6869,7 +6907,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         }
         // Hook #3 (att_prob): independent rate (nncp_dropout_att_rate()).
         if (fg.mask_att_prob && layer < SEG_MAX_LAYERS) {
-            const float rate_att = nncp_dropout_att_rate();
+            const float rate_att = nncp_effective_dropout_att_rate(tr->is_retrain);
             const size_t n = (size_t)B * tr->NH * T_CHUNK * EXT_LEN;
             if (!tr->dropout_mask_att_prob[layer])
                 tr->dropout_mask_att_prob[layer] = [tr->device newBufferWithLength:n * sizeof(float)
@@ -7485,7 +7523,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // so any later re-derivation in this chunk would be reproducible,
         // though nothing currently re-reads it.
         if (lg.mask_final) {
-            const float rate = nncp_dropout_rate();
+            const float rate = nncp_effective_dropout_rate(tr->is_retrain);
             const size_t n = (size_t)BT * H;
             if (!tr->dropout_mask_final)
                 tr->dropout_mask_final = [tr->device newBufferWithLength:n * sizeof(float)
@@ -7556,8 +7594,14 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // NNCP_DROPOUT, activating hook #3 alone; metal_bw_layer has no
         // wiring for any of the 7 sites, so either rate being active must
         // force the same fallback.
+        // retrain-blocks (2026-07-11): use the EFFECTIVE rate for THIS call
+        // (tr->is_retrain) — dropout is now off for online calls by default,
+        // so online calls can use the fast Metal path again; only calls
+        // where dropout is actually applied (retrain, or NNCP_DROPOUT_ONLINE)
+        // need the fallback.
         const bool dropout_active_no_metal_wiring =
-            (nncp_dropout_rate() > 0.0f) || (nncp_dropout_att_rate() > 0.0f);
+            (nncp_effective_dropout_rate(tr->is_retrain) > 0.0f) ||
+            (nncp_effective_dropout_att_rate(tr->is_retrain) > 0.0f);
         if (dropout_active_no_metal_wiring) {
             static bool logged_once = false;
             if (!logged_once) {
