@@ -493,6 +493,15 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_reshape_from_mh_acc;    // reshape_from_multihead_acc
     id<MTLComputePipelineState> ps_extract_new_kv_tail;    // extract_new_kv_from_mh_tail
     id<MTLComputePipelineState> ps_scale_buffer;            // scale_buffer
+    // pso-caching fix (2026-07-11, slowdown_diag.DONE): metal_bw_loss used to
+    // load+compile these TWO PSOs from scratch on EVERY call (newDefaultLibrary
+    // + newFunctionWithName + newComputePipelineStateWithFunction, no caching)
+    // instead of following this struct's established load-once-in-metal_bw_init
+    // pattern. With retrain-blocks (b3fa011) raising RETRAIN_BUF_SIZE to 15M,
+    // one retrain block now drives ~7000+ metal_bw_loss calls in a row —
+    // plausible root cause of the post-retrain online slowdown (15-20x).
+    id<MTLComputePipelineState> ps_transformer_linear;  // transformer_linear (non-AMX, V-alignment-safe output proj)
+    id<MTLComputePipelineState> ps_element_scale;       // element_scale (1/BT scale of d_logits)
 
     // --- Phase M-2 Part 1 intermediates (forward→backward saved tensors) ---
     // Shapes below assume BT = BPTT_CHUNK_BT.
@@ -642,6 +651,10 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_reshape_from_mh_acc= load(@"reshape_from_multihead_acc");
     m2->ps_extract_new_kv_tail= load(@"extract_new_kv_from_mh_tail");
     m2->ps_scale_buffer       = load(@"scale_buffer");
+    // pso-caching fix (2026-07-11): load once here instead of per-call inside
+    // metal_bw_loss (see that struct field's comment for the full rationale).
+    m2->ps_transformer_linear = load(@"transformer_linear");
+    m2->ps_element_scale      = load(@"element_scale");
 
     // Gatekeeper: loss-bw requires these kernels (weight_acc/bias_acc/gamma_acc
     // added 2026-07-04 so grad_out/grad_b_out/grad_ln_final can accumulate
@@ -649,7 +662,8 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     if (!m2->ps_ce_softmax_fused_bw || !m2->ps_linear_bw_input ||
         !m2->ps_linear_bw_weight || !m2->ps_linear_bw_weight_acc ||
         !m2->ps_linear_bw_bias || !m2->ps_linear_bw_bias_acc ||
-        !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma || !m2->ps_rmsnorm_bw_gamma_acc) {
+        !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma || !m2->ps_rmsnorm_bw_gamma_acc ||
+        !m2->ps_transformer_linear) {
         NSLog(@"[M2] required backward kernels missing — disabling Metal-BW");
         metal_bw_destroy(m2);
         return nullptr;
@@ -1465,20 +1479,15 @@ static bool metal_bw_loss(OnlineTrainer* tr,
     // metal_bw_layer's layer L-1 needs). `copy_grads` is unused here now.
     (void)copy_grads;
 
-    id<MTLLibrary> lib = [tr->device newDefaultLibrary];
-    if (!lib) {
-        NSString* exeDir = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
-        NSURL* libURL = [NSURL fileURLWithPath:[exeDir stringByAppendingPathComponent:@"default.metallib"]];
-        lib = [tr->device newLibraryWithURL:libURL error:nil];
-    }
-    id<MTLComputePipelineState> ps_lin = nil;
-    id<MTLComputePipelineState> ps_scale = nil;
-    if (lib) {
-        id<MTLFunction> fn_lin = [lib newFunctionWithName:@"transformer_linear"];
-        if (fn_lin) ps_lin = [tr->device newComputePipelineStateWithFunction:fn_lin error:nil];
-        id<MTLFunction> fn_sc = [lib newFunctionWithName:@"element_scale"];
-        if (fn_sc) ps_scale = [tr->device newComputePipelineStateWithFunction:fn_sc error:nil];
-    }
+    // pso-caching fix (2026-07-11, slowdown_diag.DONE): these two PSOs used
+    // to be loaded/compiled from scratch on EVERY call to this function
+    // (newDefaultLibrary + newFunctionWithName + newComputePipelineState
+    // WithFunction, no caching) — now loaded once in metal_bw_init, same
+    // pattern as every other PSO on m2. Likely root cause of the post-
+    // retrain online slowdown (retrain-blocks' larger RETRAIN_BUF_SIZE
+    // drives thousands of metal_bw_loss calls per block).
+    id<MTLComputePipelineState> ps_lin = m2->ps_transformer_linear;
+    id<MTLComputePipelineState> ps_scale = m2->ps_element_scale;
     if (!ps_lin) { NSLog(@"[M2] transformer_linear PSO missing"); return false; }
 
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
