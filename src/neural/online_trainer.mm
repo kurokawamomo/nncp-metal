@@ -98,9 +98,23 @@ static const int SEG_MAX_LAYERS      = 32;   // max layers for kv_mem arrays (su
 #define SEG_TRAIN_MEM       (g_nncp_profile.mem_len)
 #define SEG_TRAIN_BT        (g_nncp_profile.num_streams * g_nncp_profile.seg_len)
 #define SEG_TRAIN_BM        (g_nncp_profile.num_streams * g_nncp_profile.mem_len)
-// Truncated BPTT: split each segment into 2 chunks of T/2 to halve graph activation memory
-#define BPTT_CHUNK_LEN      (g_nncp_profile.seg_len / 2)
-#define BPTT_CHUNK_BT       (g_nncp_profile.num_streams * (g_nncp_profile.seg_len / 2))
+// BPTT 64一括化 (2026-07-11, bptt64-spec-20260711.md): was split into 2
+// chunks of T/2 (truncated BPTT) to halve graph activation memory — an
+// early memory-constraint-driven port-specific hack absent from the
+// original (nncp.c trains the full seg_len=64 in one backward pass,
+// mem=256 -> window=320 always). Now BPTT_CHUNK_LEN == seg_len: the
+// per-layer graphs (build_per_layer_fwd/bwd) build for T=64 directly, and
+// the window becomes mem(256)+T(64)=320 automatically (matching decode/
+// bug8-A exactly, no unified-mem-width or chunk-variant-table machinery
+// needed). online_trainer_train_segment_batch now calls
+// run_per_layer_bptt_chunk exactly ONCE per segment (the former "chunk2"
+// call, and all chunk1->chunk2 K/V fusion between the two, is removed —
+// see that function). Kept as a distinctly-named macro (not folded into
+// SEG_TRAIN_LEN directly) purely so any remaining references stay
+// self-documenting about which concept they mean; BPTT_CHUNK_LEN ==
+// SEG_TRAIN_LEN is now an invariant, not a coincidence.
+#define BPTT_CHUNK_LEN      (g_nncp_profile.seg_len)
+#define BPTT_CHUNK_BT       (g_nncp_profile.num_streams * g_nncp_profile.seg_len)
 
 // NO-GO triage: NNCP_WQNORM_STEP=1 forces the [WQNORM] diagnostic (see the two
 // `_wq_diag` sites below) to fire on EVERY step instead of only step 0 and
@@ -3416,13 +3430,14 @@ static MPSGraphTensor* build_single_layer(
 }
 
 // Build per-layer forward graph (compiled once, reused for all 20 layers)
-// A-only revert (2026-07-05): bug8(B)'s unified-320 chunk-dependent tables
-// reverted pending isolation of the final500 train-loss regression — see
-// window-symmetry-fix-design.md / snapshot branch wip/bug8b-unified320-snapshot
-// for the full unified implementation. This restores the bug6+7 baseline:
-// MEM_LEN=mem_len(256, not unified), EXT_LEN=MEM_LEN+T(288), causal_mask/
-// P_all_q/Q_all_b are build-time CONSTANTS (single formula, chunk-independent
-// — both chunk1 and chunk2 reuse the same table, matching bug6/7's design).
+// BPTT 64一括化 (2026-07-11): T (BPTT_CHUNK_LEN) now equals the full
+// SEG_TRAIN_LEN (64, not a half-segment chunk), so MEM_LEN=mem_len(256)
+// and EXT_LEN=MEM_LEN+T=320 — the exact 320-wide window nncp.c uses,
+// achieved with NO chunk-dependent distance tables (unlike bug8(B)'s
+// unified-320 attempt on wip/bug8b-unified320-snapshot, which needed
+// per-chunk table variants specifically to bridge two half-segment chunks
+// that no longer exist here). causal_mask/P_all_q/Q_all_b remain
+// build-time CONSTANTS — single formula, single chunk per segment.
 static void build_per_layer_fwd(OnlineTrainer* tr) {
     const int B = SEG_TRAIN_STREAMS, T = BPTT_CHUNK_LEN, BT = B * T;
     const int MEM_LEN = (int)g_nncp_profile.mem_len;
@@ -4435,8 +4450,12 @@ OnlineTrainer* online_trainer_create(id<MTLDevice>          device,
         tr->kv_pre_seg_valid = false;
     }
 
-    // Bug 6 fix (chunk-mem-fix-design.md): chunk1's own K/V, [B*T_CHUNK, H] per
-    // layer — sized like BPTT_CHUNK_BT (== SEG_TRAIN_STREAMS * BPTT_CHUNK_LEN).
+    // ATTN_ARB diagnostic scratch (BPTT 64一括化: no longer production-load-
+    // bearing — was bug6's chunk1->chunk2 fusion source before chunking was
+    // removed). Still populated every segment (t_start==0 always now) for
+    // the CPU arbiter self-K/V comparison. [B*T, H] per layer, T=SEG_TRAIN_
+    // LEN via BPTT_CHUNK_BT (== SEG_TRAIN_STREAMS * BPTT_CHUNK_LEN, now
+    // equal to the full segment).
     {
         const size_t chunk1_kv_size = (size_t)BPTT_CHUNK_BT * H * sizeof(float);
         for (int li = 0; li < SEG_MAX_LAYERS; li++) {
@@ -6190,8 +6209,7 @@ static bool metal_bw_layer(OnlineTrainer* tr,
 // relative-error artifact.
 //
 // Not gated behind NNCP_METAL_BW: used by both the METAL_BW-only FWD_DUMP
-// harness below and by the always-available NNCP_DISABLE_SLIDE bisect path
-// (bug6 chunk-mem-slide diagnostics) in run_per_layer_bptt_chunk().
+// harness below and other CPU-recompute comparators in this file.
 static void fwd_dump_max_err(const float* ref, const float* got, size_t n,
                              float* out_max_abs, float* out_max_rel_eps) {
     const float eps = 1e-3f;
@@ -6205,17 +6223,6 @@ static void fwd_dump_max_err(const float* ref, const float* got, size_t n,
     }
     *out_max_abs     = max_abs;
     *out_max_rel_eps = max_rel_eps;
-}
-
-// [BISECT④] (2026-07-05, loss-trajectory bisect): retrain-contamination
-// hypothesis (bisect③, is_retrain-gated slide skip) is dead — noslide_rt was
-// byte-identical to aonly. Toggle disables nncp_chunk_mem_slide (bug6 fix)
-// unconditionally for further isolation; unset (default) always runs it.
-// Not gated behind NNCP_METAL_BW: consumed by the MPSGraph-only train path too.
-static bool nncp_chunk_slide_disabled() {
-    static int v = -1;
-    if (v < 0) v = (getenv("NNCP_DISABLE_SLIDE") && getenv("NNCP_DISABLE_SLIDE")[0] == '1') ? 1 : 0;
-    return v != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -6670,19 +6677,15 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     }
 
     // 2. Reset KV memory
-    // Bug 6 fix (chunk-mem-fix-design.md): this reset must ONLY happen for
-    // chunk1 (t_start==0) — chunk1's mem is genuinely "the segment hasn't
-    // started yet", so it correctly restores the pre-segment latch. Chunk2
-    // (t_start==T_CHUNK) must NOT reset here: online_trainer_train_segment_
-    // batch already slid chunk1's own K/V into kv_mem_buf_k/v (via
-    // nncp_chunk_mem_slide, called between the chunk1 and chunk2
-    // run_per_layer_bptt_chunk calls) — resetting unconditionally here, as
-    // this code did before the fix, silently discarded that slide every time
-    // and left chunk2 seeing only the pre-segment mem (the root cause XCMP
-    // caught: all 20 layers FAIL, layer0 max_abs~3.4).
-    // kv_mem_buf and kv_pre_seg_buf are both mem_len(256)-wide (bug6/7
-    // baseline) — a single flat memcpy per layer restores the pre-segment
-    // latch into kv_mem_buf for chunk1's forward.
+    // BPTT 64一括化: this function is now called exactly once per segment
+    // (t_start is always 0 — see online_trainer_train_segment_batch), so
+    // this reset unconditionally restores the pre-segment latch at the
+    // start of every segment's single forward+backward pass — matching
+    // nncp.c's own semantics exactly (mem = the previous segment's last
+    // mem_len(256) K/V, frozen for the whole segment; the "current" region
+    // is simply this segment's own T=64 tokens, grown causally). kv_mem_buf
+    // and kv_pre_seg_buf are both mem_len(256)-wide — a single flat memcpy
+    // per layer suffices.
     if (t_start == 0) {
         const size_t mem_bytes = (size_t)BM * H * sizeof(float);
         for (uint32_t li = 0; li < L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
@@ -6988,11 +6991,10 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             // persistent buffers instead of leaving results in reusable scratch.
             NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
             fwd_out[tr->pl_fwd.x_out] = floatTD(tr->pl_h[i + 1], shape_h);
-            // Bug 6 fix (chunk-mem-fix-design.md step 3): during chunk1's own
-            // forward (t_start==0), save this layer's K/V straight into
-            // chunk1_kv_buf_k/v — ALWAYS, not just under NNCP_FWD_DUMP/dump_inter,
-            // since chunk2's mem-slide (step 4, below this loop) depends on it
-            // for production correctness, not just diagnostics.
+            // Diagnostic-only (BPTT 64一括化: was production-load-bearing for
+            // bug6's chunk1->chunk2 mem fusion before chunking was removed —
+            // see chunk1_kv_buf_k/v's own comment at allocation). Saves this
+            // layer's K/V for the ATTN_ARB CPU arbiter's self-K/V comparison.
             if (t_start == 0 && i < (uint32_t)SEG_MAX_LAYERS) {
                 if (tr->pl_fwd.t_K_saved) fwd_out[tr->pl_fwd.t_K_saved] = floatTD(tr->chunk1_kv_buf_k[i], shape_h);
                 if (tr->pl_fwd.t_V_saved) fwd_out[tr->pl_fwd.t_V_saved] = floatTD(tr->chunk1_kv_buf_v[i], shape_h);
@@ -7348,89 +7350,6 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 }
             }
 
-            // [ATTN_ARB2] (2026-07-05, "slide toxicity" investigation, candidate
-            // ①): extends ATTN_ARB to chunk2/local-t=0 (absolute segment
-            // position T_CHUNK) — same kv_len=MEM_LEN+1 structure as chunk1's
-            // t=0 case (causal mask only admits this chunk's OWN token at
-            // local t=0), except kv_mem_buf_k/v[i] is now the POST-SLIDE
-            // buffer (mem[MEM_LEN-T_CHUNK:MEM_LEN) = chunk1's real K/V, not
-            // pre-seg latch). Directly tests whether chunk2's REAL forward
-            // pass reads/interprets the slid-in mem correctly, independent of
-            // decode (Q and self-K/V are sourced from train's OWN captures —
-            // m2_dump->Q_saved[i]/x_ln1[i] row 0 — so this is a
-            // self-consistency check: does train's own attention math,
-            // reimplemented on the CPU, reproduce train's own actual output
-            // given the actual post-slide mem bytes?). If ATTN_ARB2 PASSes
-            // while the real training loss is still bad, the bug is NOT in
-            // "chunk2 misreading slid mem" — it's upstream (the values
-            // themselves, or something in the gradient/optimizer path).
-            if (dump_inter && i == 0 && t_start == T_CHUNK && m2_dump->x_ln1[0] && m2_dump->Q_saved[0]) {
-                const uint32_t NH_ = tr->NH, HD_ = tr->HD, D_POS_ = tr->d_pos;
-                const int B_REL_STRIDE_ = (int)tr->ext_len;
-                const float scale = 1.0f / sqrtf((float)HD_);
-                const float* x_ln1_row0 = (const float*)[m2_dump->x_ln1[0] contents];  // b=0,t=0-in-chunk2
-                const float* q_row0     = (const float*)[m2_dump->Q_saved[0] contents];
-                const float* w_k = (const float*)[wb.attn_k contents];   // layer 0 slice (i==0)
-                const float* w_v = (const float*)[wb.attn_v contents];
-                const float* w_o = (const float*)[wb.attn_out contents];
-                std::vector<float> self_k(H), self_v(H);
-                for (uint32_t n = 0; n < H; n++) {
-                    double sk = 0.0, sv = 0.0;
-                    for (uint32_t k = 0; k < H; k++) {
-                        sk += (double)x_ln1_row0[k] * w_k[(size_t)k * H + n];
-                        sv += (double)x_ln1_row0[k] * w_v[(size_t)k * H + n];
-                    }
-                    self_k[n] = (float)sk; self_v[n] = (float)sv;
-                }
-                const float* kv_mem_k = (const float*)[tr->kv_mem_buf_k[0] contents];  // [MEM_LEN,H] b=0, POST-SLIDE
-                const float* kv_mem_v = (const float*)[tr->kv_mem_buf_v[0] contents];
-                const float* w_rel_r_ = (const float*)[wb.w_rel_r_all contents];  // layer 0 slice
-                const float* b_rel_r_ = (const float*)[wb.b_rel_r contents];
-                const int kv_len = MEM_LEN + 1;
-                std::vector<float> arb_pre_o(H, 0.0f), scores2(kv_len);
-                for (uint32_t h = 0; h < NH_; h++) {
-                    const float* qh = &q_row0[h * HD_];
-                    const float* w_rel_h = w_rel_r_ + (size_t)h * HD_ * D_POS_;
-                    float mx = -1e9f;
-                    for (int kx = 0; kx < kv_len; kx++) {
-                        const float* kh = (kx < MEM_LEN) ? (kv_mem_k + (size_t)kx * H + h * HD_) : self_k.data() + h * HD_;
-                        int d = MEM_LEN + 0 - kx;
-                        int qd = ((d % (int)D_POS_) + (int)D_POS_) % (int)D_POS_;
-                        int bd = d < 0 ? 0 : (d >= B_REL_STRIDE_ ? B_REL_STRIDE_ - 1 : d);
-                        double dot = 0.0, qrel = 0.0;
-                        for (uint32_t hd = 0; hd < HD_; hd++) {
-                            dot  += (double)qh[hd] * kh[hd];
-                            qrel += (double)qh[hd] * w_rel_h[(size_t)hd * D_POS_ + qd];
-                        }
-                        float s = scale * (float)dot + scale * (float)qrel
-                                  + sqrtf((float)H) * b_rel_r_[(size_t)h * B_REL_STRIDE_ + bd];
-                        scores2[kx] = s;
-                        if (s > mx) mx = s;
-                    }
-                    double sum = 0.0;
-                    for (int kx = 0; kx < kv_len; kx++) { scores2[kx] = expf(scores2[kx] - mx); sum += scores2[kx]; }
-                    for (int kx = 0; kx < kv_len; kx++) scores2[kx] = (float)(scores2[kx] / sum);
-                    for (uint32_t hd = 0; hd < HD_; hd++) {
-                        double acc = 0.0;
-                        for (int kx = 0; kx < kv_len; kx++) {
-                            const float* vh = (kx < MEM_LEN) ? (kv_mem_v + (size_t)kx * H + h * HD_) : self_v.data() + h * HD_;
-                            acc += (double)scores2[kx] * vh[hd];
-                        }
-                        arb_pre_o[h * HD_ + hd] = (float)acc;
-                    }
-                }
-                std::vector<float> arb_post_o(H, 0.0f);
-                for (uint32_t n = 0; n < H; n++) {
-                    double s = 0.0;
-                    for (uint32_t k = 0; k < H; k++) s += (double)arb_pre_o[k] * w_o[(size_t)k * H + n];
-                    arb_post_o[n] = (float)s;
-                }
-                const float* train_attn_out = (const float*)[m2_dump->attn_out[0] contents];  // row0, POST-O-proj
-                float ma = 0.0f, mr = 0.0f;
-                fwd_dump_max_err(arb_post_o.data(), train_attn_out, H, &ma, &mr);
-                fprintf(stderr, "[ATTN_ARB2] t_start=%d layer=0 vs_train_attn_out(postO) max_abs=%.3e max_rel=%.3e  %s\n",
-                        t_start, ma, mr, ma < 1e-3f ? "PASS" : "FAIL");
-            }
 #else
             // Phase A: bind pl_h[i+1] directly; runWithMTLCommandQueue submits async
             NSMutableDictionary* fwd_out = [NSMutableDictionary dictionary];
@@ -8273,173 +8192,6 @@ static float run_chunked_bptt_chunk(OnlineTrainer* tr,
     return loss_val;
 }
 
-// Bug 6 fix (2026-07-05, chunk-mem-fix-design.md step 4): Transformer-XL-style
-// mem FIFO slide at the chunk1→chunk2 boundary. Mirrors original nncp.c's
-// mem_update (per Pane 1's line-numbered audit: mem_len > train_len case) —
-// "shift the old mem left by T_CHUNK positions, append this chunk's own
-// hidden state at the tail" — generalized here from h to K/V directly (see
-// design doc's equivalence proof: no optimizer step runs between chunk1's
-// forward and chunk2's forward, so W_k/W_v are unchanged and K/V-caching is
-// equivalent to h-caching + re-projection at this point).
-// Scope: only handles T_CHUNK <= MEM_LEN (true for every current profile,
-// e.g. enwik8: MEM_LEN=256, T_CHUNK=32) — the T_CHUNK > MEM_LEN case (chunk1
-// itself longer than the memory window) is out of scope per the design doc.
-// [C1KV_DUMP] (2026-07-05, memfix500b — fence made no difference, ruling out
-// the race hypothesis; this is now the last unverified point per the report
-// chain: the slide algorithm itself is unit-tested and PASSes, so the only
-// remaining suspect is whether chunk1_kv_buf_k/v[i]'s resultsDictionary
-// capture actually holds the K/V build_single_layer computed, or a stale/
-// aliased scratch value). Recomputes K=x_ln1@W_k, V=x_ln1@W_v on the CPU from
-// tr->pl_h[layer] (chunk1's own input — same tensor fwd_dump_cpu_verify_layer
-// already trusts) and diffs against the captured buffer for b=0's first few
-// rows. If this FAILs while the graph math looks right, it's the same class
-// of bug t_Q_saved hit (MPSGraph reusing a same-shape [BT,H] scratch
-// allocation for a non-terminal, repeatedly-invoked-graph output) — k/v's
-// downstream consumer shape (toMH → k_ext concat with kv_mem_buf) differs
-// from q_mh's (toMH → scores matmul), so the SAME identityWithTensor: fix may
-// not suffice here; the fix would need investigating this file's own
-// dump_inter/resultsDictionary binding order or an additional
-// materialization barrier.
-static bool nncp_c1kv_verify_enabled() {
-    static int v = -1;
-    if (v < 0) v = getenv("NNCP_C1KV_VERIFY") ? 1 : 0;
-    return v != 0;
-}
-
-static void nncp_c1kv_verify_layer(OnlineTrainer* tr, const MPSTransformerWeightBuffers* wb,
-                                    uint32_t layer, uint32_t H) {
-    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
-    const bool is_enwik8 = (g_nncp_profile.h == 1024);
-    const float* x    = (const float*)[tr->pl_h[layer] contents];  // row = b*T_CHUNK+t (chunk1's input)
-    const float* wln  = (const float*)[wb->ln contents] + (size_t)layer * 4 * H;
-    const float* gam1 = wln;
-    const float* w_k  = (const float*)[wb->attn_k contents] + (size_t)layer * H * H;
-    const float* w_v  = (const float*)[wb->attn_v contents] + (size_t)layer * H * H;
-    const float* k_got_buf = (const float*)[tr->chunk1_kv_buf_k[layer] contents];
-    const float* v_got_buf = (const float*)[tr->chunk1_kv_buf_v[layer] contents];
-
-    const int n_rows = (T_CHUNK < 3) ? T_CHUNK : 3;  // b=0's first few rows: row = 0*T_CHUNK+t = t
-    for (int t = 0; t < n_rows; t++) {
-        const float* xr = x + (size_t)t * H;
-        std::vector<float> x_ln1(H);
-        if (is_enwik8) {
-            double s = 0.0;
-            for (uint32_t c = 0; c < H; c++) s += (double)xr[c] * xr[c];
-            float inv = 1.0f / sqrtf((float)(s / H) + 1e-5f);
-            for (uint32_t c = 0; c < H; c++) x_ln1[c] = xr[c] * inv * gam1[c];
-        } else {
-            std::copy(xr, xr + H, x_ln1.begin());
-        }
-        std::vector<float> k_ref(H), v_ref(H);
-        for (uint32_t n = 0; n < H; n++) {
-            double sk = 0.0, sv = 0.0;
-            for (uint32_t kk = 0; kk < H; kk++) {
-                sk += (double)x_ln1[kk] * w_k[(size_t)kk * H + n];
-                sv += (double)x_ln1[kk] * w_v[(size_t)kk * H + n];
-            }
-            k_ref[n] = (float)sk;
-            v_ref[n] = (float)sv;
-        }
-        const float* k_got = k_got_buf + (size_t)t * H;
-        const float* v_got = v_got_buf + (size_t)t * H;
-        float k_abs, k_rel, v_abs, v_rel;
-        fwd_dump_max_err(k_ref.data(), k_got, H, &k_abs, &k_rel);
-        fwd_dump_max_err(v_ref.data(), v_got, H, &v_abs, &v_rel);
-        fprintf(stderr, "[C1KV_DUMP] layer=%u row(b=0,t=%d) k_rel_err=%.3e v_rel_err=%.3e  %s\n",
-                layer, t, k_rel, v_rel, (k_rel < 1e-3f && v_rel < 1e-3f) ? "PASS" : "FAIL");
-    }
-}
-
-// Bug 6 fix (chunk-mem-fix-design.md): chunk1→chunk2 mem discontinuity fix.
-// kv_mem_buf (mem_len=256-wide) FIFO-slides between chunk1 and chunk2's
-// forward passes: drop the oldest T_CHUNK(32) entries, append chunk1's own
-// K/V at the tail — so chunk2 sees [pre_seg_mem's newest 224] ++ [chunk1's
-// own 32], staying 256-wide throughout (A-only revert baseline; bug8(B)'s
-// concat-not-slide unification is parked on wip/bug8b-unified320-snapshot).
-static void nncp_chunk_mem_slide(OnlineTrainer* tr, uint32_t H) {
-    const int MEM_LEN = (int)g_nncp_profile.mem_len;   // 256
-    const int T_CHUNK = (int)BPTT_CHUNK_LEN;            // 32
-    const int KEEP    = MEM_LEN - T_CHUNK;              // 224
-    const int B       = SEG_TRAIN_STREAMS;
-    auto slide_one = [&](id<MTLBuffer> mem_buf, id<MTLBuffer> chunk1_buf) {
-        if (!mem_buf || !chunk1_buf) return;
-        float* mem = (float*)[mem_buf contents];
-        const float* c1 = (const float*)[chunk1_buf contents];
-        for (int s = 0; s < B; s++) {
-            float* mem_s = mem + (size_t)s * MEM_LEN * H;
-            const float* c1_s = c1 + (size_t)s * T_CHUNK * H;
-            memmove(mem_s, mem_s + (size_t)T_CHUNK * H, (size_t)KEEP * H * sizeof(float));
-            memcpy(mem_s + (size_t)KEEP * H, c1_s, (size_t)T_CHUNK * H * sizeof(float));
-        }
-    };
-    for (uint32_t li = 0; li < tr->L && li < (uint32_t)SEG_MAX_LAYERS; li++) {
-        slide_one(tr->kv_mem_buf_k[li], tr->chunk1_kv_buf_k[li]);
-        slide_one(tr->kv_mem_buf_v[li], tr->chunk1_kv_buf_v[li]);
-    }
-}
-
-// [SLIDE_VERIFY] (2026-07-05, memfix500c — C1KV_DUMP passed, so capture is
-// correct; this checks the NEXT link in the chain): after the slide, mem's
-// LAST slot (b=0, position MEM_LEN-1 — the most-recent memory entry) must be
-// bit-identical to chunk1_kv_buf's LAST row (b=0, t=T_CHUNK-1) — a direct
-// buffer-to-buffer equality check (no CPU recompute needed, both sides are
-// already-verified-correct buffers) that catches anything between the slide
-// itself and chunk2's graph feed silently reverting/corrupting kv_mem_buf
-// (e.g. an unnoticed second reset, or a stale cached MPSGraphTensorData
-// wrapping the OLD buffer contents from before the slide).
-static void nncp_slide_verify_layer(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
-    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
-    const int MEM_LEN = (int)g_nncp_profile.mem_len;
-    const float* mem = (const float*)[tr->kv_mem_buf_k[layer] contents];
-    const float* c1  = (const float*)[tr->chunk1_kv_buf_k[layer] contents];
-    const float* mem_last = mem + (size_t)(MEM_LEN - 1) * H;      // b=0, pos=MEM_LEN-1
-    const float* c1_last  = c1  + (size_t)(T_CHUNK - 1) * H;      // b=0, t=T_CHUNK-1
-    float max_abs = 0.0f;
-    for (uint32_t h = 0; h < H; h++) {
-        float d = fabsf(mem_last[h] - c1_last[h]);
-        if (d > max_abs) max_abs = d;
-    }
-    fprintf(stderr, "[SLIDE_VERIFY] layer=%u mem[last]-vs-chunk1_kv[last] max_abs=%.3e  %s\n",
-            layer, max_abs, (max_abs == 0.0f) ? "PASS" : "FAIL");
-}
-
-// [SLIDE_VERIFY2] (2026-07-05, blind-spot fix): SLIDE_VERIFY above only
-// checks the APPEND side (mem[last] == chunk1_kv[last]) — it never checks
-// that the SHIFT side actually moved the right data. Captures mem[T_CHUNK:
-// MEM_LEN) (b=0) BEFORE the slide call, then after the slide compares it
-// against mem[0:MEM_LEN-T_CHUNK) — the "drop the oldest T_CHUNK, shift the
-// rest forward" half of the FIFO. A mismatch here (with SLIDE_VERIFY still
-// PASSing) would mean the shift's memmove itself is wrong even though the
-// tail append happens to land correctly.
-static std::vector<float> g_slide_verify2_before_k[SEG_MAX_LAYERS];
-static std::vector<float> g_slide_verify2_before_v[SEG_MAX_LAYERS];
-
-static void nncp_slide_verify2_capture_before(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
-    const int MEM_LEN = (int)g_nncp_profile.mem_len;
-    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
-    const float* mem_k = (const float*)[tr->kv_mem_buf_k[layer] contents];
-    const float* mem_v = (const float*)[tr->kv_mem_buf_v[layer] contents];
-    g_slide_verify2_before_k[layer].assign(mem_k + (size_t)T_CHUNK * H, mem_k + (size_t)MEM_LEN * H);
-    g_slide_verify2_before_v[layer].assign(mem_v + (size_t)T_CHUNK * H, mem_v + (size_t)MEM_LEN * H);
-}
-
-static void nncp_slide_verify2_check_after(OnlineTrainer* tr, uint32_t layer, uint32_t H) {
-    const int MEM_LEN = (int)g_nncp_profile.mem_len;
-    const int T_CHUNK = (int)BPTT_CHUNK_LEN;
-    const int KEEP = MEM_LEN - T_CHUNK;
-    const float* mem_k = (const float*)[tr->kv_mem_buf_k[layer] contents];
-    const float* mem_v = (const float*)[tr->kv_mem_buf_v[layer] contents];
-    float max_abs_k = 0.0f, max_abs_v = 0.0f;
-    for (size_t i = 0; i < (size_t)KEEP * H; i++) {
-        float dk = fabsf(mem_k[i] - g_slide_verify2_before_k[layer][i]);
-        float dv = fabsf(mem_v[i] - g_slide_verify2_before_v[layer][i]);
-        if (dk > max_abs_k) max_abs_k = dk;
-        if (dv > max_abs_v) max_abs_v = dv;
-    }
-    fprintf(stderr, "[SLIDE_VERIFY2] layer=%u shifted-region(k) max_abs=%.3e shifted-region(v) max_abs=%.3e  %s\n",
-            layer, max_abs_k, max_abs_v, (max_abs_k == 0.0f && max_abs_v == 0.0f) ? "PASS" : "FAIL");
-}
-
 // ---------------------------------------------------------------------------
 // Segment-level training: run ONE backward pass over a full [B, T] segment
 // ---------------------------------------------------------------------------
@@ -8464,48 +8216,20 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
         MPSTransformerWeightBuffers wb;
         if (!mps_transformer_get_weight_buffers(tr->ctx, &wb)) return false;
 
-        const int T       = SEG_TRAIN_LEN;
-        const int T_CHUNK = (int)BPTT_CHUNK_LEN;
         uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V;
         const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
 
-        float loss1 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, 0,       true);
-        if (nncp_c1kv_verify_enabled()) {
-            static const uint32_t kC1KVLayers[3] = {0, 10, 19};
-            for (uint32_t li : kC1KVLayers) if (li < L) nncp_c1kv_verify_layer(tr, &wb, li, H);
-        }
-        // memfix500 regression triage (2026-07-05): defensive full-drain fence
-        // before the CPU-side slide touches kv_mem_buf/chunk1_kv_buf. Chunk1's
-        // own command queue submissions (forward AND backward) should already
-        // be synchronously drained by the time run_per_layer_bptt_chunk returns
-        // (its trailing leaf/embedding-gradient step uses the blocking
-        // runWithFeeds:targetTensors: API on the same serial tr->cmdQueue,
-        // which only returns once everything submitted before it on that
-        // queue has completed) — but this fence removes any doubt: unified
-        // memory means a CPU write racing an in-flight GPU read on the same
-        // buffer would corrupt results silently (no crash), which is
-        // consistent with the observed regression (worse loss/CE, not a
-        // crash). Cheap (one empty command buffer) relative to a whole chunk.
-        {
-            id<MTLCommandBuffer> drain = [tr->cmdQueue commandBuffer];
-            [drain commit];
-            [drain waitUntilCompleted];
-        }
-        // NNCP_DISABLE_SLIDE bisect toggle retained for future investigation;
-        // default (env unset) always runs the slide, train and retrain alike.
-        if (!nncp_chunk_slide_disabled()) {
-            static const uint32_t kSlideVerifyLayers[3] = {0, 10, 19};
-            if (nncp_c1kv_verify_enabled()) {
-                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify2_capture_before(tr, li, H);
-            }
-            nncp_chunk_mem_slide(tr, H);  // bug 6 fix: chunk1's K/V slides into chunk2's mem (A-only baseline)
-            if (nncp_c1kv_verify_enabled()) {
-                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify_layer(tr, li, H);
-                for (uint32_t li : kSlideVerifyLayers) if (li < L) nncp_slide_verify2_check_after(tr, li, H);
-            }
-        }
-        float loss2 = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, T_CHUNK, false);
-        float avg_loss = (loss1 + loss2) * 0.5f;
+        // BPTT 64一括化: a single full-segment (T=SEG_TRAIN_LEN=64) forward+
+        // backward pass, matching nncp.c's own single-pass-per-segment
+        // training exactly. The former "chunk1"/"chunk2" split — and all
+        // chunk1->chunk2 K/V fusion machinery (nncp_chunk_mem_slide,
+        // NNCP_DISABLE_SLIDE, nncp_c1kv_verify_layer,
+        // nncp_slide_verify_layer/verify2) between them — is gone: mem
+        // (kv_mem_buf, restored once from kv_pre_seg_buf at t_start==0
+        // inside run_per_layer_bptt_chunk) plus this one pass's own 64
+        // tokens IS the full 256+64=320 window nncp.c uses, with no
+        // intermediate fusion step needed.
+        float avg_loss = run_per_layer_bptt_chunk(tr, wb, seg_inputs, seg_targets, 0, true);
 
         // [WQNORM-DIAG]
         bool _wq_diag = nncp_wqnorm_every_step_forced() ||
@@ -8563,16 +8287,6 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
                 if (s_loss_step < 0) s_loss_step = !!getenv("NNCP_LOSS_STEP");
                 if (s_loss_step) fprintf(stderr, "[LOSS] step=%llu loss=%.8f\n",
                         (unsigned long long)_eff_step, avg_loss);
-                // [LOSS_CHUNK] (2026-07-05, shortcut hypothesis): loss1/loss2
-                // are already computed separately (per-chunk, before being
-                // averaged into avg_loss) — this just exposes both instead of
-                // only the average. If chunk2's loss is anomalously low in
-                // the frozen (NNCP_DISABLE_SLIDE=1) world, that's a shortcut
-                // signature (chunk2 finding self-information some other way,
-                // not via the mem path), meaning frozen's 2.2-2.3 headline
-                // number is inflated rather than a genuine baseline.
-                if (s_loss_step) fprintf(stderr, "[LOSS_CHUNK] step=%llu c1=%.8f c2=%.8f\n",
-                        (unsigned long long)_eff_step, loss1, loss2);
             }
 
             clip_gradients(tr, tr->grad_clip);
