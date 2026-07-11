@@ -1276,12 +1276,42 @@ static inline size_t get_block_len() {
 // fire much earlier than a flat-500000 schedule would. NNCP_BLOCK_LEN (if
 // set) overrides this ENTIRE schedule with a flat value, same as before —
 // this function is only consulted when the env var is unset.
-static inline size_t get_interp_block_len(size_t file_pos) {
-    if (g_nncp_profile.h == 1024 && file_pos < 500000) return 100000;
-    return 500000;
+//
+// cadence fix (2026-07-11, cadence-fix judge2kr analysis): nncp.c's
+// block_len (both the schedule constants AND the internal state, file_pos/
+// file_length in process_block/the compress loop, nncp.c L3446-3469) is a
+// WHOLE-FILE byte count — process_block internally divides it by n_streams
+// (nncp.c L2980: block_stride = block_len / n_streams) to get each stream's
+// share. Our port's file_pos/block_bytes are PER-STREAM from the start
+// (stride = ceil(input_size/NUM_STREAMS), L1356) — get_interp_block_len was
+// comparing a per-stream file_pos against the WHOLE-FILE schedule boundary
+// (500000) and returning the WHOLE-FILE schedule value directly as a
+// per-stream block length. Net effect: the "500000" boundary took ~32x
+// longer (in per-stream bytes) to reach than intended, and every block was
+// ~32x too large — the first retrain fired at ~78% of the file instead of
+// nncp.c's ~9 evenly-spaced blocks. Fixed by converting file_pos to an
+// approximate whole-file position (×NUM_STREAMS) for the schedule lookup,
+// then dividing the schedule's answer back down to a per-stream byte count.
+static inline size_t get_interp_block_len(size_t file_pos_per_stream) {
+    // file_pos_per_stream*NUM_STREAMS approximates the whole-file position
+    // nncp.c's schedule was authored against — exact only when all streams
+    // are still in lockstep (true up to the schedule's granularity: 500000
+    // is far larger than a single seg_len*NUM_STREAMS step, so the boundary
+    // crossing is off by at most one seg_len's worth of file position).
+    const size_t file_pos_whole = file_pos_per_stream * (size_t)NUM_STREAMS;
+    const size_t whole = (g_nncp_profile.h == 1024 && file_pos_whole < 500000) ? 100000 : 500000;
+    size_t per_stream = whole / (size_t)NUM_STREAMS;
+    // nncp.c rounds block_len (whole-file) to a multiple of seg_len*
+    // n_streams (nncp.c L3453-3454) before use — dividing by n_streams
+    // turns that into "multiple of seg_len" per stream, which is what we
+    // need anyway since block_bytes gets consumed SEG_LEN tokens at a time.
+    const size_t seg_len = (size_t)SEG_LEN;
+    per_stream = (per_stream / seg_len) * seg_len;
+    if (per_stream < seg_len) per_stream = seg_len;
+    return per_stream;
 }
 static inline size_t get_block_len_for_pos(size_t file_pos) {
-    if (g_block_len != 0) return g_block_len;  // explicit override, flat
+    if (g_block_len != 0) return g_block_len;  // explicit override, flat (already per-stream)
     const char* e = getenv("NNCP_BLOCK_LEN");
     if (e && atoi(e) > 0) { g_block_len = (size_t)atoi(e); return g_block_len; }
     return get_interp_block_len(file_pos);
