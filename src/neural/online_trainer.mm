@@ -4077,6 +4077,27 @@ static id<MTLComputePipelineState> load_sgd_pipeline(id<MTLDevice> device) {
 }
 
 // Apply SGD: weight -= lr * grad  (GPU)
+// NaN/Inf guard (2026-07-11, nanskip fix): original libnc's sgd_opt_update_var
+// skips a tensor's update ENTIRELY when its gradient contains NaN/Inf — the
+// weight AND any optimizer moment state (v/m) are left untouched, not just
+// the offending elements zeroed. This port previously zeroed individual NaN/
+// Inf gradient elements in-place (compute_l2's predecessor, used by clip_gradients)
+// and continued the update with the sanitized gradient — different
+// semantics: a tensor with e.g. 1 NaN element out of a million would still
+// receive a (slightly wrong) update here, whereas libnc would skip the
+// WHOLE tensor that step. Matches the original now: scan first, skip the
+// dispatch (and thus the RMSProp moment update too) if any element is
+// non-finite. CPU scan cost is small relative to the GPU dispatch it can
+// skip, and n_elements-sized buffers are all CPU-readable (unified memory).
+static bool nncp_grad_has_nonfinite(id<MTLBuffer> grad, size_t n_elements) {
+    if (!grad || n_elements == 0) return false;
+    const float* p = (const float*)[grad contents];
+    for (size_t i = 0; i < n_elements; i++) {
+        if (!isfinite(p[i])) return true;
+    }
+    return false;
+}
+
 static void apply_sgd(id<MTLComputeCommandEncoder> enc,
                       id<MTLComputePipelineState>   ps_sgd,
                       id<MTLBuffer>                 weight,
@@ -4084,6 +4105,10 @@ static void apply_sgd(id<MTLComputeCommandEncoder> enc,
                       float                         lr,
                       size_t                        n_elements) {
     if (!weight || !grad || n_elements == 0) return;
+    if (nncp_grad_has_nonfinite(grad, n_elements)) {
+        fprintf(stderr, "[NAN_SKIP] apply_sgd: non-finite gradient, skipping update (n=%zu)\n", n_elements);
+        return;
+    }
     [enc setComputePipelineState:ps_sgd];
     [enc setBuffer:weight offset:0 atIndex:0];
     [enc setBuffer:grad   offset:0 atIndex:1];
@@ -4106,6 +4131,10 @@ static void apply_rmsprop(id<MTLComputeCommandEncoder> enc,
                           float                        wd,
                           size_t                       n_elements) {
     if (!weight || !grad || !v || n_elements == 0) return;
+    if (nncp_grad_has_nonfinite(grad, n_elements)) {
+        fprintf(stderr, "[NAN_SKIP] apply_rmsprop: non-finite gradient, skipping update (n=%zu)\n", n_elements);
+        return;
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:weight offset:0 atIndex:0];
     [enc setBuffer:grad   offset:0 atIndex:1];
@@ -4120,13 +4149,23 @@ static void apply_rmsprop(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
-// Compute sanitized L2 norm: replace NaN/Inf with 0, return ||buf||₂
-static float sanitize_and_l2(id<MTLBuffer> buf, size_t n) {
+// L2 norm (2026-07-11, nanskip fix): used to be "sanitize_and_l2" — replaced
+// NaN/Inf elements with 0 in-place before computing the norm, so
+// clip_gradients would silently zero individual bad elements and let the
+// (partially sanitized) tensor's optimizer update proceed. Original libnc
+// instead skips a tensor's update ENTIRELY on any NaN/Inf (nncp_grad_has_
+// nonfinite in apply_sgd/apply_rmsprop, which runs AFTER clip_gradients —
+// see online_trainer_train_segment_batch/online_trainer_train_batch). For
+// that downstream check to still see the non-finite values, this function
+// must NOT mutate the buffer: a NaN/Inf element makes `sum` NaN, so
+// `norm > max_norm` is false (NaN comparisons are always false) and
+// clip_gradients's caller-side scale_grad is skipped — no clipping happens
+// on a doomed tensor, but nothing is silently repaired either.
+static float compute_l2(id<MTLBuffer> buf, size_t n) {
     if (!buf || n == 0) return 0.0f;
-    float* p = (float*)[buf contents];
+    const float* p = (const float*)[buf contents];
     double sum = 0.0;
     for (size_t i = 0; i < n; i++) {
-        if (!isfinite(p[i])) { p[i] = 0.0f; continue; }
         double g = p[i];
         sum += g * g;
     }
@@ -4147,7 +4186,7 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
     uint32_t L=tr->L, H=tr->H, F=tr->F, V=tr->V;
     const size_t FFN1_MULT = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
     auto clipTensor = [&](id<MTLBuffer> b, size_t n) {
-        float norm = sanitize_and_l2(b, n);
+        float norm = compute_l2(b, n);
         if (norm > max_norm) scale_grad(b, n, max_norm / norm);
     };
     clipTensor(tr->grad_embed,    (size_t)V * H);
