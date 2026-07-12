@@ -247,6 +247,27 @@ static void nncp_fill_dropout_mask(float* mask, size_t n, float rate, uint64_t s
     }
 }
 
+// identity-mask tax fix (2026-07-13, T1即効枠): rate==0.0f always produces
+// an all-1.0f buffer (see nncp_fill_dropout_mask — every u>=0.0f, so every
+// element keeps with scale 1/(1-0)=1). Online calls hit this rate==0 case
+// on essentially every segment (nncp_effective_dropout_rate returns 0 for
+// online unless NNCP_DROPOUT_ONLINE=1), so the RNG fill over the whole
+// buffer was pure waste once the buffer already holds that same identity
+// content from a prior call. *is_identity tracks that per-buffer; a rate>0
+// call (retrain) always regenerates and clears the flag, so the next
+// rate==0 call correctly refills back to identity exactly once.
+static inline void nncp_fill_dropout_mask_cached(float* mask, size_t n, float rate,
+                                                   uint64_t seed, bool* is_identity) {
+    if (rate == 0.0f) {
+        if (*is_identity) return;  // already all-ones from a prior call — nothing to do
+        for (size_t i = 0; i < n; i++) mask[i] = 1.0f;
+        *is_identity = true;
+        return;
+    }
+    nncp_fill_dropout_mask(mask, n, rate, seed);
+    *is_identity = false;
+}
+
 // Seed derivation: unique per (step_kind, step, t_start-chunk, layer, hook).
 // step_kind separates train vs retrain counters (which can otherwise collide
 // at the same numeric value); hook_id separates attn(#4)=0 from ffn2(#6)=1.
@@ -1339,6 +1360,24 @@ struct OnlineTrainer {
     id<MTLBuffer>   dropout_mask_ff1[SEG_MAX_LAYERS];
     id<MTLBuffer>   dropout_mask_embed;  // [BT, H] — hook #1, chunk input (layer 0), not per-layer
     id<MTLBuffer>   dropout_mask_final;  // [BT, H] — hook #7, post-LN_FINAL pre-output-proj, not per-layer
+
+    // identity-mask tax fix (2026-07-13, T1即効枠): companion "does this
+    // buffer currently hold an all-ones identity mask" flag per dropout
+    // buffer above. Online calls run with effective rate 0 essentially
+    // always (see nncp_effective_dropout_rate) — every one of those calls
+    // was re-running the splitmix64 RNG fill over the WHOLE buffer just to
+    // rewrite the same all-1.0f content that was already there from the
+    // previous call. See nncp_fill_dropout_mask_cached: once a buffer is
+    // known identity, rate==0 calls become a no-op; any rate>0 call (retrain)
+    // clears the flag so the next rate==0 call refills it back to identity.
+    bool dropout_mask_attn_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_ffn2_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_q_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_v_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_att_prob_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_ff1_is_identity[SEG_MAX_LAYERS] = {};
+    bool dropout_mask_embed_is_identity = false;
+    bool dropout_mask_final_is_identity = false;
 
     // ---- Layer-chunked gradient checkpointing (L > 8, e.g. enwik8) ----
     // 4 groups × 5 layers each; group g covers layers [g*5 .. g*5+4].
@@ -6826,10 +6865,11 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (!tr->dropout_mask_embed)
                 tr->dropout_mask_embed = [tr->device newBufferWithLength:n * sizeof(float)
                                                                    options:MTLResourceStorageModeShared];
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_embed contents], n, rate1,
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_embed contents], n, rate1,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, /*layer_idx=*/0, /*hook_id=*/2));
+                                        t_start, /*layer_idx=*/0, /*hook_id=*/2),
+                                    &tr->dropout_mask_embed_is_identity);
             const float* mask = (const float*)[tr->dropout_mask_embed contents];
             for (size_t i = 0; i < n; i++) dst[i] *= mask[i];
         }
@@ -6974,14 +7014,16 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (!tr->dropout_mask_ffn2[layer])
                 tr->dropout_mask_ffn2[layer] = [tr->device newBufferWithLength:n * sizeof(float)
                                                                         options:MTLResourceStorageModeShared];
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_attn[layer] contents], n, rate,
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_attn[layer] contents], n, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/0));
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_ffn2[layer] contents], n, rate,
+                                        t_start, layer, /*hook_id=*/0),
+                                    &tr->dropout_mask_attn_is_identity[layer]);
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_ffn2[layer] contents], n, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/1));
+                                        t_start, layer, /*hook_id=*/1),
+                                    &tr->dropout_mask_ffn2_is_identity[layer]);
             if (fg.mask_attn) feeds[fg.mask_attn] = floatTD(tr->dropout_mask_attn[layer], shape_h);
             if (fg.mask_ffn2) feeds[fg.mask_ffn2] = floatTD(tr->dropout_mask_ffn2[layer], shape_h);
         }
@@ -7000,18 +7042,21 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (!tr->dropout_mask_ff1[layer])
                 tr->dropout_mask_ff1[layer] = [tr->device newBufferWithLength:n_ff1 * sizeof(float)
                                                                         options:MTLResourceStorageModeShared];
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_q[layer] contents], n_h, rate,
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_q[layer] contents], n_h, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/3));
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_v[layer] contents], n_h, rate,
+                                        t_start, layer, /*hook_id=*/3),
+                                    &tr->dropout_mask_q_is_identity[layer]);
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_v[layer] contents], n_h, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/4));
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_ff1[layer] contents], n_ff1, rate,
+                                        t_start, layer, /*hook_id=*/4),
+                                    &tr->dropout_mask_v_is_identity[layer]);
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_ff1[layer] contents], n_ff1, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/5));
+                                        t_start, layer, /*hook_id=*/5),
+                                    &tr->dropout_mask_ff1_is_identity[layer]);
             if (fg.mask_q)   feeds[fg.mask_q]   = floatTD(tr->dropout_mask_q[layer],   shape_h);
             if (fg.mask_v)   feeds[fg.mask_v]   = floatTD(tr->dropout_mask_v[layer],   shape_h);
             if (fg.mask_ff1) feeds[fg.mask_ff1] = floatTD(tr->dropout_mask_ff1[layer], shape_ff1_mask);
@@ -7023,10 +7068,11 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (!tr->dropout_mask_att_prob[layer])
                 tr->dropout_mask_att_prob[layer] = [tr->device newBufferWithLength:n * sizeof(float)
                                                                              options:MTLResourceStorageModeShared];
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_att_prob[layer] contents], n, rate_att,
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_att_prob[layer] contents], n, rate_att,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, layer, /*hook_id=*/8));
+                                        t_start, layer, /*hook_id=*/8),
+                                    &tr->dropout_mask_att_prob_is_identity[layer]);
             feeds[fg.mask_att_prob] = floatTD(tr->dropout_mask_att_prob[layer], shape_att_prob_mask);
         }
     };
@@ -7560,10 +7606,11 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             if (!tr->dropout_mask_final)
                 tr->dropout_mask_final = [tr->device newBufferWithLength:n * sizeof(float)
                                                                    options:MTLResourceStorageModeShared];
-            nncp_fill_dropout_mask((float*)[tr->dropout_mask_final contents], n, rate,
+            nncp_fill_dropout_mask_cached((float*)[tr->dropout_mask_final contents], n, rate,
                                     nncp_dropout_seed(tr->is_retrain,
                                         tr->is_retrain ? tr->retrain_train_step : tr->train_step,
-                                        t_start, /*layer_idx=*/0, /*hook_id=*/7));
+                                        t_start, /*layer_idx=*/0, /*hook_id=*/7),
+                                    &tr->dropout_mask_final_is_identity);
             feeds[lg.mask_final] = floatTD(tr->dropout_mask_final, shape_h);
         }
 
