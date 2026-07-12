@@ -6687,6 +6687,64 @@ static bool nncp_xcmp_enabled() {
 // the XCMP check segment-exact instead of a false-positive-prone "close enough".
 static int s_xcmp_train_seg_counter = 0;
 
+// [BPTT_PROFILE] (2026-07-12, T1第1弾 — bptt64 train +30% investigation):
+// env-gated stage/per-layer wall-clock probe for run_per_layer_bptt_chunk.
+// Opt-in (NNCP_BPTT_PROFILE=1), zero overhead when unset beyond one getenv()
+// call and a handful of branches — every timer call below is a no-op
+// (returns immediately) unless the flag is on. Reports per-layer fwd/bwd
+// times (min/max/avg across the L layers actually run this segment, so a
+// slow outlier layer is visible instead of averaged away) plus embed/loss
+// stage totals, aggregated over N segments (matches the existing [PERF]
+// cadence: every 5 segments) so a single run yields a stable picture
+// without flooding stderr per-segment.
+static int nncp_bptt_profile_enabled() {
+    static int v = -1;
+    if (v < 0) v = !!getenv("NNCP_BPTT_PROFILE");
+    return v;
+}
+struct BpttProfileAccum {
+    double embed_ms = 0.0, fwd_ms = 0.0, loss_ms = 0.0, bwd_ms = 0.0, embed_grad_ms = 0.0;
+    double fwd_layer_min = 1e18, fwd_layer_max = 0.0, fwd_layer_sum = 0.0;
+    double bwd_layer_min = 1e18, bwd_layer_max = 0.0, bwd_layer_sum = 0.0;
+    int    n_fwd_layers = 0, n_bwd_layers = 0, n_segs = 0;
+};
+static BpttProfileAccum g_bptt_prof;
+static inline double nncp_bptt_now_ms() {
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-6;
+}
+static inline void nncp_bptt_prof_layer(bool is_fwd, double ms) {
+    if (!nncp_bptt_profile_enabled()) return;
+    if (is_fwd) {
+        g_bptt_prof.fwd_layer_sum += ms; g_bptt_prof.n_fwd_layers++;
+        if (ms < g_bptt_prof.fwd_layer_min) g_bptt_prof.fwd_layer_min = ms;
+        if (ms > g_bptt_prof.fwd_layer_max) g_bptt_prof.fwd_layer_max = ms;
+    } else {
+        g_bptt_prof.bwd_layer_sum += ms; g_bptt_prof.n_bwd_layers++;
+        if (ms < g_bptt_prof.bwd_layer_min) g_bptt_prof.bwd_layer_min = ms;
+        if (ms > g_bptt_prof.bwd_layer_max) g_bptt_prof.bwd_layer_max = ms;
+    }
+}
+static void nncp_bptt_prof_flush_if_due() {
+    if (!nncp_bptt_profile_enabled()) return;
+    g_bptt_prof.n_segs++;
+    if (g_bptt_prof.n_segs % 5 != 0) return;
+    fprintf(stderr, "[BPTT_PROFILE] segs=%d embed=%.2fms fwd_total=%.2fms loss=%.2fms bwd_total=%.2fms "
+            "embed_grad=%.2fms | fwd/layer min=%.3f max=%.3f avg=%.3f (n=%d) | "
+            "bwd/layer min=%.3f max=%.3f avg=%.3f (n=%d)\n",
+            g_bptt_prof.n_segs, g_bptt_prof.embed_ms, g_bptt_prof.fwd_ms, g_bptt_prof.loss_ms,
+            g_bptt_prof.bwd_ms, g_bptt_prof.embed_grad_ms,
+            g_bptt_prof.fwd_layer_min, g_bptt_prof.fwd_layer_max,
+            g_bptt_prof.n_fwd_layers ? g_bptt_prof.fwd_layer_sum / g_bptt_prof.n_fwd_layers : 0.0,
+            g_bptt_prof.n_fwd_layers,
+            g_bptt_prof.bwd_layer_min, g_bptt_prof.bwd_layer_max,
+            g_bptt_prof.n_bwd_layers ? g_bptt_prof.bwd_layer_sum / g_bptt_prof.n_bwd_layers : 0.0,
+            g_bptt_prof.n_bwd_layers);
+    // Reset accumulators for the next window (running min/max would hide
+    // regressions that appear only later in a long run).
+    g_bptt_prof = BpttProfileAccum();
+}
+
 static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const MPSTransformerWeightBuffers& wb,
     const int32_t* seg_inputs, const int32_t* seg_targets,
@@ -6739,6 +6797,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     }
 
     // 3. CPU embedding → pl_h[0]
+    const double bptt_prof_t_embed0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
     {
         const float embed_scale = sqrtf((float)H);
         const float* embed_ptr = (const float*)[wb.embed contents];
@@ -6775,6 +6834,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             for (size_t i = 0; i < n; i++) dst[i] *= mask[i];
         }
     }
+    if (nncp_bptt_profile_enabled()) g_bptt_prof.embed_ms += nncp_bptt_now_ms() - bptt_prof_t_embed0;
 
     // Helpers
     auto floatTD = [&](id<MTLBuffer> buf, NSArray<NSNumber*>* shape) -> MPSGraphTensorData* {
@@ -6998,7 +7058,9 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const bool dump_inter = (m2_dump != nullptr) && m2_dump->allocated;
     const uint32_t NH_dump = tr->NH;
 #endif
+    const double bptt_prof_t_fwd0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
     for (uint32_t i = 0; i < L; i++) {
+        const double bptt_prof_t_layer0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
         @autoreleasepool {
             NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
             buildLayerFeeds(feeds, tr->pl_fwd, i, tr->pl_h[i]);
@@ -7436,8 +7498,10 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                 }
             }
 #endif
+            nncp_bptt_prof_layer(/*is_fwd=*/true, nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() - bptt_prof_t_layer0 : 0.0);
         }
     }
+    if (nncp_bptt_profile_enabled()) g_bptt_prof.fwd_ms += nncp_bptt_now_ms() - bptt_prof_t_fwd0;
 #if !NNCP_METAL_BW
     {   // Phase A: drain cmdQueue before loss backward reads pl_h[L]
         id<MTLCommandBuffer> fence_fwd = [tr->cmdQueue commandBuffer];
@@ -7474,6 +7538,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     // as it was before today's earlier (unsafe) change.
     // ---- Loss backward: LN_FINAL + CE ----
     float loss_val = 0.0f;
+    const double bptt_prof_t_loss0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
     @autoreleasepool {
         NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
         LossBwdGraph& lg = tr->pl_loss;
@@ -7519,6 +7584,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         putGrad(tr->grad_out,      res[lg.dw_out]);
         putGrad(tr->grad_b_out,    res[lg.db_out]);
     }
+    if (nncp_bptt_profile_enabled()) g_bptt_prof.loss_ms += nncp_bptt_now_ms() - bptt_prof_t_loss0;
 
     // (Phase B verify's shadow run moved inside the Phase M-Readback loop below —
     // see the `i == (int)nncp_bw_verify_l1_target_layer(L)` hook. It must run at
@@ -7599,7 +7665,9 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
     const uint32_t verify_target_layer = nncp_bw_verify_l1_enabled()
         ? nncp_bw_verify_l1_target_layer(L) : 0;
 #endif
+    const double bptt_prof_t_bwd0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
     for (int i = (int)L - 1; i >= 0; i--) {
+        const double bptt_prof_t_blayer0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
         @autoreleasepool {
 #if NNCP_METAL_BW
             // Phase B verify: run metal_bw_layer(target_layer) against a shadow tr
@@ -7821,6 +7889,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
                                           /*is_first_processed_layer=*/(verify_target_layer == L - 1));
             }
 #endif
+            nncp_bptt_prof_layer(/*is_fwd=*/false, nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() - bptt_prof_t_blayer0 : 0.0);
         }
     }
     if (use_gpu_readback) {
@@ -7829,10 +7898,12 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         [fence_bwd commit];
         [fence_bwd waitUntilCompleted];
     }
+    if (nncp_bptt_profile_enabled()) g_bptt_prof.bwd_ms += nncp_bptt_now_ms() - bptt_prof_t_bwd0;
     } // end Metal BW fallback block
 
     // ---- Embed gradient (CPU) ----
     // d(embed)/d(w_embed) = one_hot^T × dh × embed_scale
+    const double bptt_prof_t_egrad0 = nncp_bptt_profile_enabled() ? nncp_bptt_now_ms() : 0.0;
 #if NNCP_METAL_BW
     if (!metal_bw_ok)
 #endif
@@ -7864,6 +7935,10 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             float* ge_row = ge + (size_t)tok * H;
             for (uint32_t j = 0; j < H; j++) ge_row[j] += dh_row[j] * embed_scale;
         }
+    }
+    if (nncp_bptt_profile_enabled()) {
+        g_bptt_prof.embed_grad_ms += nncp_bptt_now_ms() - bptt_prof_t_egrad0;
+        nncp_bptt_prof_flush_if_due();
     }
 
     return loss_val;
