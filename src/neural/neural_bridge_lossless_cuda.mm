@@ -1635,7 +1635,17 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         // ---- Retrain: re-train on accumulated past data (enwik8 profile) ----
         // Original nncp: retrain_period=1 (every block), retrain_len=15M
         // (nncp.c L2531) — default here, override via NNCP_RETRAIN_LEN.
-        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
+        // finalskip (2026-07-12): nncp.c L3470-3474 checks file_pos>=file_length
+        // and breaks OUT of the compress loop BEFORE calling retrain_block for
+        // that iteration — the last block is never retrained on. Our loop instead
+        // fired retrain unconditionally every iteration including the final one,
+        // wasting ~2h/4MB run on a retrain pass whose result is immediately
+        // discarded (compression is already done). `file_pos + block_bytes >=
+        // stride` is true exactly on the loop's terminal iteration (block_bytes
+        // is clamped to stride-file_pos), so it is the direct per-stream
+        // equivalent of nncp.c's whole-file "past end" check.
+        const bool nncp_is_final_block = (file_pos + block_bytes >= stride);
+        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN") && !nncp_is_final_block) {
             const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
@@ -2020,7 +2030,11 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         }
 
         // ---- Retrain (decompress side, must mirror compress) ----
-        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN")) {
+        // finalskip (2026-07-12): mirrors the compress-side skip so both sides
+        // stay symmetric/deterministic — see the comment at the compress-side
+        // retrain block for the nncp.c reference.
+        const bool nncp_is_final_block = (file_pos + block_bytes >= stride);
+        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN") && !nncp_is_final_block) {
             const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();  // must match compress side
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
