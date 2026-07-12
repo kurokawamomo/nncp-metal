@@ -4172,6 +4172,125 @@ static bool nncp_grad_has_nonfinite(id<MTLBuffer> grad, size_t n_elements) {
     return false;
 }
 
+// [NAN_TRACE] (2026-07-13, NaN出生地の計装フック): NAN_SKIP log analysis
+// (nan_dist.DONE) found all 14 optimizer-tracked gradient tensors go
+// non-finite TOGETHER on an affected step (b_out is the sole, consistent
+// exception) — a single upstream blowup propagating through the whole
+// backward chain, not a per-tensor scale problem. This walks the SAME
+// chronological order run_per_layer_bptt_chunk actually computes gradients
+// in (loss-stage tensors first — grad_out/grad_b_out/grad_ln_final, from
+// LossBwdGraph, which runs BEFORE the per-layer loop — then per-layer
+// tensors in backward execution order i=L-1 downto 0, then grad_embed last,
+// computed by the CPU embed-gradient step after the per-layer loop) and
+// reports the FIRST non-finite element found in that order — i.e. the
+// earliest-computed tensor to carry the poison, which is the closest thing
+// to "birthplace" a post-hoc CPU scan of the final buffers can identify
+// (mid-backward intermediates like pl_dh are overwritten every layer
+// iteration and can't be inspected after the fact; the per-layer-sliced
+// weight gradient buffers below are NOT overwritten across layers — each
+// layer owns a distinct offset — so they retain full post-hoc visibility).
+// By design this should never report b_out (grad_b_out) first, consistent
+// with the log analysis; if it ever does, that itself is a signal worth
+// investigating.
+static bool nncp_scan_first_nonfinite(id<MTLBuffer> buf, size_t n, size_t* out_idx, float* out_val) {
+    if (!buf || n == 0) return false;
+    const float* p = (const float*)[buf contents];
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(p[i])) { *out_idx = i; *out_val = p[i]; return true; }
+    }
+    return false;
+}
+static bool nncp_nan_trace_enabled() {
+    static int v = -1;
+    if (v < 0) v = !!getenv("NNCP_NAN_TRACE");
+    return v != 0;
+}
+static void nncp_nan_trace_report(OnlineTrainer* tr, uint32_t L, uint32_t H, uint32_t F,
+                                   size_t FFN1_MULT, bool is_enwik8,
+                                   uint64_t step, bool is_retrain) {
+    size_t idx; float val;
+    // 1. Loss stage (LossBwdGraph, runs before the per-layer loop).
+    struct { const char* name; id<MTLBuffer> buf; size_t n; } loss_stage[] = {
+        {"grad_out",      tr->grad_out,      (size_t)H * tr->V},
+        {"grad_b_out",    tr->grad_b_out,    (size_t)tr->V},
+        {"grad_ln_final", tr->grad_ln_final, (size_t)2 * H},
+    };
+    for (auto& t : loss_stage) {
+        if (nncp_scan_first_nonfinite(t.buf, t.n, &idx, &val)) {
+            fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=loss layer=- tensor=%s elem_idx=%zu value=%g\n",
+                    (unsigned long long)step, is_retrain ? "retrain" : "online", t.name, idx, val);
+            return;
+        }
+    }
+    // 2. Per-layer stage, in backward EXECUTION order (i = L-1 downto 0).
+    for (int i = (int)L - 1; i >= 0; i--) {
+        const size_t off_h  = (size_t)i * H * H;
+        const size_t off_f1 = (size_t)i * H * F * FFN1_MULT;
+        const size_t off_f2 = (size_t)i * F * H;
+        const size_t off_ln = (size_t)i * 4 * H;
+        const size_t off_bf1= (size_t)i * F * FFN1_MULT;
+        const size_t off_bf2= (size_t)i * H;
+        struct { const char* name; id<MTLBuffer> buf; size_t off; size_t n; } layer_stage[] = {
+            {"grad_q",    tr->grad_q,    off_h,  H * H},
+            {"grad_k",    tr->grad_k,    off_h,  H * H},
+            {"grad_v",    tr->grad_v,    off_h,  H * H},
+            {"grad_o",    tr->grad_o,    off_h,  H * H},
+            {"grad_ffn1", tr->grad_ffn1, off_f1, H * F * FFN1_MULT},
+            {"grad_ffn2", tr->grad_ffn2, off_f2, F * H},
+            {"grad_ln",   tr->grad_ln,   off_ln, 4 * H},
+            {"grad_b_ffn1", tr->grad_b_ffn1, off_bf1, F * FFN1_MULT},
+            {"grad_b_ffn2", tr->grad_b_ffn2, off_bf2, H},
+        };
+        for (auto& t : layer_stage) {
+            if (!t.buf) continue;
+            const float* p = (const float*)[t.buf contents];
+            for (size_t k = 0; k < t.n; k++) {
+                if (!isfinite(p[t.off + k])) {
+                    fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=per_layer layer=%d tensor=%s elem_idx=%zu value=%g\n",
+                            (unsigned long long)step, is_retrain ? "retrain" : "online", i, t.name, k, (double)p[t.off + k]);
+                    return;
+                }
+            }
+        }
+        if (is_enwik8 && tr->grad_rel_r_all) {
+            const size_t n_relr = (size_t)tr->NH * tr->HD * tr->d_pos;
+            const size_t off_relr = (size_t)i * n_relr;
+            const float* p = (const float*)[tr->grad_rel_r_all contents];
+            for (size_t k = 0; k < n_relr; k++) {
+                if (!isfinite(p[off_relr + k])) {
+                    fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=per_layer layer=%d tensor=grad_rel_r_all elem_idx=%zu value=%g\n",
+                            (unsigned long long)step, is_retrain ? "retrain" : "online", i, k, (double)p[off_relr + k]);
+                    return;
+                }
+            }
+        }
+    }
+    // 3. Shared/tied tensors accumulated across the whole per-layer loop
+    // (grad_b_rel_r) or a non-enwik8 profile's single shared rel_r.
+    if (!is_enwik8 && tr->grad_rel_r) {
+        if (nncp_scan_first_nonfinite(tr->grad_rel_r, (size_t)tr->NH * tr->HD * tr->d_pos, &idx, &val)) {
+            fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=shared layer=- tensor=grad_rel_r elem_idx=%zu value=%g\n",
+                    (unsigned long long)step, is_retrain ? "retrain" : "online", idx, val);
+            return;
+        }
+    }
+    if (nncp_scan_first_nonfinite(tr->grad_b_rel_r, (size_t)tr->NH * tr->ext_len, &idx, &val)) {
+        fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=shared layer=- tensor=grad_b_rel_r elem_idx=%zu value=%g "
+                "(note: accumulated across all layers — true origin layer not attributable post-hoc)\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online", idx, val);
+        return;
+    }
+    // 4. Embed gradient (CPU step, computed last, after the per-layer loop).
+    if (nncp_scan_first_nonfinite(tr->grad_embed, (size_t)tr->V * H, &idx, &val)) {
+        fprintf(stderr, "[NAN_TRACE] step=%llu %s stage=embed layer=- tensor=grad_embed elem_idx=%zu value=%g\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online", idx, val);
+        return;
+    }
+    fprintf(stderr, "[NAN_TRACE] step=%llu %s: canary flagged non-finite but full scan found nothing "
+            "(race or canary/scan buffer mismatch — investigate)\n",
+            (unsigned long long)step, is_retrain ? "retrain" : "online");
+}
+
 static void apply_sgd(id<MTLComputeCommandEncoder> enc,
                       id<MTLComputePipelineState>   ps_sgd,
                       id<MTLBuffer>                 weight,
@@ -8486,6 +8605,23 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             }
 
             clip_gradients(tr, tr->grad_clip);
+
+            // [NAN_TRACE] (2026-07-13): armed only under NNCP_NAN_TRACE=1 —
+            // zero cost otherwise (one cached getenv, see nncp_nan_trace_enabled).
+            // Even when armed, the expensive full-buffer scan
+            // (nncp_nan_trace_report, O(total gradient elements)) only runs on
+            // steps that actually have a non-finite gradient — gated by a cheap
+            // O(2H)=O(2048) canary check of grad_ln_final first (a tensor
+            // confirmed, via nan_dist.DONE's log analysis, to always go
+            // non-finite together with the rest on an affected step — unlike
+            // grad_b_out, which is the one tensor that never does and so would
+            // make a useless canary).
+            if (nncp_nan_trace_enabled() &&
+                nncp_grad_has_nonfinite(tr->grad_ln_final, (size_t)2 * H)) {
+                const size_t FFN1_MULT_trace = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
+                nncp_nan_trace_report(tr, L, H, F, FFN1_MULT_trace,
+                                       g_nncp_profile.h == 1024, _eff_step, tr->is_retrain);
+            }
 
             // NO-GO triage: grad_out/grad_b_out/grad_ln_final norms as fed to
             // the optimizer (post-clip — this is exactly what apply_rmsprop/
