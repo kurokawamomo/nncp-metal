@@ -20,6 +20,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -236,15 +237,49 @@ static inline uint64_t nncp_splitmix64_next(uint64_t& state) {
     return z ^ (z >> 31);
 }
 
-static void nncp_fill_dropout_mask(float* mask, size_t n, float rate, uint64_t seed) {
-    uint64_t state = seed;
+// T1-3本丸 (2026-07-13, retrain RNG-fill parallelization): splitmix64 is an
+// embarrassingly parallel per-element generator EXCEPT that the original
+// loop above threads `state` through every element sequentially (element i
+// depends on i prior nncp_splitmix64_next() calls) — that dependency chain
+// is what forced single-threaded execution. Fixed granularity chunking
+// breaks the chain while staying deterministic: each chunk c gets its own
+// independently-derived starting state (seed XOR'd with c's own splitmix64
+// constant, then avalanched once), so element i's value depends ONLY on
+// (seed, i) via its chunk index and in-chunk offset — never on how many
+// threads ran, which thread drew which chunk, or the host's core count.
+// CHUNK is a fixed compile-time constant (not derived from
+// dispatch_apply's actual concurrency), so the exact same (seed, n) always
+// produces the exact same mask on any machine — this is the determinism
+// nncp requires (same seed -> same mask), NOT bit-exact equality with the
+// old single-chunk sequential stream (retrain's actual dropout PATTERN
+// changes with this commit; its reproducibility given a seed does not).
+static const size_t NNCP_DROPOUT_FILL_CHUNK = 8192;
+static inline void nncp_fill_dropout_mask_chunk(float* mask, size_t off, size_t len,
+                                                  float rate, uint64_t chunk_seed) {
+    uint64_t state = chunk_seed;
     const float keep_scale = 1.0f / (1.0f - rate);
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < len; i++) {
         uint64_t r = nncp_splitmix64_next(state);
         // top 24 bits → uniform float in [0,1)
         float u = (float)(r >> 40) * (1.0f / 16777216.0f);
-        mask[i] = (u >= rate) ? keep_scale : 0.0f;
+        mask[off + i] = (u >= rate) ? keep_scale : 0.0f;
     }
+}
+static void nncp_fill_dropout_mask(float* mask, size_t n, float rate, uint64_t seed) {
+    const size_t n_chunks = (n + NNCP_DROPOUT_FILL_CHUNK - 1) / NNCP_DROPOUT_FILL_CHUNK;
+    if (n_chunks <= 1) {
+        uint64_t chunk_seed = seed ^ (uint64_t)(0 * 0x9E3779B97F4A7C15ULL);
+        chunk_seed = nncp_splitmix64_next(chunk_seed);
+        nncp_fill_dropout_mask_chunk(mask, 0, n, rate, chunk_seed);
+        return;
+    }
+    dispatch_apply(n_chunks, DISPATCH_APPLY_AUTO, ^(size_t c) {
+        const size_t off = c * NNCP_DROPOUT_FILL_CHUNK;
+        const size_t len = (n - off < NNCP_DROPOUT_FILL_CHUNK) ? (n - off) : NNCP_DROPOUT_FILL_CHUNK;
+        uint64_t chunk_seed = seed ^ (uint64_t)(c * 0x9E3779B97F4A7C15ULL);
+        chunk_seed = nncp_splitmix64_next(chunk_seed);  // avalanche seed/c mix before use
+        nncp_fill_dropout_mask_chunk(mask, off, len, rate, chunk_seed);
+    });
 }
 
 // identity-mask tax fix (2026-07-13, T1即効枠): rate==0.0f always produces
