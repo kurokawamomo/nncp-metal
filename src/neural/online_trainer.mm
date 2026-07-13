@@ -3801,19 +3801,58 @@ static void build_loss_bwd(OnlineTrainer* tr) {
     // zero. grad_out = Σ_row x_row⊗d_logits_row picks up a genuine IEEE754
     // NaN×0=NaN term from that one row and poisons the WHOLE sum, even
     // though the row's real contribution is zero either way — this is
-    // deterministic (same step reproduces identically, not a race), so
-    // masking it here is mathematically neutral: rows where x is already
-    // finite are a no-op; the rare NaN row's contribution changes from
-    // "NaN" to the "0" it should have contributed anyway. selectWithPredicate
-    // Tensor's gradient w.r.t. its untaken branch is the (0/1) mask itself
-    // (not a function of x's actual value), so autodiff naturally
-    // propagates a clean 0 gradient back through LN_FINAL/w_ln_final for
-    // the masked row too — grad_in and dw_ln_final are protected by the
-    // exact same mechanism as dw_out, no separate manual re-derivation
-    // needed (this is what makes it "厳密等価", not merely "close enough").
+    // deterministic (same step reproduces identically, not a race).
+    //
+    // nan_fix3 (2026-07-14, HQ regression report — 30seg smoke 36,552B ->
+    // 47,220B with ZERO shield fires): the first version of this shield used
+    // selectWithPredicateTensor:truePredicateTensor:falsePredicateTensor:,
+    // whose FORWARD value is correct (verified standalone) but whose
+    // GRADIENT is broken on this system's MPSGraph — gradientForPrimaryTensor:
+    // returns an all-zero gradient for BOTH branches of select, confirmed by
+    // a standalone MPSGraph harness (mpsgraph_grad_test.mm/_select_only.mm)
+    // reproducing the exact expression with and without NaN present, and
+    // with the predicate as either a self-comparison or an independent
+    // placeholder — all cases came back dx=[0,0,0,0] where a non-select
+    // control (plain multiply) came back correct. So even when the shield
+    // never masks anything (0 fires, matching HQ's report), its mere
+    // PRESENCE zeroed grad_in/dw_ln_final's contribution from x_ln_final on
+    // EVERY step — killing the loss-stage gradient signal into LN_FINAL and
+    // the whole per-layer backward chain (grad_in becomes tr->pl_dh, the
+    // seed for all L layers), matching a broad training-quality regression
+    // with no gradient ever registering as literally non-finite.
+    //
+    // Fixed by dropping select entirely, using only ops with confirmed-
+    // working gradients:
+    //   1. Clamp x to a wide bound via minimum/maximum — MPS min/max
+    //      SUPPRESS NaN (return the finite operand, like C's fmin/fmax, NOT
+    //      IEEE-propagate it — confirmed standalone), converting a NaN
+    //      element into a large-but-finite boundary value. This is the same
+    //      mechanism already used two lines below for the logits ±50 clamp,
+    //      and the same reason NAN_TRACE2 found d_logits finite despite
+    //      x_ln_final being NaN — the ±50 clamp on logits was ALREADY doing
+    //      this suppression downstream; this clamp does it for x itself,
+    //      before that point. ±1e6 is far outside any value LN_FINAL's
+    //      output should ever legitimately take (RMSNorm output is O(1)-
+    //      O(10) scale), so this is a no-op for every normal, non-corrupted
+    //      element — bit-exact preserved on the common path.
+    //   2. mask = float(x == x) (still self-comparison — confirmed reliable
+    //      for VALUE computation standalone) multiplied (not select'd) onto
+    //      the clamped x. Multiplication's gradient (d(a*b)/da = b) is
+    //      standard and confirmed working standalone even when b is itself
+    //      derived from a self-comparison of the SAME tensor being
+    //      differentiated — the earlier select-based version's bug was
+    //      specific to select, not to reusing x in a comparison.
+    // Net effect for a finite row: clamp is a no-op, mask=1, x unchanged.
+    // For a NaN row: clamp converts NaN->finite boundary value, mask=0,
+    // clamped_finite*0=0 (no more NaN*0=NaN — the value is finite BEFORE
+    // the zeroing multiply, not after).
     MPSGraphTensor* x_is_finite = [g equalWithPrimaryTensor:x secondaryTensor:x name:nil];  // false only where NaN (NaN != NaN)
-    MPSGraphTensor* x_zeros     = [g constantWithScalar:0.0 shape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32];
-    x = [g selectWithPredicateTensor:x_is_finite truePredicateTensor:x falsePredicateTensor:x_zeros name:nil];
+    MPSGraphTensor* x_clamp_hi  = [g constantWithScalar:1.0e6 shape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* x_clamp_lo  = [g constantWithScalar:-1.0e6 shape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* x_clamped   = [g minimumWithPrimaryTensor:x secondaryTensor:x_clamp_hi name:nil];
+    x_clamped = [g maximumWithPrimaryTensor:x_clamped secondaryTensor:x_clamp_lo name:nil];
+    MPSGraphTensor* x_mask_f = [g castTensor:x_is_finite toType:MPSDataTypeFloat32 name:nil];
+    x = [g multiplicationWithPrimaryTensor:x_clamped secondaryTensor:x_mask_f name:nil];
 
     // nan_fix2 ②: this shield makes grad_ln_final (NAN_TRACE's existing
     // canary) finite again by construction — which would silently starve
