@@ -525,6 +525,11 @@ struct LossBwdGraph {
     // gradientForPrimaryTensor:withTensors: call below.
     MPSGraphTensor*  t_x_ln_final;
     MPSGraphTensor*  t_d_logits;
+    // nan_fix2 ②: scalar count of non-finite x_ln_final elements masked by
+    // the NaN-row shield this step — always bound/read (cheap, 1 float),
+    // used as an ADDITIONAL trace trigger since the shield itself makes
+    // grad_ln_final finite again (see build_loss_bwd's shield comment).
+    MPSGraphTensor*  t_shield_count;
 };
 
 // ---------------------------------------------------------------------------
@@ -1385,6 +1390,10 @@ struct OnlineTrainer {
     id<MTLBuffer>   nan_trace_x_ln_final;  // [BT, H]
     id<MTLBuffer>   nan_trace_d_logits;    // [BT, V]
     id<MTLBuffer>   loss_scalar_buf;    // scalar
+    // nan_fix2 ②: always allocated/read (production, not trace-gated) —
+    // see LossBwdGraph.t_shield_count.
+    id<MTLBuffer>   shield_count_buf;   // scalar
+    float           last_shield_count;  // CPU copy, read by online_trainer_train_segment_batch
 
     // Dropout spike (2026-07-04, plan-A-quality-first (b)): mask-multiply
     // dropout, hooks #4 (attn_out) / #6 (FF2-out). Generated once per (layer,
@@ -3780,7 +3789,45 @@ static void build_loss_bwd(OnlineTrainer* tr) {
     MPSGraphTensor* gf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* bf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* x = tr_layer_norm(g, ctx.x_in, gf, bf);
-    ctx.t_x_ln_final = x;  // trace v2: capture BEFORE the dropout-mask multiply
+    ctx.t_x_ln_final = x;  // trace v2: capture the RAW (pre-shield) value below, so
+                           // NNCP_NAN_TRACE can still see the actual NaN if present.
+
+    // NaN-row shield (2026-07-13, nan_fix2 — NAN_TRACE2 root-caused the
+    // grad_out NaN): a specific row of x_ln_final (empirically: one
+    // (stream,t=0-in-segment) row, upstream forward cause still under
+    // investigation via the layer-bisection canary below) comes out NaN
+    // while that SAME row's d_logits is confirmed exactly zero — i.e. this
+    // row's true contribution to the loss is (and was always meant to be)
+    // zero. grad_out = Σ_row x_row⊗d_logits_row picks up a genuine IEEE754
+    // NaN×0=NaN term from that one row and poisons the WHOLE sum, even
+    // though the row's real contribution is zero either way — this is
+    // deterministic (same step reproduces identically, not a race), so
+    // masking it here is mathematically neutral: rows where x is already
+    // finite are a no-op; the rare NaN row's contribution changes from
+    // "NaN" to the "0" it should have contributed anyway. selectWithPredicate
+    // Tensor's gradient w.r.t. its untaken branch is the (0/1) mask itself
+    // (not a function of x's actual value), so autodiff naturally
+    // propagates a clean 0 gradient back through LN_FINAL/w_ln_final for
+    // the masked row too — grad_in and dw_ln_final are protected by the
+    // exact same mechanism as dw_out, no separate manual re-derivation
+    // needed (this is what makes it "厳密等価", not merely "close enough").
+    MPSGraphTensor* x_is_finite = [g equalWithPrimaryTensor:x secondaryTensor:x name:nil];  // false only where NaN (NaN != NaN)
+    MPSGraphTensor* x_zeros     = [g constantWithScalar:0.0 shape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32];
+    x = [g selectWithPredicateTensor:x_is_finite truePredicateTensor:x falsePredicateTensor:x_zeros name:nil];
+
+    // nan_fix2 ②: this shield makes grad_ln_final (NAN_TRACE's existing
+    // canary) finite again by construction — which would silently starve
+    // future task-② investigation of any trigger. Count masked elements
+    // (scalar reductionSum of the inverse mask) so a downstream, always-
+    // computed-but-cheap CPU readback can detect "the shield fired this
+    // step" directly, independent of whether any gradient still ends up
+    // non-finite.
+    MPSGraphTensor* x_is_finite_f = [g castTensor:x_is_finite toType:MPSDataTypeFloat32 name:nil];
+    MPSGraphTensor* x_nonfinite_f = [g subtractionWithPrimaryTensor:
+        [g constantWithScalar:1.0 shape:@[@(BT), @(H)] dataType:MPSDataTypeFloat32]
+        secondaryTensor:x_is_finite_f name:nil];
+    ctx.t_shield_count = [g reductionSumWithTensor:x_nonfinite_f axes:@[@0, @1] name:nil];
+
     if (ctx.mask_final) x = [g multiplicationWithPrimaryTensor:x secondaryTensor:ctx.mask_final name:nil];
 
     // Output projection + clamp
@@ -4366,6 +4413,53 @@ static void nncp_nan_trace_report(OnlineTrainer* tr, uint32_t L, uint32_t H, uin
     fprintf(stderr, "[NAN_TRACE] step=%llu %s: canary flagged non-finite but full scan found nothing "
             "(race or canary/scan buffer mismatch — investigate)\n",
             (unsigned long long)step, is_retrain ? "retrain" : "online");
+}
+
+// [NAN_TRACE_FWD] (2026-07-13, nan_fix2 ②): the mask added in build_loss_bwd
+// stops the NaN×0=NaN grad_out poisoning (safety net), but doesn't explain
+// WHY x_ln_final's row goes non-finite in the first place for certain
+// (segment, stream, t) — that's this canary's job: bisect tr->pl_h[0..L]
+// (pl_h[0] = CPU embedding output, pl_h[i+1] = layer i's forward output,
+// pl_h[L] = the final hidden state fed into LN_FINAL) to find the FIRST
+// index whose buffer contains a non-finite value. Uses binary search
+// (as requested) on the assumption that once a layer's output goes
+// non-finite, every later layer's output does too (true for the ordinary
+// residual/LN/matmul math this model uses — NaN doesn't "heal" back to
+// finite by itself); if that assumption is ever violated this still
+// terminates and reports A non-finite layer, just not provably the FIRST
+// one in that pathological case. pl_h[] buffers are NOT overwritten again
+// until the NEXT segment's forward pass starts, so by the time this runs
+// (post-backward, post-clip_gradients) they still hold THIS step's values.
+static bool nncp_pl_h_has_nonfinite(id<MTLBuffer> buf, size_t n) {
+    if (!buf || n == 0) return false;
+    const float* p = (const float*)[buf contents];
+    for (size_t i = 0; i < n; i++) if (!isfinite(p[i])) return true;
+    return false;
+}
+static void nncp_nan_trace_fwd_canary(OnlineTrainer* tr, uint32_t L, uint32_t H,
+                                       uint64_t step, bool is_retrain) {
+    const size_t n = (size_t)BPTT_CHUNK_BT * H;
+    if (!nncp_pl_h_has_nonfinite(tr->pl_h[L], n)) {
+        fprintf(stderr, "[NAN_TRACE_FWD] step=%llu %s: pl_h[0..%u] all finite — the NaN this step's "
+                "backward hit must have arisen at/after LN_FINAL (outside the per-layer forward chain), "
+                "or pl_h[] was already overwritten by a later call before this canary ran\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online", L);
+        return;
+    }
+    int lo = 0, hi = (int)L;  // pl_h[hi] already confirmed non-finite above
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (nncp_pl_h_has_nonfinite(tr->pl_h[mid], n)) hi = mid; else lo = mid + 1;
+    }
+    if (lo == 0) {
+        fprintf(stderr, "[NAN_TRACE_FWD] step=%llu %s: first non-finite forward buffer is pl_h[0] "
+                "(CPU embedding output, BEFORE any transformer layer runs)\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online");
+    } else {
+        fprintf(stderr, "[NAN_TRACE_FWD] step=%llu %s: first non-finite forward buffer is pl_h[%d] "
+                "= layer %d's output (binary search over pl_h[0..%u])\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online", lo, lo - 1, L);
+    }
 }
 
 static void apply_sgd(id<MTLComputeCommandEncoder> enc,
@@ -7867,12 +7961,16 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         if (!tr->loss_scalar_buf)
             tr->loss_scalar_buf = [tr->device newBufferWithLength:sizeof(float)
                                                             options:MTLResourceStorageModeShared];
+        if (!tr->shield_count_buf)
+            tr->shield_count_buf = [tr->device newBufferWithLength:sizeof(float)
+                                                             options:MTLResourceStorageModeShared];
         NSMutableDictionary* out = [NSMutableDictionary dictionary];
         out[lg.loss] = floatTD(tr->loss_scalar_buf, @[]);
         if (lg.grad_in)     out[lg.grad_in]     = floatTD(tr->pl_dh,        shape_h);
         if (lg.dw_ln_final) out[lg.dw_ln_final] = floatTD(tr->grad_ln_final, @[@2, @(H)]);
         if (lg.dw_out)      out[lg.dw_out]      = floatTD(tr->grad_out,    @[@(H), @(V)]);
         if (lg.db_out)      out[lg.db_out]      = floatTD(tr->grad_b_out,  @[@(V)]);
+        if (lg.t_shield_count) out[lg.t_shield_count] = floatTD(tr->shield_count_buf, @[]);
 
         // NAN_TRACE v2 (2026-07-13): x_ln_final/d_logits capture stays
         // opt-in — they're diagnostic-only extra targets, not needed for the
@@ -7898,6 +7996,12 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             [loss_fence waitUntilCompleted];
         }
         loss_val = *(const float*)[tr->loss_scalar_buf contents];
+        tr->last_shield_count = *(const float*)[tr->shield_count_buf contents];
+        if (tr->last_shield_count > 0.5f) {
+            fprintf(stderr, "[NAN_SHIELD] step=%llu %s masked_elements=%.0f (x_ln_final NaN-row shield fired — see build_loss_bwd)\n",
+                    (unsigned long long)(tr->is_retrain ? tr->retrain_train_step : tr->train_step),
+                    tr->is_retrain ? "retrain" : "online", tr->last_shield_count);
+        }
         // grad_in/dw_ln_final/dw_out/db_out were written directly into their
         // final destinations above (copy_grads==true always here) — no
         // putGrad copy/accumulate step needed.
@@ -8733,11 +8837,25 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             // non-finite together with the rest on an affected step — unlike
             // grad_b_out, which is the one tensor that never does and so would
             // make a useless canary).
+            // nan_fix2: the build_loss_bwd shield makes grad_ln_final finite
+            // again by construction whenever it fires — so grad_ln_final
+            // alone is no longer a reliable trigger for THIS mechanism.
+            // tr->last_shield_count (always computed, see the loss-stage
+            // block above) catches it directly; kept alongside the original
+            // grad_ln_final check in case some OTHER, still-unshielded path
+            // produces a non-finite gradient.
             if (nncp_nan_trace_enabled() &&
-                nncp_grad_has_nonfinite(tr->grad_ln_final, (size_t)2 * H)) {
+                (nncp_grad_has_nonfinite(tr->grad_ln_final, (size_t)2 * H) ||
+                 tr->last_shield_count > 0.5f)) {
                 const size_t FFN1_MULT_trace = (g_nncp_profile.h == 1024) ? 2UL : 1UL;
                 nncp_nan_trace_report(tr, L, H, F, FFN1_MULT_trace,
                                        g_nncp_profile.h == 1024, _eff_step, tr->is_retrain);
+                // nan_fix2 ②: layer-bisection forward canary — find which
+                // pl_h[] buffer (embedding output or a specific layer's
+                // output) is the first to go non-finite this step, to
+                // localize the upstream root cause the loss-graph shield
+                // (build_loss_bwd) papers over but doesn't explain.
+                nncp_nan_trace_fwd_canary(tr, L, H, _eff_step, tr->is_retrain);
             }
 
             // NO-GO triage: grad_out/grad_b_out/grad_ln_final norms as fed to
