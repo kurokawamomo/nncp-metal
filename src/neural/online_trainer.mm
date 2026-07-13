@@ -517,6 +517,14 @@ struct LossBwdGraph {
     MPSGraphTensor*  loss;       // scalar
     MPSGraphTensor*  grad_in;    // [BT, H]
     MPSGraphTensor*  dw_ln_final, *dw_out, *db_out;
+    // trace v2 (2026-07-13, nan_trace2): diagnostic-only extra targets, only
+    // ever bound/read when NNCP_NAN_TRACE=1 — see run_per_layer_bptt_chunk's
+    // loss-stage block. t_x_ln_final: LN_FINAL's output (post-LN, pre-
+    // dropout-mask/pre-out_proj), [BT,H]. t_d_logits: d(loss)/d(logits)
+    // (post ±50 clamp), [BT,V] — obtained by adding `logits` itself to the
+    // gradientForPrimaryTensor:withTensors: call below.
+    MPSGraphTensor*  t_x_ln_final;
+    MPSGraphTensor*  t_d_logits;
 };
 
 // ---------------------------------------------------------------------------
@@ -1371,6 +1379,12 @@ struct OnlineTrainer {
     id<MTLBuffer>   xcmp_attn_out_buf;
     id<MTLBuffer>   xcmp_ffn_act_buf;
     id<MTLBuffer>   xcmp_attn_pre_o_buf;  // ATTN_ARB: same definition as decode's dumped attn_out
+
+    // trace v2 (2026-07-13, nan_trace2): lazily allocated only when
+    // NNCP_NAN_TRACE=1 — see the loss-stage block in run_per_layer_bptt_chunk.
+    id<MTLBuffer>   nan_trace_x_ln_final;  // [BT, H]
+    id<MTLBuffer>   nan_trace_d_logits;    // [BT, V]
+    id<MTLBuffer>   nan_trace_loss_buf;    // scalar
 
     // Dropout spike (2026-07-04, plan-A-quality-first (b)): mask-multiply
     // dropout, hooks #4 (attn_out) / #6 (FF2-out). Generated once per (layer,
@@ -3766,6 +3780,7 @@ static void build_loss_bwd(OnlineTrainer* tr) {
     MPSGraphTensor* gf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:0 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* bf = [g reshapeTensor:[g sliceTensor:ctx.w_ln_final dimension:0 start:1 length:1 name:nil] withShape:@[@(H)] name:nil];
     MPSGraphTensor* x = tr_layer_norm(g, ctx.x_in, gf, bf);
+    ctx.t_x_ln_final = x;  // trace v2: capture BEFORE the dropout-mask multiply
     if (ctx.mask_final) x = [g multiplicationWithPrimaryTensor:x secondaryTensor:ctx.mask_final name:nil];
 
     // Output projection + clamp
@@ -3786,7 +3801,11 @@ static void build_loss_bwd(OnlineTrainer* tr) {
                                                   axis:-1 reductionType:MPSGraphLossReductionTypeMean
                                                   name:@"pll_loss"];
 
-    NSArray<MPSGraphTensor*>* wt = @[ctx.x_in, ctx.w_ln_final, ctx.w_out, ctx.b_out];
+    // trace v2: add `logits` (post ±50 clamp, pre-softmax) to the gradient
+    // request so grads[logits] gives d(loss)/d(logits) = "d_logits" —
+    // otherwise never exposed since softMaxCrossEntropyWithSourceTensor
+    // computes it internally without surfacing it.
+    NSArray<MPSGraphTensor*>* wt = @[ctx.x_in, ctx.w_ln_final, ctx.w_out, ctx.b_out, logits];
     NSDictionary<MPSGraphTensor*, MPSGraphTensor*>* grads =
         [g gradientForPrimaryTensor:ctx.loss withTensors:wt name:nil];
 
@@ -3794,6 +3813,7 @@ static void build_loss_bwd(OnlineTrainer* tr) {
     ctx.dw_ln_final = grads[ctx.w_ln_final];
     ctx.dw_out      = grads[ctx.w_out];
     ctx.db_out      = grads[ctx.b_out];
+    ctx.t_d_logits  = grads[logits];
 }
 
 // Shared setup for relative PE index tables and causal mask used by all chunked graphs.
@@ -4209,6 +4229,63 @@ static void nncp_nan_trace_report(OnlineTrainer* tr, uint32_t L, uint32_t H, uin
                                    size_t FFN1_MULT, bool is_enwik8,
                                    uint64_t step, bool is_retrain) {
     size_t idx; float val;
+
+    // trace v2 (2026-07-13, nan_trace2): additional, always-printed evidence
+    // requested after the first NAN_TRACE capture showed a contradiction —
+    // grad_b_out finite (d_logits healthy at the bias) + loss itself finite
+    // (implying x_ln_final healthy) yet grad_out = x_ln_final^T @ d_logits
+    // non-finite. That combination doesn't fit a semantic/numeric-overflow
+    // explanation (two finite inputs to a matmul producing a non-finite
+    // output isn't possible via ordinary FP32 overflow unless the
+    // accumulation itself overflows, which is a different, checkable
+    // hypothesis) — it fits an execution-hazard explanation (stale/aliased
+    // scratch) at least as well. Report x_ln_final and d_logits directly so
+    // future captures can confirm/refute "both individually finite while
+    // grad_out isn't" without inference from indirect signals (loss value,
+    // grad_b_out) alone.
+    const size_t bt_trace = (size_t)BPTT_CHUNK_BT;
+    if (tr->nan_trace_x_ln_final) {
+        bool nf = nncp_scan_first_nonfinite(tr->nan_trace_x_ln_final, bt_trace * H, &idx, &val);
+        fprintf(stderr, "[NAN_TRACE2] step=%llu %s tensor=x_ln_final finite=%s%s\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online",
+                nf ? "false" : "true",
+                nf ? [[NSString stringWithFormat:@" first_elem_idx=%zu value=%g", idx, val] UTF8String] : "");
+    } else {
+        fprintf(stderr, "[NAN_TRACE2] step=%llu %s tensor=x_ln_final not_captured "
+                "(NNCP_NAN_TRACE was armed after this step's loss stage already ran, or graph lacks t_x_ln_final)\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online");
+    }
+    if (tr->nan_trace_d_logits) {
+        bool nf = nncp_scan_first_nonfinite(tr->nan_trace_d_logits, bt_trace * (size_t)tr->V, &idx, &val);
+        fprintf(stderr, "[NAN_TRACE2] step=%llu %s tensor=d_logits finite=%s%s\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online",
+                nf ? "false" : "true",
+                nf ? [[NSString stringWithFormat:@" first_elem_idx=%zu value=%g", idx, val] UTF8String] : "");
+    } else {
+        fprintf(stderr, "[NAN_TRACE2] step=%llu %s tensor=d_logits not_captured\n",
+                (unsigned long long)step, is_retrain ? "retrain" : "online");
+    }
+    // Fence-state finding (code review, 2026-07-13): the loss graph is now
+    // run via runWithMTLCommandQueue:...resultsDictionary: + an explicit
+    // commit+waitUntilCompleted drain (see run_per_layer_bptt_chunk's
+    // loss-stage block, nncp_nan_trace_enabled() branch) BEFORE this
+    // function's caller reads grad_out/grad_b_out/grad_ln_final/x_ln_final/
+    // d_logits — so by construction there is no missing-fence race on THIS
+    // read. The non-traced default path instead uses the synchronous
+    // runWithFeeds:targetTensors: API, which MPSGraph documents as blocking
+    // until GPU completion internally (no caller-side fence needed there
+    // either) — so no missing waitUntilCompleted was found on either path.
+    // The scratch-reuse hazard class (same-shape graph-internal tensor
+    // recycled within one multi-target runWithFeeds:targetTensors: call,
+    // the confirmed mechanism behind the 2026-07-03 t_Q_saved/xcmp bug) is
+    // the one candidate this commit actually closes off for grad_out et al:
+    // this trace-v2 path binds every target to a caller-owned buffer via
+    // resultsDictionary, which cannot alias graph-internal scratch.
+    fprintf(stderr, "[NAN_TRACE2] step=%llu %s fence_state=loss_graph_now_uses_resultsDictionary+explicit_drain "
+            "(no missing waitUntilCompleted found on either the traced or default path; "
+            "same-shape scratch-reuse hazard class is what this trace-v2 binding rules out for grad_out/db_out/dw_ln_final)\n",
+            (unsigned long long)step, is_retrain ? "retrain" : "online");
+
     // 1. Loss stage (LossBwdGraph, runs before the per-layer loop).
     struct { const char* name; id<MTLBuffer> buf; size_t n; } loss_stage[] = {
         {"grad_out",      tr->grad_out,      (size_t)H * tr->V},
@@ -7768,6 +7845,55 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             feeds[lg.mask_final] = floatTD(tr->dropout_mask_final, shape_h);
         }
 
+        if (nncp_nan_trace_enabled() && lg.t_x_ln_final && lg.t_d_logits) {
+            // trace v2 (2026-07-13, nan_trace2): bind EVERY target directly to
+            // a caller-owned buffer via resultsDictionary + an explicit drain
+            // fence, instead of the synchronous runWithFeeds:targetTensors:
+            // used in the else-branch below. Two reasons: (a) it lets us also
+            // capture x_ln_final/d_logits, which runWithFeeds:targetTensors:
+            // has no persistent buffer for; (b) it rules out the exact hazard
+            // class that bit t_Q_saved/xcmp before (2026-07-03 bug:
+            // runWithFeeds:targetTensors: hands back MPSGraphTensorData
+            // backed by graph-internal scratch, which MPSGraph's memory
+            // planner can recycle for another same-shape tensor within the
+            // SAME multi-target execution before the caller reads it back —
+            // suspected here as an alternative to a genuine numeric-overflow
+            // explanation for grad_out, since x_ln_final and d_logits were
+            // independently confirmed healthy). copy_grads is always true at
+            // this call site (run_per_layer_bptt_chunk has exactly one
+            // caller, with copy_grads=true — see online_trainer_train_
+            // segment_batch), so binding straight to the final destination
+            // buffers here is equivalent to the existing copyToBuffer path in
+            // the else-branch, not a behavior change.
+            if (!tr->nan_trace_x_ln_final)
+                tr->nan_trace_x_ln_final = [tr->device newBufferWithLength:(size_t)BT * H * sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+            if (!tr->nan_trace_d_logits)
+                tr->nan_trace_d_logits = [tr->device newBufferWithLength:(size_t)BT * V * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            if (!tr->nan_trace_loss_buf)
+                tr->nan_trace_loss_buf = [tr->device newBufferWithLength:sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            NSMutableDictionary* out = [NSMutableDictionary dictionary];
+            out[lg.loss] = floatTD(tr->nan_trace_loss_buf, @[]);
+            if (lg.grad_in)      out[lg.grad_in]      = floatTD(tr->pl_dh,        shape_h);
+            if (lg.dw_ln_final)  out[lg.dw_ln_final]   = floatTD(tr->grad_ln_final, @[@2, @(H)]);
+            if (lg.dw_out)       out[lg.dw_out]        = floatTD(tr->grad_out,    @[@(H), @(V)]);
+            if (lg.db_out)       out[lg.db_out]        = floatTD(tr->grad_b_out,  @[@(V)]);
+            out[lg.t_x_ln_final] = floatTD(tr->nan_trace_x_ln_final, shape_h);
+            out[lg.t_d_logits]   = floatTD(tr->nan_trace_d_logits,  @[@(BT), @(V)]);
+            [lg.graph runWithMTLCommandQueue:tr->cmdQueue feeds:feeds
+                            targetOperations:nil resultsDictionary:out];
+            {
+                id<MTLCommandBuffer> loss_fence = [tr->cmdQueue commandBuffer];
+                [loss_fence commit];
+                [loss_fence waitUntilCompleted];
+            }
+            loss_val = *(const float*)[tr->nan_trace_loss_buf contents];
+            // grad_in/dw_ln_final/dw_out/db_out were written directly into
+            // their final destinations above (copy_grads==true always here)
+            // — no putGrad copy/accumulate step needed, unlike the else-branch.
+        } else {
         NSMutableArray* targets = [NSMutableArray array];
         [targets addObject:lg.loss];
         if (lg.grad_in)     [targets addObject:lg.grad_in];
@@ -7784,6 +7910,7 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         putGrad(tr->grad_ln_final, res[lg.dw_ln_final]);
         putGrad(tr->grad_out,      res[lg.dw_out]);
         putGrad(tr->grad_b_out,    res[lg.db_out]);
+        }
     }
     if (nncp_bptt_profile_enabled()) g_bptt_prof.loss_ms += nncp_bptt_now_ms() - bptt_prof_t_loss0;
 
