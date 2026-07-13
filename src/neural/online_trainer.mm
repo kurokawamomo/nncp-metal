@@ -1384,7 +1384,7 @@ struct OnlineTrainer {
     // NNCP_NAN_TRACE=1 — see the loss-stage block in run_per_layer_bptt_chunk.
     id<MTLBuffer>   nan_trace_x_ln_final;  // [BT, H]
     id<MTLBuffer>   nan_trace_d_logits;    // [BT, V]
-    id<MTLBuffer>   nan_trace_loss_buf;    // scalar
+    id<MTLBuffer>   loss_scalar_buf;    // scalar
 
     // Dropout spike (2026-07-04, plan-A-quality-first (b)): mask-multiply
     // dropout, hooks #4 (attn_out) / #6 (FF2-out). Generated once per (layer,
@@ -7845,72 +7845,62 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
             feeds[lg.mask_final] = floatTD(tr->dropout_mask_final, shape_h);
         }
 
-        if (nncp_nan_trace_enabled() && lg.t_x_ln_final && lg.t_d_logits) {
-            // trace v2 (2026-07-13, nan_trace2): bind EVERY target directly to
-            // a caller-owned buffer via resultsDictionary + an explicit drain
-            // fence, instead of the synchronous runWithFeeds:targetTensors:
-            // used in the else-branch below. Two reasons: (a) it lets us also
-            // capture x_ln_final/d_logits, which runWithFeeds:targetTensors:
-            // has no persistent buffer for; (b) it rules out the exact hazard
-            // class that bit t_Q_saved/xcmp before (2026-07-03 bug:
-            // runWithFeeds:targetTensors: hands back MPSGraphTensorData
-            // backed by graph-internal scratch, which MPSGraph's memory
-            // planner can recycle for another same-shape tensor within the
-            // SAME multi-target execution before the caller reads it back —
-            // suspected here as an alternative to a genuine numeric-overflow
-            // explanation for grad_out, since x_ln_final and d_logits were
-            // independently confirmed healthy). copy_grads is always true at
-            // this call site (run_per_layer_bptt_chunk has exactly one
-            // caller, with copy_grads=true — see online_trainer_train_
-            // segment_batch), so binding straight to the final destination
-            // buffers here is equivalent to the existing copyToBuffer path in
-            // the else-branch, not a behavior change.
+        // loss_rd_fix (2026-07-13, made unconditional — was trace-only in
+        // ce6d7fe): confirmed load-bearing, not just a diagnostic hardening.
+        // A judge2kb64-style run hit permanent-NaN mode from step 1614
+        // onward (every apply_sgd/apply_rmsprop call skipped -> model frozen
+        // -> coded bpc regressed 1.75->1.92, run had to be stopped) — the
+        // old runWithFeeds:targetTensors: API (still live in the untraced
+        // default path below until this commit) hands back MPSGraphTensor-
+        // Data backed by graph-internal scratch, which MPSGraph's memory
+        // planner can recycle for another same-shape tensor within the SAME
+        // multi-target execution before the caller reads it back — the same
+        // hazard class already fixed once for t_Q_saved/xcmp (2026-07-03).
+        // Binding every target straight to a caller-owned buffer via
+        // resultsDictionary cannot alias graph-internal scratch, closing
+        // this off for good rather than only when NNCP_NAN_TRACE=1 happens
+        // to be set. copy_grads is always true at this call site
+        // (run_per_layer_bptt_chunk has exactly one caller, with
+        // copy_grads=true — see online_trainer_train_segment_batch), so
+        // binding straight to the final destination buffers is equivalent
+        // to the old copyToBuffer path, not a behavior change on its own.
+        if (!tr->loss_scalar_buf)
+            tr->loss_scalar_buf = [tr->device newBufferWithLength:sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        NSMutableDictionary* out = [NSMutableDictionary dictionary];
+        out[lg.loss] = floatTD(tr->loss_scalar_buf, @[]);
+        if (lg.grad_in)     out[lg.grad_in]     = floatTD(tr->pl_dh,        shape_h);
+        if (lg.dw_ln_final) out[lg.dw_ln_final] = floatTD(tr->grad_ln_final, @[@2, @(H)]);
+        if (lg.dw_out)      out[lg.dw_out]      = floatTD(tr->grad_out,    @[@(H), @(V)]);
+        if (lg.db_out)      out[lg.db_out]      = floatTD(tr->grad_b_out,  @[@(V)]);
+
+        // NAN_TRACE v2 (2026-07-13): x_ln_final/d_logits capture stays
+        // opt-in — they're diagnostic-only extra targets, not needed for the
+        // production update itself, and allocating/writing their (~10MB
+        // combined) buffers every step isn't worth paying for unconditionally.
+        const bool trace_extra = nncp_nan_trace_enabled() && lg.t_x_ln_final && lg.t_d_logits;
+        if (trace_extra) {
             if (!tr->nan_trace_x_ln_final)
                 tr->nan_trace_x_ln_final = [tr->device newBufferWithLength:(size_t)BT * H * sizeof(float)
                                                                      options:MTLResourceStorageModeShared];
             if (!tr->nan_trace_d_logits)
                 tr->nan_trace_d_logits = [tr->device newBufferWithLength:(size_t)BT * V * sizeof(float)
                                                                    options:MTLResourceStorageModeShared];
-            if (!tr->nan_trace_loss_buf)
-                tr->nan_trace_loss_buf = [tr->device newBufferWithLength:sizeof(float)
-                                                                   options:MTLResourceStorageModeShared];
-            NSMutableDictionary* out = [NSMutableDictionary dictionary];
-            out[lg.loss] = floatTD(tr->nan_trace_loss_buf, @[]);
-            if (lg.grad_in)      out[lg.grad_in]      = floatTD(tr->pl_dh,        shape_h);
-            if (lg.dw_ln_final)  out[lg.dw_ln_final]   = floatTD(tr->grad_ln_final, @[@2, @(H)]);
-            if (lg.dw_out)       out[lg.dw_out]        = floatTD(tr->grad_out,    @[@(H), @(V)]);
-            if (lg.db_out)       out[lg.db_out]        = floatTD(tr->grad_b_out,  @[@(V)]);
             out[lg.t_x_ln_final] = floatTD(tr->nan_trace_x_ln_final, shape_h);
             out[lg.t_d_logits]   = floatTD(tr->nan_trace_d_logits,  @[@(BT), @(V)]);
-            [lg.graph runWithMTLCommandQueue:tr->cmdQueue feeds:feeds
-                            targetOperations:nil resultsDictionary:out];
-            {
-                id<MTLCommandBuffer> loss_fence = [tr->cmdQueue commandBuffer];
-                [loss_fence commit];
-                [loss_fence waitUntilCompleted];
-            }
-            loss_val = *(const float*)[tr->nan_trace_loss_buf contents];
-            // grad_in/dw_ln_final/dw_out/db_out were written directly into
-            // their final destinations above (copy_grads==true always here)
-            // — no putGrad copy/accumulate step needed, unlike the else-branch.
-        } else {
-        NSMutableArray* targets = [NSMutableArray array];
-        [targets addObject:lg.loss];
-        if (lg.grad_in)     [targets addObject:lg.grad_in];
-        if (lg.dw_ln_final) [targets addObject:lg.dw_ln_final];
-        if (lg.dw_out)      [targets addObject:lg.dw_out];
-        if (lg.db_out)      [targets addObject:lg.db_out];
-
-        NSDictionary* res = [lg.graph runWithFeeds:feeds targetTensors:targets targetOperations:nil];
-        MPSGraphTensorData* lossData = res[lg.loss];
-        if (lossData) [lossData.mpsndarray readBytes:&loss_val strideBytes:NULL];
-        copyToBuffer(tr->pl_dh, res[lg.grad_in]);
-
-        auto putGrad = copy_grads ? copyToBuffer : addToBuffer;
-        putGrad(tr->grad_ln_final, res[lg.dw_ln_final]);
-        putGrad(tr->grad_out,      res[lg.dw_out]);
-        putGrad(tr->grad_b_out,    res[lg.db_out]);
         }
+
+        [lg.graph runWithMTLCommandQueue:tr->cmdQueue feeds:feeds
+                        targetOperations:nil resultsDictionary:out];
+        {
+            id<MTLCommandBuffer> loss_fence = [tr->cmdQueue commandBuffer];
+            [loss_fence commit];
+            [loss_fence waitUntilCompleted];
+        }
+        loss_val = *(const float*)[tr->loss_scalar_buf contents];
+        // grad_in/dw_ln_final/dw_out/db_out were written directly into their
+        // final destinations above (copy_grads==true always here) — no
+        // putGrad copy/accumulate step needed.
     }
     if (nncp_bptt_profile_enabled()) g_bptt_prof.loss_ms += nncp_bptt_now_ms() - bptt_prof_t_loss0;
 
