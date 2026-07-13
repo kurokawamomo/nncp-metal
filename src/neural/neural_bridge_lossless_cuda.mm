@@ -1699,6 +1699,17 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
                     if (rt_step != 1) fprintf(stderr, "[RETRAIN] NNCP_RETRAIN_STEP=%d\n", rt_step);
                 }
                 const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step;
+                // rt_progress (2026-07-13, small UX fix): retrain's inner loop
+                // has no per-segment stdout write, so the outer compress-loop's
+                // "\rcompress NN.N%" line (last written before retrain started)
+                // just sits frozen on screen for however long retrain takes —
+                // indistinguishable from a hang without reading [LOSS]/[LR-DEBUG]
+                // step numbers. rt_total_segs is computed up front (pure
+                // arithmetic on rt_stride/rt_pos_inc, matching the while loop's
+                // own termination condition) so the printed fraction is exact,
+                // not an estimate.
+                const size_t rt_total_segs = (rt_stride >= (size_t)rt_seg_len)
+                    ? ((rt_stride - (size_t)rt_seg_len) / rt_pos_inc + 1) : 0;
                 while (rt_pos + rt_seg_len <= rt_stride) {
                     for (int s = 0; s < rt_n_streams; s++) {
                         for (int t = 0; t < rt_seg_len; t++) {
@@ -1716,6 +1727,12 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
 
                     rt_pos += rt_pos_inc;
                     rt_seg_count++;
+                    if (rt_seg_count % 100 == 0) {
+                        double rt_pct = rt_total_segs
+                            ? (100.0 * (double)rt_seg_count / (double)rt_total_segs) : 0.0;
+                        fprintf(stderr, "retrain block=%zu seg=%zu/%zu (%.1f%%)\n",
+                                block_num, rt_seg_count, rt_total_segs, rt_pct);
+                    }
                 }
                 uint64_t rt_t1 = mach_absolute_time();
                 double rt_ms = (double)(rt_t1 - rt_t0) * g_tb.numer / g_tb.denom * 1e-6;
@@ -2076,6 +2093,11 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                     rt_step2 = (e && atoi(e) > 0) ? atoi(e) : 1;
                 }
                 const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step2;
+                // rt_progress: mirrors the compress-side progress line (see its
+                // comment) so decompress-side retrain doesn't look hung either.
+                const size_t rt_total_segs = (rt_stride >= (size_t)rt_seg_len)
+                    ? ((rt_stride - (size_t)rt_seg_len) / rt_pos_inc + 1) : 0;
+                size_t rt_seg_count = 0;
                 while (rt_pos + rt_seg_len <= rt_stride) {
                     for (int s = 0; s < rt_n_streams; s++) {
                         for (int t = 0; t < rt_seg_len; t++) {
@@ -2089,6 +2111,13 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
                     online_trainer_train_segment_batch(g_online_trainer,
                         rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
                     rt_pos += rt_pos_inc;
+                    rt_seg_count++;
+                    if (rt_seg_count % 100 == 0) {
+                        double rt_pct = rt_total_segs
+                            ? (100.0 * (double)rt_seg_count / (double)rt_total_segs) : 0.0;
+                        fprintf(stderr, "retrain block=%zu seg=%zu/%zu (%.1f%%)\n",
+                                block_num, rt_seg_count, rt_total_segs, rt_pct);
+                    }
                 }
 
                 free(rt_inputs);
