@@ -622,6 +622,11 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_attn_val_bw_dV_batched_amx;
     id<MTLComputePipelineState> ps_attn_val_bw_dScores_batched_amx;
     id<MTLComputePipelineState> ps_attn_out_preO_recompute_batched_amx;
+    // t2_amx2 (2026-07-14, follow-up): AMX-tiled siblings of rel_pe_q_grad_
+    // dQrel/dWrel_batched — bw_verify.mm confirmed numerically equivalent
+    // (run_rel_pe_q_grad_batched_amx_realdim).
+    id<MTLComputePipelineState> ps_rel_pe_q_grad_dQrel_batched_amx;
+    id<MTLComputePipelineState> ps_rel_pe_q_grad_dWrel_batched_amx;
     id<MTLComputePipelineState> ps_linear_bw_weight_acc;   // linear_bw_weight_acc_amx
     id<MTLComputePipelineState> ps_reshape_to_mh;          // reshape_to_multihead
     id<MTLComputePipelineState> ps_reshape_from_mh;        // reshape_from_multihead
@@ -785,6 +790,8 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_attn_val_bw_dV_batched_amx          = load(@"attn_val_bw_dV_batched_amx");
     m2->ps_attn_val_bw_dScores_batched_amx     = load(@"attn_val_bw_dScores_batched_amx");
     m2->ps_attn_out_preO_recompute_batched_amx = load(@"attn_out_preO_recompute_batched_amx");
+    m2->ps_rel_pe_q_grad_dQrel_batched_amx = load(@"rel_pe_q_grad_dQrel_batched_amx");
+    m2->ps_rel_pe_q_grad_dWrel_batched_amx = load(@"rel_pe_q_grad_dWrel_batched_amx");
     m2->ps_linear_bw_weight_acc = load(@"linear_bw_weight_acc_amx");
     m2->ps_reshape_to_mh      = load(@"reshape_to_multihead");
     m2->ps_reshape_from_mh    = load(@"reshape_from_multihead");
@@ -5799,6 +5806,45 @@ static void dispatch_rel_pe_q_grad_batched(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(MIN(D_POS, 32u), 1, 1)];
 }
 
+// t2_amx2 (2026-07-14): AMX-tiled sibling of dispatch_rel_pe_q_grad_batched
+// above — same buffers/offsets, dispatchThreadgroups: with an 8-divided
+// grid instead of dispatchThreads: (same convention as every other _amx
+// dispatch wrapper in this file). T, HD, D_POS must be multiples of 8 —
+// true for every profile in this project.
+static void dispatch_rel_pe_q_grad_batched_amx(id<MTLComputeCommandEncoder> enc,
+                                           id<MTLComputePipelineState> pso_dQrel,
+                                           id<MTLComputePipelineState> pso_dWrel,
+                                           id<MTLBuffer> Q_mh,          // [B_NH, T, HD]
+                                           id<MTLBuffer> d_q_rel_raw,   // [B_NH, T, D_POS]
+                                           id<MTLBuffer> W_rel_r, NSUInteger w_rel_r_off,     // [NH, HD, D_POS]
+                                           id<MTLBuffer> d_Q_rel,       // [B_NH, T, HD] out
+                                           id<MTLBuffer> d_W_rel_r, NSUInteger d_W_rel_r_off, // [NH, HD, D_POS] accumulate
+                                           uint32_t B, uint32_t NH, uint32_t T, uint32_t HD, uint32_t D_POS) {
+    const uint32_t B_NH = B * NH;
+    [enc setComputePipelineState:pso_dQrel];
+    [enc setBuffer:d_q_rel_raw offset:0            atIndex:0];
+    [enc setBuffer:W_rel_r     offset:w_rel_r_off   atIndex:1];
+    [enc setBuffer:d_Q_rel     offset:0             atIndex:2];
+    [enc setBytes:&T     length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD    length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&D_POS length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&NH    length:sizeof(uint32_t) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(HD / 8, T / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:pso_dWrel];
+    [enc setBuffer:Q_mh        offset:0              atIndex:0];
+    [enc setBuffer:d_q_rel_raw offset:0              atIndex:1];
+    [enc setBuffer:d_W_rel_r   offset:d_W_rel_r_off  atIndex:2];
+    [enc setBytes:&T     length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD    length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&D_POS length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&NH    length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&B     length:sizeof(uint32_t) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(D_POS / 8, HD / 8, NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 static void dispatch_attn_out_preO_recompute_batched(id<MTLComputeCommandEncoder> enc,
                                                       id<MTLComputePipelineState> pso,
                                                       id<MTLBuffer> attn_prob, // [B_NH, T, TL]
@@ -6369,6 +6415,7 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         !m2->ps_attn_qkt_bw_dQ_batched_amx || !m2->ps_attn_qkt_bw_dK_batched_amx ||
         !m2->ps_attn_val_bw_dV_batched_amx || !m2->ps_attn_val_bw_dScores_batched_amx ||
         !m2->ps_attn_out_preO_recompute_batched_amx ||
+        !m2->ps_rel_pe_q_grad_dQrel_batched_amx || !m2->ps_rel_pe_q_grad_dWrel_batched_amx ||
         !m2->ps_linear_amx || !m2->ps_kv_assemble ||
         !m2->ps_reshape_to_mh || !m2->ps_reshape_from_mh || !m2->ps_reshape_from_mh_acc) {
         return false;
@@ -6754,12 +6801,14 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     barrier();
 
     // (g) rel_pe_q_grad: d_Q_rel_mh (overwrite) + grad_W_rel_r[i] accumulate.
-    // Batched (single-dispatch-pair) replacement for the B*NH-times looped
-    // dispatch_rel_pe_q_grad (which also issued a memoryBarrierWithScope per
-    // iteration) — see metal-bw-speed-static-analysis.md §8.4/§8.5.
-    // bw_verify: rel_pe_q_grad_dQrel/dWrel_batched bit-exact vs the
-    // non-batched loop (max_abs=0, max_rel=0).
-    dispatch_rel_pe_q_grad_batched(enc, m2->ps_rel_pe_q_grad_dQrel_batched, m2->ps_rel_pe_q_grad_dWrel_batched,
+    // t2_amx2 (2026-07-14): AMX-tiled — follow-up to the attn_qkt_bw/
+    // attn_val_bw/attn_out_preO retiling (t2_amx). bw_verify: rel_pe_q_grad_
+    // dQrel_batched_amx within 5e-3f (accumulation-depth rounding at
+    // D_POS=320/B*T=2048 reduction depths, same established tolerance class
+    // as attn_val_bw_dScores_batched_amx), dWrel_batched_amx bit-exact
+    // (threadgroup-staged accumulate idiom, same as linear_bw_weight_acc_amx)
+    // vs the CPU reference.
+    dispatch_rel_pe_q_grad_batched_amx(enc, m2->ps_rel_pe_q_grad_dQrel_batched_amx, m2->ps_rel_pe_q_grad_dWrel_batched_amx,
                             m2->q_mh, m2->d_q_rel_raw,
                             wb->w_rel_r_all ? wb->w_rel_r_all : wb->w_rel_r, ofs.w_relr,
                             m2->d_q_rel_mh,
