@@ -609,6 +609,19 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_rel_pe_q_grad_dQrel_batched; // rel_pe_q_grad_dQrel_batched
     id<MTLComputePipelineState> ps_rel_pe_q_grad_dWrel_batched; // rel_pe_q_grad_dWrel_batched
     id<MTLComputePipelineState> ps_attn_out_preO_recompute_batched; // attn_out_preO_recompute_batched
+    // t2_amx (2026-07-14, T2 Step0 finding): AMX-tiled siblings of the 5
+    // naive kernels above. Same single-dispatch (bnh as a grid dimension)
+    // structure, restores simdgroup_matrix tiling for the actual GEMM math
+    // — bw_verify.mm confirmed numerically equivalent (run_attn_qkt_bw_
+    // batched_amx*/run_attn_val_bw_batched_amx*/run_attn_out_preO_
+    // recompute_batched_amx). rel_pe_q_bw/rel_pe_br_bw are gather/scatter
+    // (not GEMM-shaped) and rel_pe_q_grad has no AMX sibling yet — see
+    // t2_amx.DONE for the scope rationale.
+    id<MTLComputePipelineState> ps_attn_qkt_bw_dQ_batched_amx;
+    id<MTLComputePipelineState> ps_attn_qkt_bw_dK_batched_amx;
+    id<MTLComputePipelineState> ps_attn_val_bw_dV_batched_amx;
+    id<MTLComputePipelineState> ps_attn_val_bw_dScores_batched_amx;
+    id<MTLComputePipelineState> ps_attn_out_preO_recompute_batched_amx;
     id<MTLComputePipelineState> ps_linear_bw_weight_acc;   // linear_bw_weight_acc_amx
     id<MTLComputePipelineState> ps_reshape_to_mh;          // reshape_to_multihead
     id<MTLComputePipelineState> ps_reshape_from_mh;        // reshape_from_multihead
@@ -767,6 +780,11 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_rel_pe_q_grad_dQrel_batched     = load(@"rel_pe_q_grad_dQrel_batched");
     m2->ps_rel_pe_q_grad_dWrel_batched     = load(@"rel_pe_q_grad_dWrel_batched");
     m2->ps_attn_out_preO_recompute_batched = load(@"attn_out_preO_recompute_batched");
+    m2->ps_attn_qkt_bw_dQ_batched_amx          = load(@"attn_qkt_bw_dQ_batched_amx");
+    m2->ps_attn_qkt_bw_dK_batched_amx          = load(@"attn_qkt_bw_dK_batched_amx");
+    m2->ps_attn_val_bw_dV_batched_amx          = load(@"attn_val_bw_dV_batched_amx");
+    m2->ps_attn_val_bw_dScores_batched_amx     = load(@"attn_val_bw_dScores_batched_amx");
+    m2->ps_attn_out_preO_recompute_batched_amx = load(@"attn_out_preO_recompute_batched_amx");
     m2->ps_linear_bw_weight_acc = load(@"linear_bw_weight_acc_amx");
     m2->ps_reshape_to_mh      = load(@"reshape_to_multihead");
     m2->ps_reshape_from_mh    = load(@"reshape_from_multihead");
@@ -5798,6 +5816,90 @@ static void dispatch_attn_out_preO_recompute_batched(id<MTLComputeCommandEncoder
         threadsPerThreadgroup:MTLSizeMake(MIN(HD, 32u), 1, 1)];
 }
 
+// t2_amx (2026-07-14): AMX-tiled siblings of the 3 dispatch wrappers above —
+// same buffers/signature, but the underlying kernels use simdgroup_matrix
+// tiling and a threadgroup (not thread) grid, so the dispatch call itself
+// changes from dispatchThreads: to dispatchThreadgroups: with the grid
+// divided by 8 and a fixed 32-lane threadgroup (matching every other AMX
+// kernel dispatch in this file, e.g. transformer_linear_amx's call sites).
+// T, TL, HD must be multiples of 8 — true for every profile in this project.
+static void dispatch_attn_qkt_bw_batched_amx(id<MTLComputeCommandEncoder> enc,
+                                             id<MTLComputePipelineState> pso_dQ,
+                                             id<MTLComputePipelineState> pso_dK,
+                                             id<MTLBuffer> d_scores, // [B_NH, T, TL]
+                                             id<MTLBuffer> K_full,   // [B_NH, TL, HD]
+                                             id<MTLBuffer> Q_mh,     // [B_NH, T, HD]
+                                             id<MTLBuffer> d_Q,      // [B_NH, T, HD] out
+                                             id<MTLBuffer> d_K,      // [B_NH, TL, HD] out
+                                             uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso_dQ];
+    [enc setBuffer:d_scores offset:0 atIndex:0];
+    [enc setBuffer:K_full   offset:0 atIndex:1];
+    [enc setBuffer:d_Q      offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD / 8, T / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:pso_dK];
+    [enc setBuffer:d_scores offset:0 atIndex:0];
+    [enc setBuffer:Q_mh     offset:0 atIndex:1];
+    [enc setBuffer:d_K      offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD / 8, TL / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void dispatch_attn_val_bw_batched_amx(id<MTLComputeCommandEncoder> enc,
+                                             id<MTLComputePipelineState> pso_dV,
+                                             id<MTLComputePipelineState> pso_dScores,
+                                             id<MTLBuffer> d_attn_out, // [B_NH, T, HD]
+                                             id<MTLBuffer> attn_prob,  // [B_NH, T, TL]
+                                             id<MTLBuffer> V_full,     // [B_NH, TL, HD]
+                                             id<MTLBuffer> d_V,        // [B_NH, TL, HD] out
+                                             id<MTLBuffer> d_scores,   // [B_NH, T, TL] out
+                                             uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso_dV];
+    [enc setBuffer:attn_prob  offset:0 atIndex:0];
+    [enc setBuffer:d_attn_out offset:0 atIndex:1];
+    [enc setBuffer:d_V        offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD / 8, TL / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:pso_dScores];
+    [enc setBuffer:d_attn_out offset:0 atIndex:0];
+    [enc setBuffer:V_full     offset:0 atIndex:1];
+    [enc setBuffer:d_scores   offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(TL / 8, T / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void dispatch_attn_out_preO_recompute_batched_amx(id<MTLComputeCommandEncoder> enc,
+                                                          id<MTLComputePipelineState> pso,
+                                                          id<MTLBuffer> attn_prob, // [B_NH, T, TL]
+                                                          id<MTLBuffer> V_full,    // [B_NH, TL, HD]
+                                                          id<MTLBuffer> attn_pre,  // [B_NH, T, HD] out
+                                                          uint32_t B_NH, uint32_t T, uint32_t TL, uint32_t HD) {
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:attn_prob offset:0 atIndex:0];
+    [enc setBuffer:V_full    offset:0 atIndex:1];
+    [enc setBuffer:attn_pre  offset:0 atIndex:2];
+    [enc setBytes:&T  length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&TL length:sizeof(uint32_t) atIndex:4];
+    [enc setBytes:&HD length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD / 8, T / 8, B_NH)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 // dispatch_element_add: out[i] = a[i] + b[i] (with optional in-place if out aliases a)
 static void dispatch_element_add(id<MTLComputeCommandEncoder> enc,
                                   id<MTLComputePipelineState> pso,
@@ -6264,6 +6366,9 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         !m2->ps_attn_val_bw_dV_batched || !m2->ps_attn_val_bw_dScores_batched ||
         !m2->ps_rel_pe_q_grad_dQrel_batched || !m2->ps_rel_pe_q_grad_dWrel_batched ||
         !m2->ps_attn_out_preO_recompute_batched ||
+        !m2->ps_attn_qkt_bw_dQ_batched_amx || !m2->ps_attn_qkt_bw_dK_batched_amx ||
+        !m2->ps_attn_val_bw_dV_batched_amx || !m2->ps_attn_val_bw_dScores_batched_amx ||
+        !m2->ps_attn_out_preO_recompute_batched_amx ||
         !m2->ps_linear_amx || !m2->ps_kv_assemble ||
         !m2->ps_reshape_to_mh || !m2->ps_reshape_from_mh || !m2->ps_reshape_from_mh_acc) {
         return false;
@@ -6538,12 +6643,12 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // We write per-head slices into a [BT, H] contiguous flat layout by using
     // d_q_rel_mh (same size BT*H floats) as a [BNH,T,HD] scratch, then reshape.
     {
-        // Batched (single-dispatch) replacement for the B_NH-times looped
-        // per-head transformer_linear_amx dispatch — see
-        // metal-bw-speed-static-analysis.md §8.4/§8.5. bw_verify:
-        // attn_out_preO_recompute_batched bit-exact vs the non-batched loop
-        // (max_abs=0, max_rel=0).
-        dispatch_attn_out_preO_recompute_batched(enc, m2->ps_attn_out_preO_recompute_batched,
+        // t2_amx (2026-07-14): AMX-tiled version — see T2 Step0's finding
+        // that the naive batched kernel below was ~1.9x slower than the old
+        // AMX-tiled per-head loop it replaced. bw_verify: attn_out_preO_
+        // recompute_batched_amx bit-exact vs both the naive batched kernel
+        // and the CPU reference (max_abs=0, max_rel=0).
+        dispatch_attn_out_preO_recompute_batched_amx(enc, m2->ps_attn_out_preO_recompute_batched_amx,
                                                   m2->attn_prob[i], m2->v_full,
                                                   m2->d_q_rel_mh, // scratch: [BNH,T,HD]
                                                   B_NH, T, TL, HD);
@@ -6584,13 +6689,16 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                             B, T, NH, HD, H);
     barrier();
 
-    // (a) attn_val_bw → d_V_mh + d_scores. Batched (single-dispatch-pair)
-    // replacement for the B_NH-times looped dispatch_attn_val_bw — see
-    // metal-bw-speed-static-analysis.md §8.4/§8.5. bw_verify:
-    // attn_val_bw_dV/dScores_batched bit-exact vs the non-batched loop
-    // (max_abs=0, max_rel=0).
-    dispatch_attn_val_bw_batched(enc,
-                          m2->ps_attn_val_bw_dV_batched, m2->ps_attn_val_bw_dScores_batched,
+    // (a) attn_val_bw → d_V_mh + d_scores. t2_amx (2026-07-14): AMX-tiled —
+    // T2 Step0 found the naive batched kernel below was ~1.9x slower than
+    // the AMX-tiled per-head loop it replaced (dispatch overhead itself was
+    // never the bottleneck, <1ms even at 512 dispatches). bw_verify:
+    // attn_val_bw_dV_batched_amx bit-exact, dScores_batched_amx within
+    // 5e-3f (accumulation-depth rounding at HD=128 reduction, same
+    // signature as rel_pe_q_grad_dQrel_batched.realdim's established
+    // tolerance) vs the CPU reference.
+    dispatch_attn_val_bw_batched_amx(enc,
+                          m2->ps_attn_val_bw_dV_batched_amx, m2->ps_attn_val_bw_dScores_batched_amx,
                           m2->d_attn_out_mh, m2->attn_prob[i], m2->v_full,
                           m2->d_v_mh, m2->d_scores,
                           B_NH, T, TL, HD);
@@ -6624,13 +6732,12 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         barrier();
     }
 
-    // (e) attn_qkt_bw → d_Q_mh_qk (stored in d_q_mh), d_K_mh. Batched
-    // (single-dispatch-pair) replacement for the B_NH-times looped
-    // dispatch_attn_qkt_bw — see metal-bw-speed-static-analysis.md
-    // §8.4/§8.5. bw_verify: attn_qkt_bw_dQ/dK_batched bit-exact vs the
-    // non-batched loop (max_abs=0, max_rel=0).
-    dispatch_attn_qkt_bw_batched(enc,
-                          m2->ps_attn_qkt_bw_dQ_batched, m2->ps_attn_qkt_bw_dK_batched,
+    // (e) attn_qkt_bw → d_Q_mh_qk (stored in d_q_mh), d_K_mh. t2_amx
+    // (2026-07-14): AMX-tiled — see the (a) comment above for the T2 Step0
+    // rationale. bw_verify: attn_qkt_bw_dQ/dK_batched_amx bit-exact vs the
+    // CPU reference (max_abs=0, max_rel=0).
+    dispatch_attn_qkt_bw_batched_amx(enc,
+                          m2->ps_attn_qkt_bw_dQ_batched_amx, m2->ps_attn_qkt_bw_dK_batched_amx,
                           m2->d_scores, m2->k_full, m2->q_mh,
                           m2->d_q_mh, m2->d_k_mh,
                           B_NH, T, TL, HD);
