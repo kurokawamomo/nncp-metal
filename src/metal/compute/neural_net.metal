@@ -1759,6 +1759,98 @@ kernel void attn_out_preO_recompute_batched_amx(
     simdgroup_store(c, ap + t_start * HD + hd_start, HD);
 }
 
+// d_Q_rel[bnh,t,hd] = sum_dp d_q_rel_raw[bnh,t,dp] * W_rel_r[h,hd,dp]  (h = bnh % NH, AMX-tiled)
+// Dispatch: threadgroups [HD/8, T/8, B_NH], threads_per_threadgroup [32,1,1]
+// AMX-tiled sibling of rel_pe_q_grad_dQrel_batched above (2026-07-14, t2_amx2
+// — follow-up to the attn_qkt_bw/attn_val_bw/attn_out_preO retiling).
+// Same dX[m,k]=sum_n dY[m,n]*W[k,n] pattern as linear_bw_input_amx / attn_
+// qkt_bw_dQ_batched_amx, just with W_rel_r indexed by h=bnh%NH (shared
+// across the B streams for a fixed head) instead of directly by bnh.
+kernel void rel_pe_q_grad_dQrel_batched_amx(
+    device const float* d_q_rel_raw [[buffer(0)]], // [B_NH, T, D_POS]
+    device const float* W_rel_r     [[buffer(1)]], // [NH, HD, D_POS]
+    device float*       d_Q_rel     [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T     [[buffer(3)]],
+    constant uint& HD    [[buffer(4)]],
+    constant uint& D_POS [[buffer(5)]],
+    constant uint& NH    [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint hd_start = tgid.x * 8;
+    uint t_start  = tgid.y * 8;
+    uint bnh      = tgid.z;
+    uint h        = bnh % NH;
+
+    device const float* dr = d_q_rel_raw + (size_t)bnh * T * D_POS;
+    device const float* wr = W_rel_r     + (size_t)h   * HD * D_POS;
+    device float*       dq = d_Q_rel     + (size_t)bnh * T * HD;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    // dQ_rel[t,hd] = sum_dp dr[t,dp]*wr[hd,dp] = dr @ wr^T
+    for (uint dp = 0; dp < D_POS; dp += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, dr + t_start * D_POS + dp,  D_POS);                    // [8(t),8(dp)]
+        simdgroup_load(b, wr + hd_start * D_POS + dp, D_POS, ulong2(0,0), true); // transpose: [8(dp),8(hd)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, dq + t_start * HD + hd_start, HD);
+}
+
+// d_W_rel_r[h,hd,dp] += sum_{b,t} Q_mh[b*NH+h,t,hd] * d_q_rel_raw[b*NH+h,t,dp]
+// (AMX-tiled). Dispatch: threadgroups [D_POS/8, HD/8, NH], threads_per_
+// threadgroup [32,1,1]. AMX-tiled sibling of rel_pe_q_grad_dWrel_batched
+// above (2026-07-14, t2_amx2). Q_mh/d_q_rel_raw for a fixed h are NOT
+// contiguous across b (stride NH*T*{HD,D_POS} between successive b, not a
+// uniform row stride simdgroup_load can express in one call spanning
+// multiple b) — so unlike the other retiled kernels here, this one keeps
+// an explicit outer loop over B (same B=32 iterations the naive kernel's
+// inner scalar loop already paid for) with an AMX-tiled T-reduction
+// inside each iteration, accumulating into the SAME simdgroup_float8x8
+// across the whole double loop. Output is a += onto existing device
+// memory (shared/tied across all layers, matching the naive kernel and
+// linear_bw_weight_acc_amx's established accumulate idiom above): the new
+// contribution is staged through threadgroup memory, then 32 threads each
+// do a scalar += into device memory — device-side arithmetic on a
+// simdgroup_matrix directly is not used here, following that same
+// precedent rather than introducing a new idiom.
+kernel void rel_pe_q_grad_dWrel_batched_amx(
+    device const float* Q_mh        [[buffer(0)]], // [B_NH, T, HD]
+    device const float* d_q_rel_raw [[buffer(1)]], // [B_NH, T, D_POS]
+    device float*       d_W_rel_r   [[buffer(2)]], // [NH, HD, D_POS] accumulate (+=)
+    constant uint& T     [[buffer(3)]],
+    constant uint& HD    [[buffer(4)]],
+    constant uint& D_POS [[buffer(5)]],
+    constant uint& NH    [[buffer(6)]],
+    constant uint& B     [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    uint dp_start = tgid.x * 8;
+    uint hd_start = tgid.y * 8;
+    uint h        = tgid.z;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    for (uint b = 0; b < B; b++) {
+        uint bnh = b * NH + h;
+        device const float* qb = Q_mh        + (size_t)bnh * T * HD;
+        device const float* dr = d_q_rel_raw + (size_t)bnh * T * D_POS;
+        for (uint t = 0; t < T; t += 8) {
+            simdgroup_float8x8 a, bt;
+            simdgroup_load(a,  qb + t * HD    + hd_start, HD,    ulong2(0,0), true); // transpose: [8(hd),8(t)]
+            simdgroup_load(bt, dr + t * D_POS + dp_start, D_POS);                     // [8(t),8(dp)]
+            simdgroup_multiply_accumulate(c, a, bt, c);
+        }
+    }
+
+    threadgroup float tile[64];
+    simdgroup_store(c, tile, 8);
+    for (uint e = lane; e < 64; e += 32) {
+        uint dhd = e / 8;
+        uint ddp = e % 8;
+        d_W_rel_r[((size_t)h * HD + hd_start + dhd) * D_POS + dp_start + ddp] += tile[e];
+    }
+}
+
 /* ========================================================================
  * B10: Embedding backward (deterministic)
  *

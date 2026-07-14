@@ -1844,6 +1844,85 @@ static void run_rel_pe_q_grad_batched_realdim(Rng& r) {
     }
 }
 
+// t2_amx2 (2026-07-14): AMX-tiled dQrel/dWrel vs the SAME CPU reference used
+// above, at the real enwik8 profile shape (T=64, matching the current BPTT64
+// window — the existing realdim test above predates BPTT64 and kept T=8).
+static void run_rel_pe_q_grad_batched_amx_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 64, HD = 128, D_POS = 320, BNH = B * NH;
+    std::vector<float> Q_mh(BNH*T*HD), d_q_rel_raw(BNH*T*D_POS), W_rel_r(NH*HD*D_POS);
+    fill_random(Q_mh, r); fill_random(d_q_rel_raw, r); fill_random(W_rel_r, r);
+    std::vector<float> prior_dWr(NH*HD*D_POS);
+    fill_random(prior_dWr, r);
+
+    std::vector<float> ref_dQrel(BNH*T*HD), ref_dWrel = prior_dWr;
+    cpu_rel_pe_q_grad_batched(Q_mh.data(), d_q_rel_raw.data(), W_rel_r.data(),
+                               ref_dQrel.data(), ref_dWrel.data(), B, NH, T, HD, D_POS);
+
+    id<MTLBuffer> b_Q  = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dr = g_mtl.bufFrom(d_q_rel_raw);
+    id<MTLBuffer> b_Wr = g_mtl.bufFrom(W_rel_r);
+    id<MTLBuffer> b_dQrel = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dWrel = g_mtl.bufFrom(prior_dWr); // pre-filled, kernel accumulates
+    auto pso_dQrel = g_mtl.pso(@"rel_pe_q_grad_dQrel_batched_amx");
+    auto pso_dWrel = g_mtl.pso(@"rel_pe_q_grad_dWrel_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, HDu=HD, DPu=D_POS, NHu=NH, Bu=B;
+    [enc setComputePipelineState:pso_dQrel];
+    [enc setBuffer:b_dr    offset:0 atIndex:0];
+    [enc setBuffer:b_Wr    offset:0 atIndex:1];
+    [enc setBuffer:b_dQrel offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4];
+    [enc setBytes:&DPu length:4 atIndex:5]; [enc setBytes:&NHu length:4 atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc setComputePipelineState:pso_dWrel];
+    [enc setBuffer:b_Q     offset:0 atIndex:0];
+    [enc setBuffer:b_dr    offset:0 atIndex:1];
+    [enc setBuffer:b_dWrel offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4];
+    [enc setBytes:&DPu length:4 atIndex:5]; [enc setBytes:&NHu length:4 atIndex:6];
+    [enc setBytes:&Bu length:4 atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(D_POS/8, HD/8, NH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQrel(BNH*T*HD), g_dWrel(NH*HD*D_POS);
+    g_mtl.readInto(b_dQrel, g_dQrel); g_mtl.readInto(b_dWrel, g_dWrel);
+
+    // Same accumulation-depth rounding rationale as rel_pe_q_grad_dQrel_
+    // batched.realdim above (D_POS=320 reduction) — 5e-3f, same precedent.
+    record("rel_pe_q_grad_dQrel_batched_amx.realdim", g_dQrel, ref_dQrel, 5e-3f);
+
+    static char dqheadname[16][72];
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> ref_h, got_h;
+        ref_h.reserve((size_t)B * T * HD);
+        got_h.reserve((size_t)B * T * HD);
+        for (uint b = 0; b < B; b++) {
+            uint bnh = b * NH + h;
+            size_t base = (size_t)bnh * T * HD;
+            ref_h.insert(ref_h.end(), ref_dQrel.begin() + base, ref_dQrel.begin() + base + (size_t)T*HD);
+            got_h.insert(got_h.end(), g_dQrel.begin()   + base, g_dQrel.begin()   + base + (size_t)T*HD);
+        }
+        snprintf(dqheadname[h], sizeof(dqheadname[h]), "rel_pe_q_grad_dQrel_batched_amx.realdim.h%u", h);
+        record(dqheadname[h], got_h, ref_h, 5e-3f);
+    }
+
+    // dWrel's reduction is B*T=32*64=2048 terms (deeper than dQrel's D_POS=
+    // 320) — same rounding-drift class, same 5e-3f tolerance applied
+    // uniformly rather than assuming it stays exact like the smaller-T
+    // (T=8, B*T=256) test above did.
+    static char headname[16][72];
+    const size_t per_head = (size_t)HD * D_POS;
+    for (uint h = 0; h < NH && h < 16; h++) {
+        std::vector<float> ref_h(ref_dWrel.begin() + h*per_head, ref_dWrel.begin() + (h+1)*per_head);
+        std::vector<float> got_h(g_dWrel.begin()   + h*per_head, g_dWrel.begin()   + (h+1)*per_head);
+        snprintf(headname[h], sizeof(headname[h]), "rel_pe_q_grad_dWrel_batched_amx.realdim.h%u", h);
+        record(headname[h], got_h, ref_h, 5e-3f);
+    }
+}
+
 static void cpu_attn_out_preO_recompute_batched(const float* attn_prob, const float* V_full,
                                                  float* attn_pre, uint B_NH, uint T, uint TL, uint HD) {
     for (uint bnh = 0; bnh < B_NH; bnh++)
@@ -2184,6 +2263,7 @@ int main(int argc, char** argv) {
         run_attn_out_preO_recompute_batched_amx(r);
         run_rel_pe_q_grad_batched(r);
         run_rel_pe_q_grad_batched_realdim(r);
+        run_rel_pe_q_grad_batched_amx_realdim(r);
         run_attn_out_preO_recompute_batched(r);
         run_kv_memory_shift(r);
 
