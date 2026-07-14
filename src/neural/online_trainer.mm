@@ -201,11 +201,14 @@ static float nncp_dropout_att_rate() {
 // both build_per_layer_fwd/build_per_layer_bwd, each compiled once and
 // reused every segment) so NNCP_TRAIN_CLAMP=0 structurally omits the clamp
 // ops entirely rather than merely being numerically inert.
+//
+// clamp_off (2026-07-15): judged harmful (HQ verdict) -- default flipped to
+// OFF. Code kept in place for future re-tuning; opt back in with "1".
 static bool nncp_train_clamp_enabled() {
     static int v = -1;
     if (v < 0) {
         const char* e = getenv("NNCP_TRAIN_CLAMP");
-        v = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;  // default ON; only "0" disables
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;  // default OFF; only "1" enables
     }
     return v != 0;
 }
