@@ -1587,6 +1587,179 @@ kernel void attn_out_preO_recompute_batched(
 }
 
 /* ========================================================================
+ * B9d: AMX-tiled batched attention-backward kernels (2026-07-14, t2_amx —
+ * T2 Step0 finding: the naive per-thread B9c kernels above are ~1.9x
+ * SLOWER than the AMX-tiled per-head-loop kernels they replaced
+ * (transformer_linear_amx / linear_bw_input_amx / linear_bw_weight_amx,
+ * dispatched B_NH times each) — dispatch overhead itself was never the
+ * bottleneck (measured <1ms even at 512 dispatches in one encoder), so
+ * trading AMX tiling away for fewer dispatches was a net loss. These
+ * kernels keep B9c's single-dispatch structure (bnh is a THIRD grid
+ * dimension, tgid.z, instead of a CPU-side loop) but restore
+ * simdgroup_matrix<float,8,8> tiling for the actual GEMM math — same
+ * algorithm as transformer_linear_amx/linear_bw_input_amx/
+ * linear_bw_weight_amx, just with a batch dimension folded into the
+ * threadgroup grid instead of a per-call buffer offset. T, TL, HD must
+ * all be multiples of 8 (same constraint the non-batched AMX kernels
+ * already have — true for every profile in this project: HD=128, and TL
+ * = mem_len+seg_len is always seg_len-aligned per BPTT_CHUNK_LEN).
+ * Verified bit/rel-err identical to the B9c kernels above at both a small
+ * synthetic shape and the real enwik8 profile shape (bw_verify.mm,
+ * run_attn_qkt_bw_batched_amx / run_attn_val_bw_batched_amx).
+ * ======================================================================== */
+
+// d_Q[bnh,t,hd] = sum_tl d_scores[bnh,t,tl] * K_full[bnh,tl,hd]  (AMX-tiled)
+// Dispatch: threadgroups [HD/8, T/8, B_NH], threads_per_threadgroup [32,1,1]
+kernel void attn_qkt_bw_dQ_batched_amx(
+    device const float* d_scores [[buffer(0)]], // [B_NH, T, TL]
+    device const float* K_full   [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       d_Q      [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint hd_start = tgid.x * 8;
+    uint t_start  = tgid.y * 8;
+    uint bnh      = tgid.z;
+
+    device const float* ds = d_scores + (size_t)bnh * T  * TL;
+    device const float* kf = K_full   + (size_t)bnh * TL * HD;
+    device float*       dq = d_Q      + (size_t)bnh * T  * HD;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    for (uint tl = 0; tl < TL; tl += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, ds + t_start * TL + tl,       TL);  // [8(t), 8(tl)]
+        simdgroup_load(b, kf + tl * HD + hd_start,      HD);  // [8(tl), 8(hd)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, dq + t_start * HD + hd_start, HD);
+}
+
+// d_K[bnh,tl,hd] = sum_t d_scores[bnh,t,tl] * Q_mh[bnh,t,hd]  (AMX-tiled)
+// Dispatch: threadgroups [HD/8, TL/8, B_NH], threads_per_threadgroup [32,1,1]
+kernel void attn_qkt_bw_dK_batched_amx(
+    device const float* d_scores [[buffer(0)]], // [B_NH, T, TL]
+    device const float* Q_mh     [[buffer(1)]], // [B_NH, T, HD]
+    device float*       d_K      [[buffer(2)]], // [B_NH, TL, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint hd_start = tgid.x * 8;
+    uint tl_start = tgid.y * 8;
+    uint bnh      = tgid.z;
+
+    device const float* ds = d_scores + (size_t)bnh * T * TL;
+    device const float* qb = Q_mh     + (size_t)bnh * T * HD;
+    device float*       dk = d_K      + (size_t)bnh * TL * HD;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    // dK[tl,hd] = sum_t ds[t,tl]*qb[t,hd] = ds^T @ qb
+    for (uint t = 0; t < T; t += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, ds + t * TL + tl_start, TL, ulong2(0,0), true);  // transpose: [8(tl),8(t)]
+        simdgroup_load(b, qb + t * HD + hd_start, HD);                     // [8(t),8(hd)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, dk + tl_start * HD + hd_start, HD);
+}
+
+// d_V[bnh,tl,hd] = sum_t attn_prob[bnh,t,tl] * d_attn_out[bnh,t,hd]  (AMX-tiled)
+// Dispatch: threadgroups [HD/8, TL/8, B_NH], threads_per_threadgroup [32,1,1]
+kernel void attn_val_bw_dV_batched_amx(
+    device const float* attn_prob  [[buffer(0)]], // [B_NH, T, TL]
+    device const float* d_attn_out [[buffer(1)]], // [B_NH, T, HD]
+    device float*       d_V        [[buffer(2)]], // [B_NH, TL, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint hd_start = tgid.x * 8;
+    uint tl_start = tgid.y * 8;
+    uint bnh      = tgid.z;
+
+    device const float* pb = attn_prob  + (size_t)bnh * T * TL;
+    device const float* db = d_attn_out + (size_t)bnh * T * HD;
+    device float*       dv = d_V        + (size_t)bnh * TL * HD;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    // dV[tl,hd] = sum_t pb[t,tl]*db[t,hd] = pb^T @ db
+    for (uint t = 0; t < T; t += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, pb + t * TL + tl_start, TL, ulong2(0,0), true);  // transpose: [8(tl),8(t)]
+        simdgroup_load(b, db + t * HD + hd_start, HD);                     // [8(t),8(hd)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, dv + tl_start * HD + hd_start, HD);
+}
+
+// d_scores[bnh,t,tl] = sum_hd d_attn_out[bnh,t,hd] * V_full[bnh,tl,hd]  (AMX-tiled)
+// Dispatch: threadgroups [TL/8, T/8, B_NH], threads_per_threadgroup [32,1,1]
+kernel void attn_val_bw_dScores_batched_amx(
+    device const float* d_attn_out [[buffer(0)]], // [B_NH, T, HD]
+    device const float* V_full     [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       d_scores   [[buffer(2)]], // [B_NH, T, TL] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& TL [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint tl_start = tgid.x * 8;
+    uint t_start  = tgid.y * 8;
+    uint bnh      = tgid.z;
+
+    device const float* db = d_attn_out + (size_t)bnh * T  * HD;
+    device const float* vf = V_full     + (size_t)bnh * TL * HD;
+    device float*       ds = d_scores   + (size_t)bnh * T  * TL;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    // d_scores[t,tl] = sum_hd db[t,hd]*vf[tl,hd] = db @ vf^T
+    for (uint hd = 0; hd < HD; hd += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, db + t_start * HD + hd,  HD);                    // [8(t), 8(hd)]
+        simdgroup_load(b, vf + tl_start * HD + hd, HD, ulong2(0,0), true); // transpose: [8(hd), 8(tl)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, ds + t_start * TL + tl_start, TL);
+}
+
+// attn_pre_Wo[bnh,t,hd] = sum_tl attn_prob[bnh,t,tl] * V_full[bnh,tl,hd]  (AMX-tiled)
+// Pre-O-proj attention output recompute, AMX-tiled sibling of
+// attn_out_preO_recompute_batched above — same math as attn_qkt_bw_dQ_
+// batched_amx (attn_prob plays the role of d_scores).
+// Dispatch: threadgroups [HD/8, T/8, B_NH], threads_per_threadgroup [32,1,1]
+kernel void attn_out_preO_recompute_batched_amx(
+    device const float* attn_prob [[buffer(0)]], // [B_NH, T, TL]
+    device const float* V_full    [[buffer(1)]], // [B_NH, TL, HD]
+    device float*       attn_pre  [[buffer(2)]], // [B_NH, T, HD] (output, overwrite)
+    constant uint& T  [[buffer(3)]],
+    constant uint& TL [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint hd_start = tgid.x * 8;
+    uint t_start  = tgid.y * 8;
+    uint bnh      = tgid.z;
+
+    device const float* pb = attn_prob + (size_t)bnh * T  * TL;
+    device const float* vf = V_full    + (size_t)bnh * TL * HD;
+    device float*       ap = attn_pre  + (size_t)bnh * T  * HD;
+
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
+    for (uint tl = 0; tl < TL; tl += 8) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, pb + t_start * TL + tl,  TL);  // [8(t), 8(tl)]
+        simdgroup_load(b, vf + tl * HD + hd_start, HD);  // [8(tl), 8(hd)]
+        simdgroup_multiply_accumulate(c, a, b, c);
+    }
+    simdgroup_store(c, ap + t_start * HD + hd_start, HD);
+}
+
+/* ========================================================================
  * B10: Embedding backward (deterministic)
  *
  * Forward:

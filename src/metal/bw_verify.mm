@@ -1435,6 +1435,228 @@ static void run_attn_val_bw_batched_realdim(Rng& r) {
     }
 }
 
+// ---- t2_amx (2026-07-14): AMX-tiled batched kernels vs the SAME CPU
+// reference used above for the naive B9c kernels — proves the AMX-tiled
+// replacements are numerically equivalent, not just "fast". T/TL/HD must
+// all be 8-aligned for simdgroup_matrix tiling (unlike the naive kernels'
+// small synthetic test above, which deliberately used non-8-aligned dims
+// to catch index bugs — that shape doesn't apply here).
+static void run_attn_qkt_bw_batched_amx(Rng& r) {
+    const uint B = 2, NH = 8, T = 8, TL = 16, HD = 8, BNH = B * NH;
+    std::vector<float> d_scores(BNH*T*TL), K_full(BNH*TL*HD), Q_mh(BNH*T*HD);
+    fill_random(d_scores, r); fill_random(K_full, r); fill_random(Q_mh, r);
+
+    std::vector<float> ref_dQ(BNH*T*HD), ref_dK(BNH*TL*HD);
+    cpu_attn_qkt_bw_batched(d_scores.data(), K_full.data(), Q_mh.data(),
+                             ref_dQ.data(), ref_dK.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ds = g_mtl.bufFrom(d_scores);
+    id<MTLBuffer> b_kf = g_mtl.bufFrom(K_full);
+    id<MTLBuffer> b_qm = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dQ = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dK = g_mtl.buf(BNH*TL*HD);
+    auto pso_dQ = g_mtl.pso(@"attn_qkt_bw_dQ_batched_amx");
+    auto pso_dK = g_mtl.pso(@"attn_qkt_bw_dK_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dQ];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_kf offset:0 atIndex:1];
+    [enc setBuffer:b_dQ offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc setComputePipelineState:pso_dK];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_qm offset:0 atIndex:1];
+    [enc setBuffer:b_dK offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQ(BNH*T*HD), g_dK(BNH*TL*HD);
+    g_mtl.readInto(b_dQ, g_dQ); g_mtl.readInto(b_dK, g_dK);
+    record("attn_qkt_bw_dQ_batched_amx", g_dQ, ref_dQ, 1e-4f);
+    record("attn_qkt_bw_dK_batched_amx", g_dK, ref_dK, 1e-4f);
+}
+
+// Real (current enwik8 profile) shape: B=32, NH=8, T=64 (BPTT64), TL=320
+// (mem_len 256 + seg_len 64), HD=128 — matches T2 Step0's microbench shape
+// exactly, all dims 8-aligned.
+static void run_attn_qkt_bw_batched_amx_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 64, TL = 320, HD = 128, BNH = B * NH;
+    std::vector<float> d_scores(BNH*T*TL), K_full(BNH*TL*HD), Q_mh(BNH*T*HD);
+    fill_random(d_scores, r); fill_random(K_full, r); fill_random(Q_mh, r);
+
+    std::vector<float> ref_dQ(BNH*T*HD), ref_dK(BNH*TL*HD);
+    cpu_attn_qkt_bw_batched(d_scores.data(), K_full.data(), Q_mh.data(),
+                             ref_dQ.data(), ref_dK.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ds = g_mtl.bufFrom(d_scores);
+    id<MTLBuffer> b_kf = g_mtl.bufFrom(K_full);
+    id<MTLBuffer> b_qm = g_mtl.bufFrom(Q_mh);
+    id<MTLBuffer> b_dQ = g_mtl.buf(BNH*T*HD);
+    id<MTLBuffer> b_dK = g_mtl.buf(BNH*TL*HD);
+    auto pso_dQ = g_mtl.pso(@"attn_qkt_bw_dQ_batched_amx");
+    auto pso_dK = g_mtl.pso(@"attn_qkt_bw_dK_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dQ];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_kf offset:0 atIndex:1];
+    [enc setBuffer:b_dQ offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc setComputePipelineState:pso_dK];
+    [enc setBuffer:b_ds offset:0 atIndex:0];
+    [enc setBuffer:b_qm offset:0 atIndex:1];
+    [enc setBuffer:b_dK offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dQ(BNH*T*HD), g_dK(BNH*TL*HD);
+    g_mtl.readInto(b_dQ, g_dQ); g_mtl.readInto(b_dK, g_dK);
+    record("attn_qkt_bw_dQ_batched_amx.realdim", g_dQ, ref_dQ, 1e-4f);
+    record("attn_qkt_bw_dK_batched_amx.realdim", g_dK, ref_dK, 1e-4f);
+}
+
+static void run_attn_val_bw_batched_amx(Rng& r) {
+    const uint B = 2, NH = 8, T = 8, TL = 16, HD = 8, BNH = B * NH;
+    std::vector<float> attn_prob(BNH*T*TL), d_attn_out(BNH*T*HD), V_full(BNH*TL*HD);
+    fill_random(attn_prob, r); fill_random(d_attn_out, r); fill_random(V_full, r);
+
+    std::vector<float> ref_dV(BNH*TL*HD), ref_dScores(BNH*T*TL);
+    cpu_attn_val_bw_batched(attn_prob.data(), d_attn_out.data(), V_full.data(),
+                             ref_dV.data(), ref_dScores.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ap = g_mtl.bufFrom(attn_prob);
+    id<MTLBuffer> b_do = g_mtl.bufFrom(d_attn_out);
+    id<MTLBuffer> b_vf = g_mtl.bufFrom(V_full);
+    id<MTLBuffer> b_dV = g_mtl.buf(BNH*TL*HD);
+    id<MTLBuffer> b_dS = g_mtl.buf(BNH*T*TL);
+    auto pso_dV = g_mtl.pso(@"attn_val_bw_dV_batched_amx");
+    auto pso_dS = g_mtl.pso(@"attn_val_bw_dScores_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dV];
+    [enc setBuffer:b_ap offset:0 atIndex:0];
+    [enc setBuffer:b_do offset:0 atIndex:1];
+    [enc setBuffer:b_dV offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc setComputePipelineState:pso_dS];
+    [enc setBuffer:b_do offset:0 atIndex:0];
+    [enc setBuffer:b_vf offset:0 atIndex:1];
+    [enc setBuffer:b_dS offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4]; [enc setBytes:&TLu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(TL/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dV(BNH*TL*HD), g_dS(BNH*T*TL);
+    g_mtl.readInto(b_dV, g_dV); g_mtl.readInto(b_dS, g_dS);
+    record("attn_val_bw_dV_batched_amx", g_dV, ref_dV, 1e-4f);
+    record("attn_val_bw_dScores_batched_amx", g_dS, ref_dScores, 1e-4f);
+}
+
+static void run_attn_val_bw_batched_amx_realdim(Rng& r) {
+    const uint B = 32, NH = 8, T = 64, TL = 320, HD = 128, BNH = B * NH;
+    std::vector<float> attn_prob(BNH*T*TL), d_attn_out(BNH*T*HD), V_full(BNH*TL*HD);
+    fill_random(attn_prob, r); fill_random(d_attn_out, r); fill_random(V_full, r);
+
+    std::vector<float> ref_dV(BNH*TL*HD), ref_dScores(BNH*T*TL);
+    cpu_attn_val_bw_batched(attn_prob.data(), d_attn_out.data(), V_full.data(),
+                             ref_dV.data(), ref_dScores.data(), BNH, T, TL, HD);
+
+    id<MTLBuffer> b_ap = g_mtl.bufFrom(attn_prob);
+    id<MTLBuffer> b_do = g_mtl.bufFrom(d_attn_out);
+    id<MTLBuffer> b_vf = g_mtl.bufFrom(V_full);
+    id<MTLBuffer> b_dV = g_mtl.buf(BNH*TL*HD);
+    id<MTLBuffer> b_dS = g_mtl.buf(BNH*T*TL);
+    auto pso_dV = g_mtl.pso(@"attn_val_bw_dV_batched_amx");
+    auto pso_dS = g_mtl.pso(@"attn_val_bw_dScores_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso_dV];
+    [enc setBuffer:b_ap offset:0 atIndex:0];
+    [enc setBuffer:b_do offset:0 atIndex:1];
+    [enc setBuffer:b_dV offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, TL/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc setComputePipelineState:pso_dS];
+    [enc setBuffer:b_do offset:0 atIndex:0];
+    [enc setBuffer:b_vf offset:0 atIndex:1];
+    [enc setBuffer:b_dS offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&HDu length:4 atIndex:4]; [enc setBytes:&TLu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(TL/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> g_dV(BNH*TL*HD), g_dS(BNH*T*TL);
+    g_mtl.readInto(b_dV, g_dV); g_mtl.readInto(b_dS, g_dS);
+    record("attn_val_bw_dV_batched_amx.realdim", g_dV, ref_dV, 1e-4f);
+    // dScores' reduction depth is HD=128 (16 8-wide simdgroup_matrix tiles) —
+    // AMX/simdgroup hardware accumulates in a different order than the naive
+    // kernel's sequential CPU-style loop, so a few ULPs of reordering drift
+    // are expected, not a correctness bug. Same signature and same fix as
+    // rel_pe_q_grad_dQrel_batched.realdim above (max_abs=7.629e-06,
+    // max_rel=2.045e-3 there vs max_abs=4.768e-06, max_rel=1.932e-3 here) —
+    // widened to 5e-3f for the same "accumulation-depth rounding" reason.
+    record("attn_val_bw_dScores_batched_amx.realdim", g_dS, ref_dScores, 5e-3f);
+}
+
+// attn_out_preO_recompute_batched_amx: same math as attn_qkt_bw_dQ_batched_
+// amx (attn_prob plays d_scores' role), reuse cpu_linear_fwd-style ref inline.
+static void run_attn_out_preO_recompute_batched_amx(Rng& r) {
+    const uint B = 32, NH = 8, T = 64, TL = 320, HD = 128, BNH = B * NH;
+    std::vector<float> attn_prob(BNH*T*TL), V_full(BNH*TL*HD);
+    fill_random(attn_prob, r); fill_random(V_full, r);
+
+    std::vector<float> ref(BNH*T*HD);
+    for (uint bnh = 0; bnh < BNH; bnh++) {
+        const float* pb = attn_prob.data() + (size_t)bnh*T*TL;
+        const float* vf = V_full.data() + (size_t)bnh*TL*HD;
+        float* out = ref.data() + (size_t)bnh*T*HD;
+        for (uint t = 0; t < T; t++)
+            for (uint hd = 0; hd < HD; hd++) {
+                float s = 0.0f;
+                for (uint tl = 0; tl < TL; tl++) s += pb[t*TL+tl] * vf[tl*HD+hd];
+                out[t*HD+hd] = s;
+            }
+    }
+
+    id<MTLBuffer> b_ap = g_mtl.bufFrom(attn_prob);
+    id<MTLBuffer> b_vf = g_mtl.bufFrom(V_full);
+    id<MTLBuffer> b_out = g_mtl.buf(BNH*T*HD);
+    auto pso = g_mtl.pso(@"attn_out_preO_recompute_batched_amx");
+
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint Tu=T, TLu=TL, HDu=HD;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_ap offset:0 atIndex:0];
+    [enc setBuffer:b_vf offset:0 atIndex:1];
+    [enc setBuffer:b_out offset:0 atIndex:2];
+    [enc setBytes:&Tu length:4 atIndex:3]; [enc setBytes:&TLu length:4 atIndex:4]; [enc setBytes:&HDu length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(HD/8, T/8, BNH) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    std::vector<float> got(BNH*T*HD);
+    g_mtl.readInto(b_out, got);
+    record("attn_out_preO_recompute_batched_amx.realdim", got, ref, 1e-4f);
+}
+
 static void cpu_rel_pe_q_grad_batched(const float* Q_mh, const float* d_q_rel_raw,
                                        const float* W_rel_r, float* d_Q_rel, float* d_W_rel_r,
                                        uint B, uint NH, uint T, uint HD, uint D_POS) {
@@ -1955,6 +2177,11 @@ int main(int argc, char** argv) {
         run_attn_qkt_bw_batched_realdim(r);
         run_attn_val_bw_batched(r);
         run_attn_val_bw_batched_realdim(r);
+        run_attn_qkt_bw_batched_amx(r);
+        run_attn_qkt_bw_batched_amx_realdim(r);
+        run_attn_val_bw_batched_amx(r);
+        run_attn_val_bw_batched_amx_realdim(r);
+        run_attn_out_preO_recompute_batched_amx(r);
         run_rel_pe_q_grad_batched(r);
         run_rel_pe_q_grad_batched_realdim(r);
         run_attn_out_preO_recompute_batched(r);
