@@ -210,6 +210,21 @@ static bool nncp_train_clamp_enabled() {
     return v != 0;
 }
 
+// Wave1-③ BF16 shadow residency (2026-07-14, bf16_wire): OPPOSITE default
+// polarity from nncp_train_clamp_enabled — this is a NEW, unvalidated
+// mechanism (design doc's own §5-B recommends a staged, evidence-gated
+// rollout; microbench found only ~1.04-1.13x GEMM speedup at production
+// shapes, far below the naive expectation — see bf16_wire.DONE), so it
+// defaults OFF and requires explicit opt-in ("1") rather than opt-out.
+static bool nncp_bf16_fwd_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_BF16_FWD");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;  // default OFF; only "1" enables
+    }
+    return v != 0;
+}
+
 // retrain-blocks (2026-07-11, retrain-blocks-spec-20260711.md): nncp.c's
 // trf_set_retrain (nncp.c L1236-1240) enables dropout ONLY while retrain is
 // active — `s->dropout_enabled = (enabled && s->dropout_prob != 0)` — and
@@ -1279,6 +1294,21 @@ struct OnlineTrainer {
     id<MTLComputePipelineState> ps_sgd;
     id<MTLComputePipelineState> ps_rmsprop;
     id<MTLComputePipelineState> ps_element_add_rb;  // element_add for readback-GPU path
+
+    // Wave1-③ BF16 residency (2026-07-14, clamp_impl's sibling task, bf16_wire
+    // — bf16-residency-design.md): FP32 master weights above stay the single
+    // source of truth (untouched); these are BF16 "shadow" copies refreshed
+    // once per segment (right after the optimizer step, before the next
+    // segment's forward) via fp32_to_bf16_weights (transformer_linear_amx_
+    // bf16.metal, already compiled into default.metallib, previously unwired).
+    // Lazily allocated/loaded ONLY when NNCP_BF16_FWD=1 — see
+    // nncp_bf16_fwd_enabled(). Scope matches the design doc §2-C: the
+    // GEMM-heavy weights only (embed/LN/rel-PE/optimizer state stay FP32-only,
+    // matching the doc's recommended non-BF16 list).
+    id<MTLComputePipelineState> ps_bf16_convert;      // fp32_to_bf16_weights
+    id<MTLBuffer> bf16_shadow_attn_q, bf16_shadow_attn_k, bf16_shadow_attn_v, bf16_shadow_attn_o;
+    id<MTLBuffer> bf16_shadow_ffn1, bf16_shadow_ffn2;
+    bool bf16_shadow_valid;  // false until the first refresh completes this run
 
     bool graph_built;
 
@@ -4666,6 +4696,72 @@ static void clip_gradients(OnlineTrainer* tr, float max_norm) {
         if (tr->grad_rel_r) clipTensor(tr->grad_rel_r, (size_t)tr->NH * tr->HD * tr->d_pos);
     }
     if (tr->grad_b_rel_r) clipTensor(tr->grad_b_rel_r, (size_t)tr->NH * tr->ext_len);
+}
+
+// ---------------------------------------------------------------------------
+// Wave1-③ BF16 shadow residency (2026-07-14, bf16_wire — bf16-residency-
+// design.md §2-A/§2-C). FP32 master weights (wb.attn_q/k/v/o/ffn1/ffn2)
+// remain the single source of truth and are never modified here; this
+// dispatches fp32_to_bf16_weights (transformer_linear_amx_bf16.metal,
+// already compiled into default.metallib, previously unwired) to refresh
+// BF16 "shadow" copies once per segment, right after the optimizer step —
+// matching the design doc's timing recommendation (not per-GEMM-call, which
+// was the old matmul_bf16 failure mode). Consumption of these shadows by
+// the actual forward GEMM path is NOT wired yet (see bf16_wire.DONE) — this
+// function only keeps the shadows correct/up to date so that a future
+// consumption change can be added without also needing to solve residency
+// timing at the same time.
+// ---------------------------------------------------------------------------
+static void nncp_bf16_shadow_dispatch(id<MTLComputeCommandEncoder> enc,
+                                       id<MTLComputePipelineState> pso,
+                                       id<MTLBuffer> src_fp32, id<MTLBuffer> dst_bf16) {
+    if (!src_fp32 || !dst_bf16) return;
+    uint32_t n = (uint32_t)([src_fp32 length] / sizeof(float));
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:src_fp32 offset:0 atIndex:0];
+    [enc setBuffer:dst_bf16 offset:0 atIndex:1];
+    [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+    NSUInteger tg = MIN((NSUInteger)n, (NSUInteger)256);
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+static void nncp_bf16_shadow_refresh(OnlineTrainer* tr, const MPSTransformerWeightBuffers& wb) {
+    if (!nncp_bf16_fwd_enabled()) return;
+    if (!tr->ps_bf16_convert) {
+        id<MTLLibrary> lib = load_metal_library(tr->device);
+        tr->ps_bf16_convert = load_pso(tr->device, lib, @"fp32_to_bf16_weights");
+        if (!tr->ps_bf16_convert) {
+            fprintf(stderr, "[BF16_WIRE] fp32_to_bf16_weights PSO load failed — shadow refresh disabled this run\n");
+            return;
+        }
+    }
+    auto ensureShadow = [&](id<MTLBuffer>& shadow, id<MTLBuffer> master) {
+        if (!master) return;
+        const size_t n = [master length] / sizeof(float);
+        const size_t bytes_bf16 = n * sizeof(uint16_t);  // bfloat is 2 bytes
+        if (!shadow || [shadow length] != bytes_bf16) {
+            shadow = [tr->device newBufferWithLength:bytes_bf16 options:MTLResourceStorageModeShared];
+        }
+    };
+    ensureShadow(tr->bf16_shadow_attn_q, wb.attn_q);
+    ensureShadow(tr->bf16_shadow_attn_k, wb.attn_k);
+    ensureShadow(tr->bf16_shadow_attn_v, wb.attn_v);
+    ensureShadow(tr->bf16_shadow_attn_o, wb.attn_out);
+    ensureShadow(tr->bf16_shadow_ffn1,   wb.ffn1);
+    ensureShadow(tr->bf16_shadow_ffn2,   wb.ffn2);
+
+    id<MTLCommandBuffer> cb = [tr->cmdQueue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.attn_q,   tr->bf16_shadow_attn_q);
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.attn_k,   tr->bf16_shadow_attn_k);
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.attn_v,   tr->bf16_shadow_attn_v);
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.attn_out, tr->bf16_shadow_attn_o);
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.ffn1,     tr->bf16_shadow_ffn1);
+    nncp_bf16_shadow_dispatch(enc, tr->ps_bf16_convert, wb.ffn2,     tr->bf16_shadow_ffn2);
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    tr->bf16_shadow_valid = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -9016,6 +9112,11 @@ bool online_trainer_train_segment_batch(OnlineTrainer* tr,
             [cmd commit];
             [cmd waitUntilCompleted];
         }
+        // Wave1-③ (2026-07-14, bf16_wire): refresh the BF16 weight shadows
+        // right after this step's optimizer update, before the NEXT
+        // segment's forward reads the (now-stale-if-skipped) shadows. No-op
+        // (single cached getenv check) unless NNCP_BF16_FWD=1.
+        nncp_bf16_shadow_refresh(tr, wb);
         if (nncp_state_norm_step_forced()) {
             const uint64_t _state_step = tr->is_retrain ? tr->retrain_train_step : tr->train_step;
             nncp_state_norm_dump(tr, wb, _state_step);
