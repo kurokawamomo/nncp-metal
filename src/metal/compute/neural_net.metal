@@ -773,6 +773,25 @@ kernel void element_add(
     output[gid] = a[gid] + b[gid];
 }
 
+// element_mul: output[i] = a[i] * b[i] (2026-07-14, mbw_dropout — metal_bw's
+// dropout mask wiring). Used to apply/undo the SAME inverted-dropout mask
+// forward used, on both sides of a masked value: mask the forward-recomputed
+// value before it feeds a downstream matmul, and undo the mask on the
+// downstream gradient before it feeds this tensor's own weight/bias
+// gradient (chain rule for y=x*mask: dx = dy*mask, same mask, plain
+// elementwise multiply — no different from the forward multiply itself).
+// output may alias a (in-place: output[i] = a[i]*b[i] is safe per-thread).
+kernel void element_mul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    output[gid] = a[gid] * b[gid];
+}
+
 // =============================================================================
 // Phase M-1: Manual Metal backward kernels
 //

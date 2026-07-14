@@ -325,6 +325,72 @@ static void run_linear_bw_bias(Rng& r) {
     record("linear_bw_bias", out, ref, 1e-5f);
 }
 
+// mbw_dropout (2026-07-14, T2関門): element_mul is the primitive every one
+// of metal_bw_loss/metal_bw_layer/metal_bw_embed's 7 dropout-hook mask
+// multiplies is built from (see online_trainer.mm's "mbw_dropout" comments
+// at each hook site) -- this verifies the KERNEL PRIMITIVE itself against a
+// CPU reference, at both an identity mask (all-1.0, the rate=0 online-call
+// case -- must be an exact no-op) and a random mask (the retrain, rate>0
+// case). It does NOT verify that each hook's CHAIN-RULE PLACEMENT in
+// metal_bw_layer/loss/embed is correct end to end (that would need a full
+// composed forward+backward layer harness this file doesn't have) -- see
+// mbw_dropout.DONE for what full-pipeline verification (NNCP_BW_VERIFY_L1
+// under live retrain dropout) is still needed for.
+static void run_element_mul(Rng& r) {
+    const uint n = 4096;
+    std::vector<float> a(n), identity(n, 1.0f), random_mask(n), out(n);
+    fill_random(a, r);
+    fill_random(random_mask, r);
+
+    id<MTLBuffer> ba = g_mtl.bufFrom(a);
+    id<MTLBuffer> bid = g_mtl.bufFrom(identity);
+    id<MTLBuffer> brand = g_mtl.bufFrom(random_mask);
+    id<MTLBuffer> bout = g_mtl.buf(n);
+    auto pso = g_mtl.pso(@"element_mul");
+
+    auto run = [&](id<MTLBuffer> mask, id<MTLBuffer> dst) {
+        id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:ba   offset:0 atIndex:0];
+        [enc setBuffer:mask offset:0 atIndex:1];
+        [enc setBuffer:dst  offset:0 atIndex:2];
+        [enc setBytes:&n length:sizeof(uint) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(n,256u),1,1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+    };
+
+    // Identity mask: output must equal `a` exactly (rate=0 no-op contract).
+    run(bid, bout);
+    g_mtl.readInto(bout, out);
+    record("element_mul.identity", out, a, 0.0f);
+
+    // Random mask: output must equal a[i]*random_mask[i].
+    std::vector<float> ref_rand(n);
+    for (uint i = 0; i < n; i++) ref_rand[i] = a[i] * random_mask[i];
+    run(brand, bout);
+    g_mtl.readInto(bout, out);
+    record("element_mul.random", out, ref_rand, 1e-6f);
+
+    // In-place (dst aliases a): must match the same random-mask reference —
+    // every mbw_dropout call site multiplies a buffer by its mask in place.
+    id<MTLBuffer> bip = g_mtl.bufFrom(a);
+    id<MTLCommandBuffer> cb = [g_mtl.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bip   offset:0 atIndex:0];
+    [enc setBuffer:brand offset:0 atIndex:1];
+    [enc setBuffer:bip   offset:0 atIndex:2];
+    [enc setBytes:&n length:sizeof(uint) atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(n,256u),1,1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    std::vector<float> out_ip(n);
+    g_mtl.readInto(bip, out_ip);
+    record("element_mul.inplace_random", out_ip, ref_rand, 1e-6f);
+}
+
 static void run_rmsnorm_bw(Rng& r) {
     uint B = 16, D = 128;
     std::vector<float> gy(B*D), x(B*D), gamma(D), inv_rms(B);
@@ -2266,6 +2332,11 @@ int main(int argc, char** argv) {
         run_rel_pe_q_grad_batched_amx_realdim(r);
         run_attn_out_preO_recompute_batched(r);
         run_kv_memory_shift(r);
+        // mbw_dropout (2026-07-14): appended last so it can't perturb the
+        // shared RNG's draw sequence for any pre-existing test above (all
+        // draw from the same Rng& r in call order) — see the DONE report
+        // for the ordering bug this caught during development.
+        run_element_mul(r);
 
         int fail = 0;
         for (auto& r : g_results) if (!r.ok) fail++;
