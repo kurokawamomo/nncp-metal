@@ -186,6 +186,30 @@ static float nncp_dropout_att_rate() {
     return cached;
 }
 
+// Wave1-① train-side activation clamp (2026-07-14, clamp_impl — shield-
+// judgment-26.66pct-strategy: late-training FP32 blowups in a *forward*
+// pass (finite input -> non-finite output, seen at varying layers/streams,
+// growing in frequency run over run: 4->35->12->63 events) are a physiology
+// issue distinct from the loss-graph NaN-row poisoning already fixed
+// (nan_fix3) — decode's own graph (mps_transformer_graph.mm) already clamps
+// attention scores to +-50 before softmax via clampWithTensor: (fine there,
+// no backward pass); train needs the SAME numeric ceiling but MUST NOT use
+// clampWithTensor: (its backward is broken on this MPSGraph — established
+// precedent, "重要な技術的判断" in MEMORY.md) — minimum+maximum is the
+// standing safe idiom (same one build_loss_bwd's own logits clamp already
+// uses). Read once at graph-BUILD time (build_single_layer is called by
+// both build_per_layer_fwd/build_per_layer_bwd, each compiled once and
+// reused every segment) so NNCP_TRAIN_CLAMP=0 structurally omits the clamp
+// ops entirely rather than merely being numerically inert.
+static bool nncp_train_clamp_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_TRAIN_CLAMP");
+        v = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;  // default ON; only "0" disables
+    }
+    return v != 0;
+}
+
 // retrain-blocks (2026-07-11, retrain-blocks-spec-20260711.md): nncp.c's
 // trf_set_retrain (nncp.c L1236-1240) enables dropout ONLY while retrain is
 // active — `s->dropout_enabled = (enabled && s->dropout_prob != 0)` — and
@@ -3434,6 +3458,20 @@ static MPSGraphTensor* build_single_layer(
     }
 
     scores = [g additionWithPrimaryTensor:scores secondaryTensor:causal_mask name:nil];
+    // Wave1-① attention-score clamp (2026-07-14, clamp_impl): symmetric with
+    // decode's own +-50 clamp (mps_transformer_graph.mm, right before its
+    // softmax too) but via minimum+maximum, never clampWithTensor: (backward
+    // is broken for that op — standing precedent). NNCP_TRAIN_CLAMP=0 omits
+    // this structurally; when active, values already within +-50 pass
+    // through unchanged (min/max on an in-range value is a no-op — no
+    // arithmetic transform), so this is bit-exact whenever it doesn't
+    // actually clip anything.
+    if (nncp_train_clamp_enabled()) {
+        MPSGraphTensor* sc_hi = [g constantWithScalar:50.0 dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* sc_lo = [g constantWithScalar:-50.0 dataType:MPSDataTypeFloat32];
+        scores = [g minimumWithPrimaryTensor:scores secondaryTensor:sc_hi name:nil];
+        scores = [g maximumWithPrimaryTensor:scores secondaryTensor:sc_lo name:nil];
+    }
     scores = [g softMaxWithTensor:scores axis:-1 name:nil];
     // t_attn_prob records the pre-dropout softmax output (decode has no
     // dropout, so this stays the fair comparison point for XCMP/decode-dump
@@ -3482,6 +3520,23 @@ static MPSGraphTensor* build_single_layer(
     MPSGraphTensor* fp = [g additionWithPrimaryTensor:
         [g matrixMultiplicationWithPrimaryTensor:x_ln2 secondaryTensor:w_ffn1 name:nil]
         secondaryTensor:b_ffn1 name:nil];
+    // Wave1-① FFN1/GeGLU-input clamp (2026-07-14, clamp_impl): same rationale
+    // and mechanism as the attention-score clamp above (minimum+maximum,
+    // never clampWithTensor:) — bounds FF1's raw matmul+bias output before
+    // it feeds GeGLU's tr_gelu(fv)*fg (an exp()-based activation, another
+    // FP32-overflow-prone spot per the shield-judgment strategy report).
+    // +-64 (wider than the attention score's +-50 since this value hasn't
+    // been through a softmax-normalizing operation and legitimately spans a
+    // somewhat larger range) is a first-pass choice, not empirically tuned
+    // yet — see clamp_impl.DONE for the reasoning and the request for
+    // real-run evidence on whether it needs adjustment. Bit-exact whenever
+    // it doesn't actually clip (same no-op-in-range property as above).
+    if (nncp_train_clamp_enabled()) {
+        MPSGraphTensor* fp_hi = [g constantWithScalar:64.0 dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* fp_lo = [g constantWithScalar:-64.0 dataType:MPSDataTypeFloat32];
+        fp = [g minimumWithPrimaryTensor:fp secondaryTensor:fp_hi name:nil];
+        fp = [g maximumWithPrimaryTensor:fp secondaryTensor:fp_lo name:nil];
+    }
     // Dropout hook #5 (nncp.c L929-933): applied to FF1's raw matmul+bias
     // output, BEFORE the GELU/GeGLU activation/split (verified by direct
     // read — dropout_mul happens immediately after ff_bias1 add, before the
