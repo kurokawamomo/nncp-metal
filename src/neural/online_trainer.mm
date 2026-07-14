@@ -596,6 +596,7 @@ struct M2BwContext {
     id<MTLComputePipelineState> ps_geglu_recomp_split;
     id<MTLComputePipelineState> ps_gelu_bw;
     id<MTLComputePipelineState> ps_element_add;
+    id<MTLComputePipelineState> ps_element_mul;         // element_mul (mbw_dropout, 2026-07-14)
     id<MTLComputePipelineState> ps_kv_assemble;        // kv_assemble_per_head
     id<MTLComputePipelineState> ps_embed_bw;
     id<MTLComputePipelineState> ps_rel_pe_q_bw;
@@ -699,6 +700,17 @@ struct M2BwContext {
     // FFN scratch (enwik8): ffn = GELU(val)*gate recompute [BT, F] for grad_ffn2 input
     id<MTLBuffer> ffn_recomp;
 
+    // mbw_dropout (2026-07-14): dropout mask wiring for metal_bw_layer/loss/
+    // embed. mask_scratch_bt_h holds a masked COPY of a [BT,H] gradient
+    // (hook #6's d_ff, then reused for hook #4's d_x_mid — the two uses are
+    // temporally disjoint within one metal_bw_layer call, see mbw_dropout.DONE
+    // for why that's safe). attn_prob_masked holds attn_prob[i]*mask_att_prob
+    // (hook #3) — same [B_NH,T,TL] shape as attn_prob[i] itself, allocated
+    // once and reused across layers/segments (not per-layer, unlike
+    // attn_prob[i] — only one layer's masked copy is ever needed at a time).
+    id<MTLBuffer> mask_scratch_bt_h;
+    id<MTLBuffer> attn_prob_masked;
+
     // Dimensions cached for buffer sizing
     uint32_t BT;
     uint32_t TL;       // total attention length (MEM_LEN + T_CHUNK)
@@ -730,6 +742,7 @@ static void metal_bw_destroy(M2BwContext* m2) {
     m2->d_x_ln1 = nil; m2->d_x_ln2 = nil; m2->d_x_mid = nil;
     m2->d_q_rel_raw = nil;
     m2->ffn_recomp = nil;
+    m2->mask_scratch_bt_h = nil; m2->attn_prob_masked = nil;
     m2->qdist_buf = nil; m2->bdist_buf = nil;
     m2->k_full = nil; m2->v_full = nil; m2->kv_new_scr = nil; m2->zero_bias = nil;
     m2->q_mh = nil; m2->d_attn_out_mh = nil;
@@ -772,6 +785,7 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     m2->ps_geglu_recomp_split = load(@"geglu_recompute_split");
     m2->ps_gelu_bw            = load(@"gelu_bw");
     m2->ps_element_add        = load(@"element_add");
+    m2->ps_element_mul        = load(@"element_mul");
     m2->ps_kv_assemble        = load(@"kv_assemble_per_head");
     m2->ps_embed_bw           = load(@"embed_bw");
     m2->ps_rel_pe_q_bw        = load(@"rel_pe_q_scatter_bw");
@@ -871,6 +885,13 @@ static M2BwContext* metal_bw_init(id<MTLDevice> device, id<MTLLibrary> lib,
     const size_t d_q_rel_raw_floats = (size_t)BT * NH * D_POS;
     m2->d_q_rel_raw = newBuf(((BT_NH_TL > d_q_rel_raw_floats) ? BT_NH_TL : d_q_rel_raw_floats) * sizeof(float));
     m2->ffn_recomp  = newBuf(BT_F * sizeof(float));
+
+    // mbw_dropout (2026-07-14): mask_scratch_bt_h [BT,H] (hooks #4/#6, reused
+    // — see the struct comment) and attn_prob_masked [B_NH,T,TL] (hook #3,
+    // same size as attn_prob[i], allocated once and reused across
+    // layers/segments).
+    m2->mask_scratch_bt_h = newBuf(BT_H * sizeof(float));
+    m2->attn_prob_masked  = newBuf(BT_NH_TL * sizeof(float));
 
     // Rel-PE distance tables [T_CHUNK, TL] int32, precomputed from profile.
     {
@@ -1698,6 +1719,27 @@ static bool metal_bw_loss(OnlineTrainer* tr,
         x_after_ln = m2->x_ln_final;
     }
 
+    // mbw_dropout (2026-07-14): hook #7 (nncp.c L992-1001 — dropout applied
+    // to LN_FINAL's output, BEFORE the out_proj matmul). tr->dropout_mask_
+    // final is the SAME persistent mask buffer build_loss_bwd's MPSGraph
+    // path feeds — see nncp_fill_dropout_mask_cached's call site in
+    // run_per_layer_bptt_chunk's loss stage, which fills it before EITHER
+    // backward path could read it. rate=0 → buffer holds all-1.0f (identity,
+    // a true no-op multiply); NNCP_DROPOUT entirely unset → buffer is nil
+    // (mirrors build_loss_bwd's own placeholder-existence gate, no multiply
+    // at all). Masking x_after_ln in place here is safe: it has no other
+    // reader before ps_lin below.
+    if (tr->dropout_mask_final && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:x_after_ln            offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_final offset:0 atIndex:1];
+        [enc setBuffer:x_after_ln            offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+    }
+
     [enc setComputePipelineState:ps_lin];
     [enc setBuffer:x_after_ln     offset:0 atIndex:0];
     [enc setBuffer:wb->out_proj   offset:0 atIndex:1];
@@ -1745,6 +1787,28 @@ static bool metal_bw_loss(OnlineTrainer* tr,
         [enc setBytes:&K length:sizeof(uint32_t) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(K/8, M/8, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        // mbw_dropout (2026-07-14): hook #7 backward undo. d_x_buf now holds
+        // d(masked x_after_ln); chain rule for y=x*mask gives dx=dy*mask —
+        // same mask, multiply again (in place) before ps_rmsnorm_bw_x below
+        // reads it as d(x_after_ln) proper. Only meaningful for is_enwik8
+        // (d_x_buf==m2->x_ln_final there); for !is_enwik8, d_x_buf IS
+        // tr->pl_dh directly and hook #7 doesn't apply to the default
+        // profile's (non-LN_FINAL) path the same way, so this is skipped —
+        // matches build_loss_bwd's own is_enwik8-independent mask_final
+        // wiring only ever being exercised for the enwik8 profile in
+        // practice (nncp_dropout_rate() is 0 by default for the non-enwik8
+        // profile in this project).
+        if (is_enwik8 && tr->dropout_mask_final && m2->ps_element_mul) {
+            [enc setComputePipelineState:m2->ps_element_mul];
+            [enc setBuffer:d_x_buf                offset:0 atIndex:0];
+            [enc setBuffer:tr->dropout_mask_final offset:0 atIndex:1];
+            [enc setBuffer:d_x_buf                offset:0 atIndex:2];
+            uint32_t n = BT * H;
+            [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        }
     }
     // grad_out/grad_b_out are NOT computed here (take 2, see comment above) —
     // the MPSGraph loss-bw path owns them exclusively. Only d_x (feeding
@@ -1871,6 +1935,28 @@ static bool metal_bw_embed(OnlineTrainer* tr,
 
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     enc.label = @"m2_bw_embed";
+    // mbw_dropout (2026-07-14): hook #1 (nncp.c L628-632 — dropout applied to
+    // the embedding output, BEFORE the layer loop). By the time metal_bw_
+    // embed runs, tr->pl_dh has already been overwritten by layer 0's LN1
+    // backward (metal_bw_layer's last step: "pl_dh = pl_dh + d_x_mid") to
+    // hold d(pl_h[0]) — and pl_h[0] itself was saved as the MASKED value
+    // (the CPU embedding step in run_per_layer_bptt_chunk applies mask_embed
+    // in place before saving). So d(pl_h[0]_masked) = tr->pl_dh needs the
+    // SAME undo (*mask_embed) the CPU embed-gradient path already applies
+    // (see run_per_layer_bptt_chunk's "Dropout hook #1's chain rule" block)
+    // before it can be used as d(embed_row_prescale) here. Mutating pl_dh
+    // in place is safe: embed backward is metal_bw_train_step's last stage,
+    // nothing reads pl_dh again after this.
+    if (tr->dropout_mask_embed && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:tr->pl_dh             offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_embed offset:0 atIndex:1];
+        [enc setBuffer:tr->pl_dh             offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+    }
     dispatch_embed_bw(enc, m2->ps_embed_bw,
                       tr->pl_dh, tr->seg_buf_input, tr->grad_embed,
                       BT, H, V, embed_scale, /*accumulate=*/true);
@@ -5963,6 +6049,24 @@ static void dispatch_element_add(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
+// dispatch_element_mul: out[i] = a[i]*b[i] (2026-07-14, mbw_dropout). out may
+// alias a for an in-place masked update.
+static void dispatch_element_mul(id<MTLComputeCommandEncoder> enc,
+                                  id<MTLComputePipelineState> pso,
+                                  id<MTLBuffer> a, NSUInteger a_off,
+                                  id<MTLBuffer> b, NSUInteger b_off,
+                                  id<MTLBuffer> out, NSUInteger out_off,
+                                  uint32_t size) {
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:a   offset:a_off   atIndex:0];
+    [enc setBuffer:b   offset:b_off   atIndex:1];
+    [enc setBuffer:out offset:out_off atIndex:2];
+    [enc setBytes:&size length:sizeof(uint32_t) atIndex:3];
+    NSUInteger tg = MIN((NSUInteger)256, (NSUInteger)size);
+    [enc dispatchThreads:MTLSizeMake(size, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
 // dispatch_geglu_bw_split: val/gate separate inputs [B,D] → d_out packed [B, 2D]
 static void dispatch_geglu_bw_split(id<MTLComputeCommandEncoder> enc,
                                      id<MTLComputePipelineState> pso,
@@ -6406,7 +6510,8 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     if (!m2->ps_linear_bw_input || !m2->ps_linear_bw_weight || !m2->ps_linear_bw_weight_acc ||
         !m2->ps_linear_bw_bias || !m2->ps_linear_bw_bias_acc || !m2->ps_rmsnorm_bw_x || !m2->ps_rmsnorm_bw_gamma ||
         !m2->ps_softmax_bw || !m2->ps_geglu_bw_split || !m2->ps_geglu_recomp_split ||
-        !m2->ps_element_add || !m2->ps_scale_buffer || !m2->ps_extract_new_kv_tail ||
+        !m2->ps_element_add || !m2->ps_element_mul || !m2->ps_scale_buffer || !m2->ps_extract_new_kv_tail ||
+        !m2->mask_scratch_bt_h || !m2->attn_prob_masked ||
         !m2->ps_rel_pe_q_bw_batched || !m2->ps_rel_pe_br_bw_batched ||
         !m2->ps_attn_qkt_bw_dQ_batched || !m2->ps_attn_qkt_bw_dK_batched ||
         !m2->ps_attn_val_bw_dV_batched || !m2->ps_attn_val_bw_dScores_batched ||
@@ -6490,6 +6595,30 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                                     m2->geglu_val[i], m2->geglu_gate[i], m2->ffn_recomp,
                                     BT, F);
     barrier();
+    // mbw_dropout (2026-07-14): hook #6 (nncp.c dropout_mul(ff2_out, ...),
+    // applied to the FF2 output BEFORE residual #2 — build_single_layer's
+    // "if (mask_ffn2) ff = ff*mask_ffn2" right before "res2 = residual+ff").
+    // pl_dh here is d(res2) = d(masked ff) via the residual's identity
+    // gradient — the FFN2 weight/bias gradients below need d(ff) =
+    // d(masked_ff)*mask_ffn2, NOT raw pl_dh. Compute the masked copy into
+    // mask_scratch_bt_h and use THAT for the 3 FFN2-branch uses; the
+    // residual-2 merge further below ("d_x_mid = d_x_mid + pl_dh") still
+    // correctly uses the RAW pl_dh (residual identity, untouched by hook
+    // #6's mask). tr->dropout_mask_ffn2[i] nil (dropout entirely disabled)
+    // → skip entirely, d_ff stays aliased to pl_dh unchanged.
+    id<MTLBuffer> d_ff = tr->pl_dh;
+    if (tr->dropout_mask_ffn2[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:tr->pl_dh              offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_ffn2[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->mask_scratch_bt_h  offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        barrier();
+        d_ff = m2->mask_scratch_bt_h;
+    }
     // Bug fix (2026-07-03): grad_b_ffn2 must accumulate across BPTT chunks
     // (same contract as grad_ffn2 via linear_bw_weight_acc, see comment above:
     // "grad_b_ffn2[i] += sum_m pl_dh"), but linear_bw_bias overwrites
@@ -6498,13 +6627,13 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // matches the caller-zeroes-first-chunk contract every other grad_* buffer
     // in this function already follows.
     dispatch_bias_bw(enc, m2->ps_linear_bw_bias_acc,
-                     tr->pl_dh, 0,
+                     d_ff, 0,
                      tr->grad_b_ffn2, ofs.b_h,
                      BT, H);
     // linear_bw_weight_acc: dW[k,n] += X[m,k]^T @ dY[m,n]; here K=F, N=H, M=BT
     [enc setComputePipelineState:m2->ps_linear_bw_weight_acc];
     [enc setBuffer:m2->ffn_recomp offset:0          atIndex:0];
-    [enc setBuffer:tr->pl_dh       offset:0          atIndex:1];
+    [enc setBuffer:d_ff            offset:0          atIndex:1];
     [enc setBuffer:tr->grad_ffn2   offset:ofs.w_ffn2 atIndex:2];
     { uint32_t M = BT, K = F, N = H;
       [enc setBytes:&M length:sizeof(uint32_t) atIndex:3];
@@ -6512,9 +6641,9 @@ static bool metal_bw_layer(OnlineTrainer* tr,
       [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
       [enc dispatchThreadgroups:MTLSizeMake(N / 8, K / 8, 1)
           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
-    // d_ffn = pl_dh @ W_ffn2^T (linear_bw_input: dY=[M=BT, N=H], W=[K=F, N=H], dX=[M=BT, K=F])
+    // d_ffn = d_ff @ W_ffn2^T (linear_bw_input: dY=[M=BT, N=H], W=[K=F, N=H], dX=[M=BT, K=F])
     dispatch_linear_bw_input(enc, m2->ps_linear_bw_input,
-                             tr->pl_dh, 0,
+                             d_ff, 0,
                              wb->ffn2, ofs.w_ffn2,
                              m2->d_geglu, 0,
                              BT, H, F);
@@ -6524,6 +6653,28 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                              m2->d_geglu, m2->geglu_val[i], m2->geglu_gate[i],
                              m2->d_ffn1, BT, F);
     barrier();
+    // mbw_dropout (2026-07-14): hook #5 (nncp.c dropout_mul applied to FF1's
+    // raw output, BEFORE the GeGLU val/gate split — build_single_layer's
+    // "if (mask_ff1) fp = fp*mask_ff1" right before the slice). Unlike hook
+    // #6, the FORWARD side needs no fix here: m2->geglu_val[i]/geglu_gate[i]
+    // were saved from the ALREADY-masked fp (the slice happens after the
+    // mask multiply in build_single_layer), so dispatch_geglu_recompute_
+    // split/dispatch_geglu_bw_split above are already correct as-is. Only
+    // the BACKWARD undo is needed: d_ffn1 (just computed) is d(masked fp);
+    // the grad_b_ffn1/grad_ffn1/d_x_ln2 computations below need d(fp) =
+    // d(masked fp)*mask_ff1 — mask in place (m2->d_ffn1 has no other
+    // reader before this point in the current BPTT chunk).
+    if (tr->dropout_mask_ff1[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->d_ffn1             offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_ff1[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->d_ffn1             offset:0 atIndex:2];
+        uint32_t n = BT * 2u * F;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        barrier();
+    }
     // grad_b_ffn1[i] += sum_m d_ffn_pre  (N=2F). Same accumulate-contract fix
     // as grad_b_ffn2 above — linear_bw_bias_acc, not linear_bw_bias.
     dispatch_bias_bw(enc, m2->ps_linear_bw_bias_acc,
@@ -6670,6 +6821,28 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         [enc dispatchThreadgroups:MTLSizeMake(Hloc / 8, BTloc / 8, 1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         barrier();
+        // mbw_dropout (2026-07-14): hook #2's V component (nncp.c L712-716 —
+        // dropout applied to Q and V right after their own matmul, BEFORE
+        // multi-head split; K is deliberately untouched — "no need to apply
+        // w_k on key", same source comment build_single_layer already cites).
+        // kv_new_scr currently holds the RAW V_new this segment computed;
+        // the actual forward pass masked it before it ever became part of
+        // v_full/the KV cache. Masking it here — before kv_assemble folds it
+        // into v_full — keeps v_full consistent with what forward actually
+        // used for BOTH the P@V matmul (attn_val_bw's dV/dScores/attn_out_
+        // preO_recompute above) and the KV-cache write for the NEXT segment.
+        // tr->dropout_mask_v[i] nil → skip, kv_new_scr stays raw V_new.
+        if (tr->dropout_mask_v[i] && m2->ps_element_mul) {
+            [enc setComputePipelineState:m2->ps_element_mul];
+            [enc setBuffer:m2->kv_new_scr        offset:0 atIndex:0];
+            [enc setBuffer:tr->dropout_mask_v[i] offset:0 atIndex:1];
+            [enc setBuffer:m2->kv_new_scr        offset:0 atIndex:2];
+            uint32_t n = BT * H;
+            [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+            barrier();
+        }
         [enc setComputePipelineState:m2->ps_kv_assemble];
         [enc setBuffer:tr->kv_mem_buf_v[i] offset:0 atIndex:0];
         [enc setBuffer:m2->kv_new_scr      offset:0 atIndex:1];
@@ -6684,6 +6857,32 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         barrier();
     }
 
+    // mbw_dropout (2026-07-14): hook #3 (nncp.c L796-798 — dropout applied to
+    // the post-softmax attention probability, BEFORE the P@V matmul).
+    // attn_prob[i] is SAVED PRE-mask (build_single_layer captures t_attn_prob
+    // before "if (mask_att_prob) scores = scores*mask_att_prob" — matching
+    // #4/#6's pre-mask save convention, opposite of #2/#5's post-mask
+    // convention). The actual forward P@V matmul used the MASKED
+    // probabilities, so BOTH consumers below that recompute/reuse that
+    // matmul (the pre-O-proj recompute here, and attn_val_bw's dV further
+    // down) need attn_prob_masked = attn_prob[i]*mask_att_prob, not the raw
+    // saved value. Computed once per layer into the reused (not per-layer)
+    // m2->attn_prob_masked scratch. tr->dropout_mask_att_prob[i] nil → skip,
+    // ap stays aliased to the raw attn_prob[i] unchanged.
+    id<MTLBuffer> ap = m2->attn_prob[i];
+    if (tr->dropout_mask_att_prob[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->attn_prob[i]            offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_att_prob[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->attn_prob_masked        offset:0 atIndex:2];
+        uint32_t n = B_NH * T * TL;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        barrier();
+        ap = m2->attn_prob_masked;
+    }
+
     // Forward saved attn_out = POST-O-proj (see t_attn_out comment at L213). We need
     // PRE-O-proj for grad_o. Recompute it via attn_prob @ V_full per head.
     // attn_pre_Wo_mh [BNH, T, HD] = attn_prob [BNH, T, TL] @ V_full [BNH, TL, HD]
@@ -6696,7 +6895,7 @@ static bool metal_bw_layer(OnlineTrainer* tr,
         // recompute_batched_amx bit-exact vs both the naive batched kernel
         // and the CPU reference (max_abs=0, max_rel=0).
         dispatch_attn_out_preO_recompute_batched_amx(enc, m2->ps_attn_out_preO_recompute_batched_amx,
-                                                  m2->attn_prob[i], m2->v_full,
+                                                  ap, m2->v_full,
                                                   m2->d_q_rel_mh, // scratch: [BNH,T,HD]
                                                   B_NH, T, TL, HD);
         barrier();
@@ -6706,10 +6905,34 @@ static bool metal_bw_layer(OnlineTrainer* tr,
                                   B, T, NH, HD, H);
         barrier();
     }
-    // grad_o[i] += attn_out_pre^T @ d_x_mid   (K=H, N=H, M=BT)
+    // mbw_dropout (2026-07-14): hook #4 (nncp.c "dropout_mul(attn_out, ...)",
+    // applied to the POST-O-proj attention output, BEFORE residual #1 —
+    // build_single_layer's "if (mask_attn) attn = attn*mask_attn" right
+    // before "res1 = residual+attn"). d_x_mid here is d(res1) = d(masked
+    // attn) via the residual's identity gradient — grad_o's weight gradient
+    // and d_attn_out_preO below need d(attn) = d(masked_attn)*mask_attn,
+    // NOT raw d_x_mid. The residual-1 merge further below ("pl_dh = pl_dh +
+    // d_x_mid", combining with LN1's own d_x) still correctly uses the RAW
+    // d_x_mid — untouched by hook #4's mask, same pattern as hook #6's
+    // residual-2 merge. tr->dropout_mask_attn[i] nil → skip, d_attn_grad
+    // stays aliased to d_x_mid unchanged.
+    id<MTLBuffer> d_attn_grad = m2->d_x_mid;
+    if (tr->dropout_mask_attn[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->d_x_mid            offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_attn[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->mask_scratch_bt_h  offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        barrier();
+        d_attn_grad = m2->mask_scratch_bt_h;
+    }
+    // grad_o[i] += attn_out_pre^T @ d(attn)   (K=H, N=H, M=BT)
     [enc setComputePipelineState:m2->ps_linear_bw_weight_acc];
     [enc setBuffer:m2->attn_out[i] offset:0         atIndex:0];
-    [enc setBuffer:m2->d_x_mid     offset:0         atIndex:1];
+    [enc setBuffer:d_attn_grad     offset:0         atIndex:1];
     [enc setBuffer:tr->grad_o      offset:ofs.w_qkv atIndex:2];
     { uint32_t M = BT, K = H, N = H;
       [enc setBytes:&M length:sizeof(uint32_t) atIndex:3];
@@ -6717,9 +6940,9 @@ static bool metal_bw_layer(OnlineTrainer* tr,
       [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
       [enc dispatchThreadgroups:MTLSizeMake(N / 8, K / 8, 1)
           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
-    // d_attn_out_preO = d_x_mid @ W_o^T   (dY=[BT,H], W=[H,H], dX=[BT,H])
+    // d_attn_out_preO = d(attn) @ W_o^T   (dY=[BT,H], W=[H,H], dX=[BT,H])
     dispatch_linear_bw_input(enc, m2->ps_linear_bw_input,
-                             m2->d_x_mid, 0,
+                             d_attn_grad, 0,
                              wb->attn_out, ofs.w_qkv,
                              m2->d_attn_out, 0,
                              BT, H, H);
@@ -6744,14 +6967,41 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     // 5e-3f (accumulation-depth rounding at HD=128 reduction, same
     // signature as rel_pe_q_grad_dQrel_batched.realdim's established
     // tolerance) vs the CPU reference.
+    // dV needs the masked probability `ap` (matches the actual forward P@V
+    // matmul, see the hook #3 comment above) — dScores' OWN formula
+    // (d(masked_scores)[t,tl] = sum_hd d_attn_out[t,hd]*V[tl,hd]) doesn't
+    // reference the probability value at all, so it's unaffected by which
+    // variant we'd pass; kept as `ap` here too purely for consistency (both
+    // dV/dScores share the same call, `ap` is a strict improvement over
+    // stale attn_prob[i] with no downside).
     dispatch_attn_val_bw_batched_amx(enc,
                           m2->ps_attn_val_bw_dV_batched_amx, m2->ps_attn_val_bw_dScores_batched_amx,
-                          m2->d_attn_out_mh, m2->attn_prob[i], m2->v_full,
+                          m2->d_attn_out_mh, ap, m2->v_full,
                           m2->d_v_mh, m2->d_scores,
                           B_NH, T, TL, HD);
     barrier();
 
+    // mbw_dropout (2026-07-14): hook #3 backward undo. d_scores here is
+    // d(masked_scores) (attn_val_bw_dScores' output); softmax_bw needs the
+    // gradient w.r.t. its OWN actual output attn_prob[i] (the raw,
+    // pre-mask value it was passed below) — chain rule for y_masked=y*mask
+    // gives d(y)=d(y_masked)*mask, same mask, in place.
+    if (tr->dropout_mask_att_prob[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->d_scores                offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_att_prob[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->d_scores                offset:0 atIndex:2];
+        uint32_t n = B_NH * T * TL;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+        barrier();
+    }
+
     // (b) softmax_bw: d_scores ← softmax_bw(d_scores, attn_prob) row-wise over TL
+    // (attn_prob[i], the RAW pre-mask value — softmax_bw's formula is
+    // defined in terms of its own actual output, matching build_single_
+    // layer's t_attn_prob capture point exactly)
     dispatch_softmax_bw(enc, m2->ps_softmax_bw,
                          m2->d_scores, m2->attn_prob[i], m2->d_scores,
                          B_NH * T, TL);
@@ -6836,6 +7086,37 @@ static bool metal_bw_layer(OnlineTrainer* tr,
     dispatch_extract_new_kv_tail(enc, m2->ps_extract_new_kv_tail,
                                   m2->d_v_mh, m2->d_v,
                                   B, NH, HD, MEM_LEN, T);
+    barrier();
+
+    // mbw_dropout (2026-07-14): hook #2 backward undo, Q and V (K
+    // deliberately untouched — see the forward-side V comment above).
+    // d_q/d_v here are d(q_masked)/d(v_masked) — the SAVED Q_saved[i] and
+    // the just-masked v_full both reflect the actual (masked) forward
+    // values throughout this function, so their gradients ARE w.r.t. the
+    // masked value, i.e. this IS the correct "d(masked)" to undo. grad_q/
+    // grad_v (and d_x_ln1's Q/V contributions) below need d(q_raw)/
+    // d(v_raw) = d(masked)*mask — same mask, in place. tr->dropout_mask_
+    // q[i]/v[i] nil → skip, d_q/d_v stay unchanged.
+    if (tr->dropout_mask_q[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->d_q             offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_q[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->d_q             offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+    }
+    if (tr->dropout_mask_v[i] && m2->ps_element_mul) {
+        [enc setComputePipelineState:m2->ps_element_mul];
+        [enc setBuffer:m2->d_v             offset:0 atIndex:0];
+        [enc setBuffer:tr->dropout_mask_v[i] offset:0 atIndex:1];
+        [enc setBuffer:m2->d_v             offset:0 atIndex:2];
+        uint32_t n = BT * H;
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(n, 256u), 1, 1)];
+    }
     barrier();
 
     // Q/K/V linear backward:
@@ -7003,6 +7284,20 @@ static bool nncp_fwd_dump_verify_enabled() {
 static bool nncp_metal_bw_disabled() {
     static int v = -1;
     if (v < 0) v = (getenv("NNCP_METAL_BW_DISABLE") && getenv("NNCP_METAL_BW_DISABLE")[0] == '1') ? 1 : 0;
+    return v != 0;
+}
+
+// mbw_dropout (2026-07-14): NNCP_METAL_BW_DROPOUT=0 restores the OLD
+// dropout-forces-MPSGraph-fallback safety fuse (see metal_bw_train_step's
+// call site) — an opt-out escape hatch, default OFF (i.e. the new mask
+// wiring is trusted and used by default; only "0" reverts to the old
+// forced-fallback behavior).
+static bool nncp_metal_bw_dropout_disabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("NNCP_METAL_BW_DROPOUT");
+        v = (e && e[0] == '0' && e[1] == '\0') ? 1 : 0;
+    }
     return v != 0;
 }
 
@@ -8376,38 +8671,27 @@ static float run_per_layer_bptt_chunk(OnlineTrainer* tr,
         // also enable the BW_VERIFY_L1 shadow/reference machinery, it just
         // forces every step down the MPSGraph path.
         //
-        // Safety fuse (2026-07-04, dropout spike): metal_bw_layer has no
-        // dropout mask wiring yet (see plan-A-quality-first (b) — the
-        // mask-multiply dropout implemented so far only feeds tr->pl_fwd /
-        // tr->pl_bwd, MPSGraph-side graphs). If NNCP_DROPOUT>0 and the fast
-        // Metal path ran anyway, its forward-recompute-free per-layer
-        // backward would implicitly assume NO dropout was applied, while
-        // the actual forward pass (which produced pl_h[i+1] and the loss)
-        // DID apply it — forward/backward would silently disagree on what
-        // function was differentiated. Force the MPSGraph fallback (which
-        // always plumbs the mask correctly) whenever dropout is active.
-        // Remove this condition once metal_bw_layer gets its own mask
-        // dispatch (see metal_bw_loss/metal_bw_layer's forward-value
-        // consumers — this needs the same tr->dropout_mask_attn/ffn2[i]
-        // buffers this file already saves for MPSGraph's benefit).
-        // 7-site expansion (2026-07-11): also check nncp_dropout_att_rate()
-        // — a caller could in principle set NNCP_DROPOUT_ATT without
-        // NNCP_DROPOUT, activating hook #3 alone; metal_bw_layer has no
-        // wiring for any of the 7 sites, so either rate being active must
-        // force the same fallback.
-        // retrain-blocks (2026-07-11): use the EFFECTIVE rate for THIS call
-        // (tr->is_retrain) — dropout is now off for online calls by default,
-        // so online calls can use the fast Metal path again; only calls
-        // where dropout is actually applied (retrain, or NNCP_DROPOUT_ONLINE)
-        // need the fallback.
+        // mbw_dropout (2026-07-14, T2関門): metal_bw_loss/metal_bw_layer/
+        // metal_bw_embed now carry their own dropout mask wiring for all 7
+        // hooks (reading the SAME persistent tr->dropout_mask_* buffers the
+        // MPSGraph path already fills — see each function's own "mbw_dropout"
+        // comments) — the safety fuse that used to force the MPSGraph
+        // fallback whenever dropout was active (retrain = ~95% of compute,
+        // always dropout=0.19, was permanently locked out of the AMX-tiled
+        // fast path by this fuse) is removed. NNCP_METAL_BW_DROPOUT=0
+        // restores the OLD forcing behavior (opt-out escape hatch for A/B
+        // comparison or if a real run surfaces a wiring bug this session's
+        // bw_verify-only coverage didn't catch — see mbw_dropout.DONE for
+        // what IS and ISN'T covered by that unit-level verification).
         const bool dropout_active_no_metal_wiring =
-            (nncp_effective_dropout_rate(tr->is_retrain) > 0.0f) ||
-            (nncp_effective_dropout_att_rate(tr->is_retrain) > 0.0f);
+            nncp_metal_bw_dropout_disabled() &&
+            ((nncp_effective_dropout_rate(tr->is_retrain) > 0.0f) ||
+             (nncp_effective_dropout_att_rate(tr->is_retrain) > 0.0f));
         if (dropout_active_no_metal_wiring) {
             static bool logged_once = false;
             if (!logged_once) {
-                NSLog(@"[M2] NNCP_DROPOUT>0: forcing MPSGraph fallback for per-layer backward "
-                      @"(metal_bw_layer has no dropout mask wiring yet)");
+                NSLog(@"[M2] NNCP_METAL_BW_DROPOUT=0: forcing MPSGraph fallback for per-layer "
+                      @"backward despite dropout mask wiring being available");
                 logged_once = true;
             }
         }
