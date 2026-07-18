@@ -1256,16 +1256,13 @@ static MPSTransformerContext* get_shared_mps_ctx() {
 #define NUM_STREAMS  (g_nncp_profile.num_streams)
 #define SEG_LEN      (g_nncp_profile.seg_len)
 #define MEM_LEN      (g_nncp_profile.mem_len)
+// pp_retrain_impl (2026-07-18): get_block_len()/BLOCK_LEN (the flat-500000
+// per-stream-token chunker neural_bridge_compress_symbols/decompress_
+// symbols used to use directly) removed — both functions now call get_
+// block_len_for_pos below instead, unifying block-boundary logic with the
+// raw-byte path (②). g_block_len itself stays: get_block_len_for_pos's
+// own NNCP_BLOCK_LEN override path still reads/writes it directly.
 static size_t g_block_len = 0;
-static inline size_t get_block_len() {
-    if (g_block_len == 0) {
-        const char* e = getenv("NNCP_BLOCK_LEN");
-        g_block_len = (e && atoi(e) > 0) ? (size_t)atoi(e) : 500000;
-        if (g_block_len != 500000) fprintf(stderr, "[CFG] NNCP_BLOCK_LEN=%zu\n", g_block_len);
-    }
-    return g_block_len;
-}
-#define BLOCK_LEN    get_block_len()
 
 // retrain-blocks (2026-07-11, retrain-blocks-spec-20260711.md): original
 // nncp.c's enwik8 profile uses a PIECE-WISE block_len schedule, not a flat
@@ -1333,6 +1330,139 @@ static inline size_t get_retrain_buf_size() {
 }
 
 static mach_timebase_info_data_t g_tb = {};
+
+// pp_retrain_impl (2026-07-18): shared retrain-block core, factored out of
+// what were four independent copy-pasted implementations (compress/
+// decompress × raw-byte/preprocess-symbols) — this task is adding the
+// preprocess pair, which would have made it four without this refactor.
+// T is the ring-buffer element type: uint8_t for raw bytes (byte value
+// 0-255 IS the symbol), uint16_t for preprocess tokens (vocab_size can
+// exceed 256 there — see g_vocab_size_override — so a byte-sized ring
+// buffer would truncate token IDs above 255).
+//
+// `get_value(s, t)` returns the actual data value (already-coded byte on
+// the compress side, already-decoded byte/token on the decompress side)
+// for stream s at position t (0 <= t < block_len) within the block that
+// was JUST processed — retrain always trains on the most-recently-seen
+// data, mirroring nncp.c's retrain_block semantics (retrain_len=15M
+// default, NNCP_RETRAIN_LEN override, nncp.c L2531).
+//
+// Callers own their own `retrain_buf`/`retrain_buf_pos`/`retrain_buf_len`
+// statics (passed by reference) rather than this function owning function-
+// local statics itself — template instantiation would otherwise silently
+// SHARE one ring buffer between, e.g., the raw-byte compress and raw-byte
+// decompress call sites (same T=uint8_t instantiation), which previously
+// had fully independent state by lexical scope. Roundtrip determinism is
+// the hard requirement here (④) — this preserves the exact per-call-site
+// isolation the original 2-copy code had, across what's now 4 call sites.
+//
+// The `nncp_is_final_block`-style skip is NOT decided in here — it depends
+// on each call site's own file_pos/block_bytes/stride (all still owned by
+// the caller's loop), so callers only call this function when they've
+// already decided retrain SHOULD fire this block. This function's own gate
+// is only the 3 call-site-independent conditions (g_online_trainer exists,
+// enwik8 profile, NNCP_NO_TRAIN unset) — matching HQ's requirement ⑥ that
+// NNCP_NO_TRAIN disables retrain uniformly everywhere.
+// Templates can't have C linkage — this file's `extern "C" {` (opened at
+// the top for the exported neural_bridge_*/nncp_bridge_* API) wraps this
+// point too, so explicitly switch back to C++ linkage for the template
+// itself.
+extern "C++" {
+template <typename T, typename GetValueFn>
+static void nncp_retrain_block(GetValueFn&& get_value,
+                                size_t num_streams, size_t block_len, size_t block_num,
+                                MPSTransformerContext* mps_ctx,
+                                T*& retrain_buf, size_t& retrain_buf_pos, size_t& retrain_buf_len) {
+    if (!g_online_trainer || g_nncp_profile.h != 1024 || getenv("NNCP_NO_TRAIN")) return;
+
+    const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();
+    if (!retrain_buf) retrain_buf = (T*)calloc(RETRAIN_BUF_SIZE, sizeof(T));
+
+    // Add this block's data to the ring buffer (all streams interleaved) —
+    // same layout the original per-callsite code used.
+    for (size_t s = 0; s < num_streams; s++) {
+        for (size_t t = 0; t < block_len; t++) {
+            retrain_buf[retrain_buf_pos] = get_value(s, t);
+            retrain_buf_pos++;
+            if (retrain_buf_pos >= RETRAIN_BUF_SIZE) retrain_buf_pos = 0;
+        }
+    }
+    retrain_buf_len += block_len * num_streams;
+    if (retrain_buf_len > RETRAIN_BUF_SIZE) retrain_buf_len = RETRAIN_BUF_SIZE;
+
+    const int rt_n_streams = (int)num_streams;
+    const int rt_seg_len = SEG_LEN;
+    const size_t rt_stride = retrain_buf_len / (size_t)rt_n_streams;
+    if (rt_stride < (size_t)rt_seg_len) return;
+
+    // Reset KV cache for retrain (fresh context), switch LR counter to
+    // retrain_train_step (C1: original nncp alignment).
+    mps_transformer_reset_kv_cache(mps_ctx);
+    online_trainer_set_retrain(g_online_trainer, true);
+
+    int32_t* rt_inputs  = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
+    int32_t* rt_targets = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
+
+    // Read from ring buffer (most recent retrain_buf_len values, wrapping).
+    auto get_rb = [&](size_t idx) -> T {
+        size_t pos = (retrain_buf_pos + RETRAIN_BUF_SIZE - retrain_buf_len + idx) % RETRAIN_BUF_SIZE;
+        return retrain_buf[pos];
+    };
+
+    uint64_t rt_t0 = mach_absolute_time();
+    size_t rt_seg_count = 0;
+    size_t rt_pos = 0;
+    static int rt_step = -1;
+    if (rt_step < 0) {
+        const char* e = getenv("NNCP_RETRAIN_STEP");
+        // Default 1 = original nncp parity. Set 2 for -60% retrain time
+        // with +0.0014% bpc (verified in a1-multiblock-verify.md).
+        rt_step = (e && atoi(e) > 0) ? atoi(e) : 1;
+        if (rt_step != 1) fprintf(stderr, "[RETRAIN] NNCP_RETRAIN_STEP=%d\n", rt_step);
+    }
+    const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step;
+    const size_t rt_total_segs = (rt_stride >= (size_t)rt_seg_len)
+        ? ((rt_stride - (size_t)rt_seg_len) / rt_pos_inc + 1) : 0;
+    while (rt_pos + rt_seg_len <= rt_stride) {
+        for (int s = 0; s < rt_n_streams; s++) {
+            for (int t = 0; t < rt_seg_len; t++) {
+                size_t abs = (size_t)s * rt_stride + rt_pos + (size_t)t;
+                rt_targets[s * rt_seg_len + t] = (int32_t)get_rb(abs);
+                rt_inputs[s * rt_seg_len + t] = (abs > 0) ? (int32_t)get_rb(abs - 1) : 0;
+            }
+        }
+
+        if (g_online_trainer)
+            online_trainer_latch_kv_memory(g_online_trainer);
+
+        online_trainer_train_segment_batch(g_online_trainer,
+            rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
+
+        rt_pos += rt_pos_inc;
+        rt_seg_count++;
+        if (rt_seg_count % 100 == 0) {
+            double rt_pct = rt_total_segs
+                ? (100.0 * (double)rt_seg_count / (double)rt_total_segs) : 0.0;
+            fprintf(stderr, "retrain block=%zu seg=%zu/%zu (%.1f%%)\n",
+                    block_num, rt_seg_count, rt_total_segs, rt_pct);
+        }
+    }
+    uint64_t rt_t1 = mach_absolute_time();
+    double rt_ms = (double)(rt_t1 - rt_t0) * g_tb.numer / g_tb.denom * 1e-6;
+
+    free(rt_inputs);
+    free(rt_targets);
+
+    // Reset KV cache after retrain (next block starts fresh); restore main
+    // LR counter (C1).
+    mps_transformer_reset_kv_cache(mps_ctx);
+    online_trainer_set_retrain(g_online_trainer, false);
+
+    fprintf(stderr, "[RETRAIN] block=%zu buf_len=%zu segs=%zu total=%.1fms avg=%.1fms/seg\n",
+            block_num, retrain_buf_len, rt_seg_count,
+            rt_ms, rt_seg_count > 0 ? rt_ms / (double)rt_seg_count : 0.0);
+}
+} // extern "C++"
 
 // NNCP_DECODE_DUMP=1 companion (2026-07-05, "配膳の皿違い" triage): decode_dump.inc
 // (mps_transformer_graph.mm) already confirmed decode_ce_bpc ≈ [LOSS] and 320/320
@@ -1643,113 +1773,22 @@ size_t neural_bridge_cuda_lossless_compress(const uint8_t* input_data, size_t in
         // discarded (compression is already done). `file_pos + block_bytes >=
         // stride` is true exactly on the loop's terminal iteration (block_bytes
         // is clamped to stride-file_pos), so it is the direct per-stream
-        // equivalent of nncp.c's whole-file "past end" check.
+        // equivalent of nncp.c's whole-file "past end" check. This decision
+        // stays HERE (not inside the shared nncp_retrain_block helper, pp_
+        // retrain_impl 2026-07-18) since it depends on this call site's own
+        // file_pos/block_bytes/stride.
         const bool nncp_is_final_block = (file_pos + block_bytes >= stride);
-        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN") && !nncp_is_final_block) {
-            const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();
+        if (!nncp_is_final_block) {
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;
-
-            if (!retrain_buf) retrain_buf = (uint8_t*)calloc(RETRAIN_BUF_SIZE, 1);
-
-            // Add this block's data to the ring buffer (all streams interleaved)
-            // We store the raw input bytes for all streams: block_bytes per stream
-            for (int s = 0; s < NUM_STREAMS; s++) {
-                for (size_t t = 0; t < block_bytes; t++) {
+            nncp_retrain_block<uint8_t>(
+                [&](size_t s, size_t t) -> uint8_t {
                     size_t data_off = (size_t)s * stride + file_pos + t;
-                    uint8_t byte_val = (data_off < input_size) ? input_data[data_off] : 0;
-                    retrain_buf[retrain_buf_pos] = byte_val;
-                    retrain_buf_pos++;
-                    if (retrain_buf_pos >= RETRAIN_BUF_SIZE) retrain_buf_pos = 0;
-                }
-            }
-            retrain_buf_len += block_bytes * NUM_STREAMS;
-            if (retrain_buf_len > RETRAIN_BUF_SIZE) retrain_buf_len = RETRAIN_BUF_SIZE;
-
-            // Retrain on the buffer: split into n_streams × seg_len segments
-            const int rt_n_streams = NUM_STREAMS;
-            const int rt_seg_len = SEG_LEN;
-            const size_t rt_stride = retrain_buf_len / (size_t)rt_n_streams;
-            if (rt_stride >= (size_t)rt_seg_len) {
-                // Reset KV cache for retrain (fresh context)
-                mps_transformer_reset_kv_cache(mps_ctx);
-
-                // Switch LR counter to retrain_train_step (C1: original nncp alignment).
-                online_trainer_set_retrain(g_online_trainer, true);
-
-                int32_t* rt_inputs  = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
-                int32_t* rt_targets = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
-
-                // Read from ring buffer (most recent retrain_buf_len bytes, wrapping)
-                auto get_rb = [&](size_t idx) -> uint8_t {
-                    size_t pos = (retrain_buf_pos + RETRAIN_BUF_SIZE - retrain_buf_len + idx) % RETRAIN_BUF_SIZE;
-                    return retrain_buf[pos];
-                };
-
-                uint64_t rt_t0 = mach_absolute_time();
-                size_t rt_seg_count = 0;
-                size_t rt_pos = 0;
-                static int rt_step = -1;
-                if (rt_step < 0) {
-                    const char* e = getenv("NNCP_RETRAIN_STEP");
-                    // Default 1 = original nncp parity. Set 2 for -60% retrain time
-                    // with +0.0014% bpc (verified in a1-multiblock-verify.md).
-                    rt_step = (e && atoi(e) > 0) ? atoi(e) : 1;
-                    if (rt_step != 1) fprintf(stderr, "[RETRAIN] NNCP_RETRAIN_STEP=%d\n", rt_step);
-                }
-                const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step;
-                // rt_progress (2026-07-13, small UX fix): retrain's inner loop
-                // has no per-segment stdout write, so the outer compress-loop's
-                // "\rcompress NN.N%" line (last written before retrain started)
-                // just sits frozen on screen for however long retrain takes —
-                // indistinguishable from a hang without reading [LOSS]/[LR-DEBUG]
-                // step numbers. rt_total_segs is computed up front (pure
-                // arithmetic on rt_stride/rt_pos_inc, matching the while loop's
-                // own termination condition) so the printed fraction is exact,
-                // not an estimate.
-                const size_t rt_total_segs = (rt_stride >= (size_t)rt_seg_len)
-                    ? ((rt_stride - (size_t)rt_seg_len) / rt_pos_inc + 1) : 0;
-                while (rt_pos + rt_seg_len <= rt_stride) {
-                    for (int s = 0; s < rt_n_streams; s++) {
-                        for (int t = 0; t < rt_seg_len; t++) {
-                            size_t abs = (size_t)s * rt_stride + rt_pos + (size_t)t;
-                            rt_targets[s * rt_seg_len + t] = (int32_t)get_rb(abs);
-                            rt_inputs[s * rt_seg_len + t] = (abs > 0) ? (int32_t)get_rb(abs - 1) : 0;
-                        }
-                    }
-
-                    if (g_online_trainer)
-                        online_trainer_latch_kv_memory(g_online_trainer);
-
-                    online_trainer_train_segment_batch(g_online_trainer,
-                        rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
-
-                    rt_pos += rt_pos_inc;
-                    rt_seg_count++;
-                    if (rt_seg_count % 100 == 0) {
-                        double rt_pct = rt_total_segs
-                            ? (100.0 * (double)rt_seg_count / (double)rt_total_segs) : 0.0;
-                        fprintf(stderr, "retrain block=%zu seg=%zu/%zu (%.1f%%)\n",
-                                block_num, rt_seg_count, rt_total_segs, rt_pct);
-                    }
-                }
-                uint64_t rt_t1 = mach_absolute_time();
-                double rt_ms = (double)(rt_t1 - rt_t0) * g_tb.numer / g_tb.denom * 1e-6;
-
-                free(rt_inputs);
-                free(rt_targets);
-
-                // Reset KV cache after retrain (next block starts fresh)
-                mps_transformer_reset_kv_cache(mps_ctx);
-
-                // Restore main LR counter (C1).
-                online_trainer_set_retrain(g_online_trainer, false);
-
-                fprintf(stderr, "[RETRAIN] block=%zu buf_len=%zu segs=%zu total=%.1fms avg=%.1fms/seg\n",
-                        block_num, retrain_buf_len, rt_seg_count,
-                        rt_ms, rt_seg_count > 0 ? rt_ms / (double)rt_seg_count : 0.0);
-            }
+                    return (data_off < input_size) ? input_data[data_off] : 0;
+                },
+                (size_t)NUM_STREAMS, block_bytes, block_num, mps_ctx,
+                retrain_buf, retrain_buf_pos, retrain_buf_len);
         }
 
         block_num++;
@@ -2051,80 +2090,17 @@ size_t neural_bridge_cuda_lossless_decompress(const uint8_t* input_data, size_t 
         // stay symmetric/deterministic — see the comment at the compress-side
         // retrain block for the nncp.c reference.
         const bool nncp_is_final_block = (file_pos + block_bytes >= stride);
-        if (g_online_trainer && g_nncp_profile.h == 1024 && !getenv("NNCP_NO_TRAIN") && !nncp_is_final_block) {
-            const size_t RETRAIN_BUF_SIZE = get_retrain_buf_size();  // must match compress side
+        if (!nncp_is_final_block) {
             static uint8_t* retrain_buf = NULL;
             static size_t retrain_buf_pos = 0;
             static size_t retrain_buf_len = 0;
-
-            if (!retrain_buf) retrain_buf = (uint8_t*)calloc(RETRAIN_BUF_SIZE, 1);
-
-            for (uint32_t s = 0; s < file_num_streams; s++) {
-                for (size_t t = 0; t < block_bytes; t++) {
+            nncp_retrain_block<uint8_t>(
+                [&](size_t s, size_t t) -> uint8_t {
                     size_t out_off = (size_t)s * stride + file_pos + t;
-                    uint8_t byte_val = (out_off < output_capacity) ? output_data[out_off] : 0;
-                    retrain_buf[retrain_buf_pos] = byte_val;
-                    retrain_buf_pos++;
-                    if (retrain_buf_pos >= RETRAIN_BUF_SIZE) retrain_buf_pos = 0;
-                }
-            }
-            retrain_buf_len += block_bytes * file_num_streams;
-            if (retrain_buf_len > RETRAIN_BUF_SIZE) retrain_buf_len = RETRAIN_BUF_SIZE;
-
-            const int rt_n_streams = (int)file_num_streams;
-            const int rt_seg_len = SEG_LEN;
-            const size_t rt_stride = retrain_buf_len / (size_t)rt_n_streams;
-            if (rt_stride >= (size_t)rt_seg_len) {
-                mps_transformer_reset_kv_cache(mps_ctx);
-                online_trainer_set_retrain(g_online_trainer, true);
-
-                int32_t* rt_inputs  = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
-                int32_t* rt_targets = (int32_t*)calloc((size_t)rt_n_streams * rt_seg_len, sizeof(int32_t));
-
-                auto get_rb = [&](size_t idx) -> uint8_t {
-                    size_t pos = (retrain_buf_pos + RETRAIN_BUF_SIZE - retrain_buf_len + idx) % RETRAIN_BUF_SIZE;
-                    return retrain_buf[pos];
-                };
-
-                size_t rt_pos = 0;
-                static int rt_step2 = -1;
-                if (rt_step2 < 0) {
-                    const char* e = getenv("NNCP_RETRAIN_STEP");
-                    rt_step2 = (e && atoi(e) > 0) ? atoi(e) : 1;
-                }
-                const size_t rt_pos_inc = (size_t)rt_seg_len * (size_t)rt_step2;
-                // rt_progress: mirrors the compress-side progress line (see its
-                // comment) so decompress-side retrain doesn't look hung either.
-                const size_t rt_total_segs = (rt_stride >= (size_t)rt_seg_len)
-                    ? ((rt_stride - (size_t)rt_seg_len) / rt_pos_inc + 1) : 0;
-                size_t rt_seg_count = 0;
-                while (rt_pos + rt_seg_len <= rt_stride) {
-                    for (int s = 0; s < rt_n_streams; s++) {
-                        for (int t = 0; t < rt_seg_len; t++) {
-                            size_t abs = (size_t)s * rt_stride + rt_pos + (size_t)t;
-                            rt_targets[s * rt_seg_len + t] = (int32_t)get_rb(abs);
-                            rt_inputs[s * rt_seg_len + t] = (abs > 0) ? (int32_t)get_rb(abs - 1) : 0;
-                        }
-                    }
-                    if (g_online_trainer)
-                        online_trainer_latch_kv_memory(g_online_trainer);
-                    online_trainer_train_segment_batch(g_online_trainer,
-                        rt_inputs, rt_targets, rt_n_streams, rt_seg_len);
-                    rt_pos += rt_pos_inc;
-                    rt_seg_count++;
-                    if (rt_seg_count % 100 == 0) {
-                        double rt_pct = rt_total_segs
-                            ? (100.0 * (double)rt_seg_count / (double)rt_total_segs) : 0.0;
-                        fprintf(stderr, "retrain block=%zu seg=%zu/%zu (%.1f%%)\n",
-                                block_num, rt_seg_count, rt_total_segs, rt_pct);
-                    }
-                }
-
-                free(rt_inputs);
-                free(rt_targets);
-                mps_transformer_reset_kv_cache(mps_ctx);
-                online_trainer_set_retrain(g_online_trainer, false);
-            }
+                    return (out_off < output_capacity) ? output_data[out_off] : 0;
+                },
+                (size_t)file_num_streams, block_bytes, block_num, mps_ctx,
+                retrain_buf, retrain_buf_pos, retrain_buf_len);
         }
 
         block_num++;
@@ -2211,12 +2187,25 @@ size_t neural_bridge_compress_symbols(
         return 0;
     }
 
-    const size_t total_blocks = (stride + BLOCK_LEN - 1) / BLOCK_LEN;
+    // pp_retrain_impl (2026-07-18): block_tokens now uses get_block_len_for_pos
+    // (the same per-stream interpolated schedule the raw-byte path uses,
+    // see its cadence-fix comment above) instead of the flat BLOCK_LEN=
+    // 500000 default this path used to apply directly as a per-stream TOKEN
+    // count — that flat value made a 25MB/~8M-token file (~250K tokens/
+    // stream) resolve to exactly ONE block (total_blocks=1), which is the
+    // reason retrain never fired even before this task added the retrain
+    // call itself (see pp_retrain_diag.DONE). Unifying the mechanism is
+    // HQ's explicit ask (②) — note file_pos here is a per-stream TOKEN
+    // position, not a byte position, so this schedule's magnitude is not
+    // byte-equivalent to the raw-byte path's use of the same function; it
+    // produces comparably-shaped multi-block splitting, which is the goal.
     size_t file_pos = 0;
+    size_t block_num = 0;
 
     while (file_pos < stride) {
-        const size_t block_tokens = ((stride - file_pos) < (size_t)BLOCK_LEN)
-                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        const size_t this_block_len = get_block_len_for_pos(file_pos);
+        const size_t block_tokens = ((stride - file_pos) < this_block_len)
+                                    ? (stride - file_pos) : this_block_len;
         mps_transformer_reset_kv_cache(mps_ctx);
 
         size_t block_idx = 0;
@@ -2277,9 +2266,30 @@ size_t neural_bridge_compress_symbols(
             printf("\rcompress %.1f%%", pct);
             fflush(stdout);
         }
+
+        // pp_retrain_impl (2026-07-18): retrain, ported from the raw-byte
+        // path (①) — see its comment for why the final-block skip decision
+        // stays at the call site. Ring buffer element type is uint16_t
+        // (not uint8_t): preprocess tokens are vocab-indexed and can exceed
+        // 255 (g_vocab_size_override = 256 + n_words), so a byte-sized
+        // buffer would truncate token IDs.
+        const bool nncp_is_final_block = (file_pos + block_tokens >= stride);
+        if (!nncp_is_final_block) {
+            static uint16_t* retrain_buf = NULL;
+            static size_t retrain_buf_pos = 0;
+            static size_t retrain_buf_len = 0;
+            nncp_retrain_block<uint16_t>(
+                [&](size_t s, size_t t) -> uint16_t {
+                    size_t data_off = (size_t)s * stride + file_pos + t;
+                    return (data_off < n_tokens) ? tokens[data_off] : 0;
+                },
+                (size_t)NUM_STREAMS, block_tokens, block_num, mps_ctx,
+                retrain_buf, retrain_buf_pos, retrain_buf_len);
+        }
+
+        block_num++;
         file_pos += block_tokens;
     }
-    (void)total_blocks;
 
     free(seg_logits); free(probs); free(seg_tokens); free(seg_targets);
 
@@ -2372,10 +2382,18 @@ size_t neural_bridge_decompress_symbols(
 
     size_t total_decoded = 0;
     size_t file_pos      = 0;
+    size_t block_num     = 0;
 
+    // pp_retrain_impl (2026-07-18): block_tokens unified with the compress
+    // side's get_block_len_for_pos schedule (②) — see that function's
+    // comment for why the flat BLOCK_LEN default broke multi-block
+    // splitting for typical file sizes. Compress/decompress MUST compute
+    // the identical schedule here (both call get_block_len_for_pos with
+    // the same file_pos progression) for roundtrip determinism (④).
     while (file_pos < stride) {
-        const size_t block_tokens = ((stride - file_pos) < (size_t)BLOCK_LEN)
-                                    ? (stride - file_pos) : (size_t)BLOCK_LEN;
+        const size_t this_block_len = get_block_len_for_pos(file_pos);
+        const size_t block_tokens = ((stride - file_pos) < this_block_len)
+                                    ? (stride - file_pos) : this_block_len;
         mps_transformer_reset_kv_cache(mps_ctx);
 
         size_t block_idx = 0;
@@ -2456,6 +2474,32 @@ size_t neural_bridge_decompress_symbols(
             fprintf(stderr, "\rdecompress %.1f%%", pct);
             fflush(stderr);
         }
+
+        // pp_retrain_impl (2026-07-18): retrain, mirroring the compress-side
+        // symbol path exactly (④ roundtrip determinism requires an
+        // identical schedule) — ring buffer reads from tokens_out (what
+        // this side just DECODED), the token-side analog of the raw-byte
+        // decompress retrain reading from output_data. NOTE: the `goto
+        // sym_done` above (fired when every stream has decoded its full
+        // length mid-segment) skips this retrain call for whatever block
+        // was in progress at that point -- acceptable since that only
+        // happens at/near the true end of decoding, which nncp_is_final_
+        // block already excludes from retraining in the common case.
+        const bool nncp_is_final_block = (file_pos + block_tokens >= stride);
+        if (!nncp_is_final_block) {
+            static uint16_t* retrain_buf = NULL;
+            static size_t retrain_buf_pos = 0;
+            static size_t retrain_buf_len = 0;
+            nncp_retrain_block<uint16_t>(
+                [&](size_t s, size_t t) -> uint16_t {
+                    size_t out_off = (size_t)s * stride + file_pos + t;
+                    return (out_off < n_tokens) ? tokens_out[out_off] : 0;
+                },
+                (size_t)file_num_streams, block_tokens, block_num, mps_ctx,
+                retrain_buf, retrain_buf_pos, retrain_buf_len);
+        }
+
+        block_num++;
         file_pos += block_tokens;
     }
 
