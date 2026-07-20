@@ -55,16 +55,26 @@ diff input.txt restored.txt && echo PASS
 
 ## Performance
 
-Measured on Apple Silicon (online learning, deterministic seed):
+Small-file benchmarks (`default` profile, online learning, deterministic seed):
 
 | Input | Size | Compressed | Ratio |
-|-------|------|------------|-------|
+|-------|------|------|-------|
 | Dictionary text | 10 KB | ~6.3 KB | **63.5%** |
 | Natural language | 10 KB | ~6.2 KB | **62.4%** |
 | C source code | 50 KB | ~21.3 KB | **42.5%** |
-| enwik8 | 100 MB | ~22.8 MB | **22.8%** |
 
-Compression speed: ~6 s / 10 KB, ~30 s / 50 KB, ~100 min / 100 MB (M-series, online learning included).
+enwik8 (`enwik8` profile — 20-layer Transformer, dictionary preprocessing + periodic retraining on recent history, matching the original NNCP recipe): sub-full-scale runs (up to 25 MB) land around **~20%**, approaching the original NNCP's published 14.9% at full 100 MB scale. A full 100 MB run has not yet been benchmarked end-to-end.
+
+### Rough 100 MB timing estimate
+
+Extrapolated from partial-scale measurements and public Apple Silicon GPU/memory-bandwidth specs — **not a direct 100 MB benchmark**, expect ±50% margin:
+
+| Apple Silicon | Est. full 100 MB compress time |
+|---|---|
+| M2 (base) | ~7–10 days |
+| M4 Max | ~3–5 days |
+
+This workload is GPU-bound but only lightly parallel (small batch, online learning), so it doesn't scale linearly with GPU core count across chip tiers.
 
 ## How it works
 
